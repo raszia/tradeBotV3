@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR1 — Project skeleton and shared foundation.**
+Last updated: **PR2 — Database schema and migrations.**
 
 ---
 
@@ -102,23 +102,44 @@ PKs, `DECIMAL(36,18)` base qty / `DECIMAL(36,8)` quote-price, `TIMESTAMP(6)` /
 `DATETIME(6)`, `JSON` payloads, explicit indexes, `version` columns for
 optimistic concurrency.
 
-Implemented so far (**PR1**):
+Infrastructure (**PR1**): `schema_migrations` (runner), `app_meta` (migration `001`).
 
-- `schema_migrations` — applied migration versions + checksums (created by the runner).
-- `app_meta` — minimal key/value infrastructure metadata (migration `001`).
+Implemented (**PR2**, migrations `002`–`007`):
 
-Planned (**PR2**): exchanges, assets, markets, exchange_markets, config_versions,
-symbol_configs, exchange_configs, cycles, cycle_state_events, orders,
-order_events, fills, symbol_locks, exchange_requests, wallet_balances_current,
-wallet_balance_history, exchange_health_current, exchange_health_samples,
-api_call_logs, app_logs, comparison_events, signals, exchange_fees,
-cycle_fee_snapshots. **PR15**: market_regime_baskets, market_regime_basket_symbols,
-market_regime_timeframes, market_regime_current, market_regime_history.
+- **Reference / discovery (002):** `exchanges`, `assets`, `markets`,
+  `exchange_markets` (per-venue listing: exchange-native symbol, canonical
+  mapping, trading rules, venue status, raw metadata, `last_discovery_at`, and the
+  four per-symbol enable flags).
+- **Credentials (003):** `exchange_credentials` (encrypted-only secret columns +
+  `encryption_algorithm`/`key_version`; no plaintext columns),
+  `exchange_credential_audit` (never stores secrets).
+- **Config (004):** `config_versions`, `config_change_audit`, `symbol_configs`
+  (trading params), `exchange_configs` (per-exchange concurrency + timeouts),
+  `exchange_fees`, `retention_settings`.
+- **Trading core (005):** `cycles` (+ config_version + regime snapshot),
+  `cycle_state_events`, `orders` (+ `local_client_order_id`,
+  `client_order_id_sent`, `version`), `order_events`, `fills`, `symbol_locks`
+  (composite-scope, generated `active_key`), `exchange_requests` (queue),
+  `cycle_fee_snapshots`.
+- **Observability (006):** `wallet_balances_current`, `wallet_balance_history`,
+  `exchange_health_current`, `exchange_health_samples`, `api_call_logs`,
+  `app_logs`, `comparison_events`, `signals`.
+- **Discovery runs (007):** `market_discovery_runs`.
 
-Records that are kept permanently (unless explicitly configured otherwise):
-trades/orders/fills/cycles. High-volume tables (api_call_logs, comparison_events,
-exchange_health_samples, app_logs, market_regime_history) are subject to
-retention.
+Planned (**PR15**): `market_regime_baskets`, `market_regime_basket_symbols`,
+`market_regime_timeframes`, `market_regime_current`, `market_regime_history`.
+
+Records kept permanently (unless explicitly configured otherwise): orders, fills,
+cycles, signals. High-volume tables (`api_call_logs`, `comparison_events`,
+`exchange_health_samples`, `app_logs`, `wallet_balance_history`, and later
+`market_regime_history`) are subject to retention — they are **non-partitioned
+with a strong `created_at` index and carry NO foreign keys** so inserts stay cheap
+(async/batched) and pruning is a simple batched `DELETE` (see §9 decision).
+
+**Mapping note:** `exchange_markets.market_id` is the authoritative link to the
+canonical `markets` row; `canonical_symbol` is denormalized and must equal
+`markets.canonical_symbol` when `market_id` is set (both stored, relationship
+unambiguous).
 
 ## 6. Migration rules
 
@@ -181,6 +202,28 @@ which enqueues) from API calls (order-executor, which claims and sends).
 - **Transactional completion:** on a successful response, the queue row status
   and the order state/event are updated in the **same transaction**.
 - **Idempotency & crash-after-send:** see §15.
+
+## 8a. Per-symbol enable/disable (schema in PR2; behaviour enforced in later PRs)
+
+Each `exchange_markets` row carries four independent flags so every exchange
+market is individually controllable from the dashboard:
+
+- `enabled_for_collection` — collect this market's book/price into Redis.
+- `enabled_for_signal` — evaluate signals on it.
+- `enabled_for_trading` — allowed to **start new buy cycles**.
+- `enabled_for_sell_manage` — manage existing sell/reprice/cancel (defaults TRUE).
+
+**Disabling means "do not start new trades", NOT "forget existing open orders".**
+When `enabled_for_trading` is turned off for a market that already has an open
+cycle, the system must: stop accepting new signals / not start new buy cycles for
+it, **but continue** managing the existing open cycle/order (sell, reprice,
+cancel, reconcile) to a safe resolution, keep the symbol lock correct, and
+**release the lock only when safe**. `enabled_for_sell_manage` should normally
+stay TRUE until all open cycles are resolved. Disabling `enabled_for_collection`
+can make safe management impossible unless another market-data source still feeds
+the prices that sell/reprice decisions need — so it must be used with care while a
+cycle is open. PR2 provides only the flags; this behaviour is enforced in the
+engine (PR8/PR9), executor (PR10/PR11), and reconciler (PR12).
 
 ## 9. State-machine design (PR3)
 
@@ -325,11 +368,13 @@ start.
 - **Retention** (PR18) for high-volume tables, configurable by days (and, where
   partitioned, by retained-partition count ≈ volume), using batched/partition-
   aware deletes. Trades/orders/fills/cycles kept permanently by default.
-- **Partitioning note (MariaDB):** a partitioned InnoDB table requires every
-  unique/primary key to include the partition column. High-volume tables will
-  therefore include the time/partition column in their PK/unique keys, or start
-  **non-partitioned with strong `created_at` indexes + batched retention** and
-  add partitioning in a later PR. (Decided per-table in PR2/PR18.)
+- **Partitioning decision (PR2, MariaDB):** a partitioned InnoDB table requires
+  every unique/primary key to include the partition column, which complicates the
+  `AUTO_INCREMENT` PKs here. **PR2 therefore creates all high-volume tables
+  NON-PARTITIONED** with a strong `created_at` index (and no foreign keys), so
+  retention is a simple batched `DELETE ... WHERE created_at < ? LIMIT N`.
+  Partitioning may be introduced later if volume demands it; because the
+  `created_at` index already exists, that change is additive, not breaking.
 
 ## 17. Safety rules (the hard rules)
 
@@ -369,14 +414,19 @@ start.
 
 ## 18. Known limitations (current)
 
-- **PR1 is skeleton only.** Service binaries boot, verify the schema, and idle;
-  no market data, no signals, no orders, no reconciliation yet.
-- Only `schema_migrations` and `app_meta` exist; the trading schema is PR2.
+- **Through PR2 the system has schema but no behaviour.** Service binaries boot,
+  verify the schema, and idle; no market data, no signals, no orders, no
+  reconciliation yet.
+- **PR2 is schema/migrations only.** The tables exist, but: Go models + the state
+  machine are PR3; credential **encryption is not implemented** (only the at-rest
+  schema exists); **market-discovery execution is not implemented** (only its
+  storage); the per-symbol enable/disable **behaviour** (§8a) is documented but
+  enforced in PR8–PR12.
 - The exchange-request queue's multi-process per-exchange concurrency protection
   and the conservative crash-after-send recovery are **designed** (§8, §17) but
   implemented in PR7+. Until then, assume one executor per exchange.
-- Partitioning decisions for high-volume tables are deferred to PR2/PR18 (may
-  start non-partitioned).
+- High-volume tables are **non-partitioned** for now (§16 decision); partitioning
+  is a later additive change if volume requires it.
 - The migration statement splitter does not support stored programs/`DELIMITER`.
 
 ## 19. Pending work (delivery plan)
@@ -409,13 +459,25 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
   PR2 (schema/SQL only) or PR4 (deps re-added by `go get`/`tidy` as imports
   appear). Retained: `go-sql-driver/mysql`, `redis/go-redis/v9`,
   `pelletier/go-toml/v2`, `DATA-DOG/go-sqlmock`.
+- **PR2 — high-volume tables non-partitioned + no FKs.** See §16. Keeps inserts
+  cheap and retention simple; `created_at` index makes future partitioning
+  additive.
+- **PR2 — credential secrets stored as structured AES-256-GCM payloads.** Each
+  `encrypted_*` column holds `nonce ‖ ciphertext ‖ tag` (no separate nonce
+  column); `encryption_algorithm` + `key_version` allow rotation. No plaintext
+  secret columns exist. (Encryption code is a later PR; PR2 is schema only.)
+- **PR2 — `exchange_markets` (what a venue supports) is kept separate from
+  `symbol_configs` (how we trade).** Trading parameters never live on
+  `exchange_markets`.
+- **PR2 — reserved word avoided.** The app-log producer column is `source_binary`
+  (`binary` is reserved in MariaDB).
 
 ## 20. PR history / implementation phases
 
 | PR | Branch | Status | Summary |
 |---|---|---|---|
-| PR1 | `pr1-project-skeleton` | **in review** | Project skeleton & shared foundation: module layout, all 9 binaries bootable, **file-only bootstrap config** (no env; `-config` flag; secret redaction), slog logging, `db.Store`+pool+`WithTx`, Redis wrapper, in-code migration runner (GET_LOCK + checksum + DDL/DML rules) with `schema_migrations` + `001_app_meta`, scaffold packages, tests, this document. No trading logic. |
-| PR2 | `pr2-database-schema` | planned | Full trading schema & migrations. |
+| PR1 | `pr1-project-skeleton` | **accepted** | Project skeleton & shared foundation: module layout, all 9 binaries bootable, **file-only bootstrap config** (no env; `-config` flag; secret redaction), slog logging, `db.Store`+pool+`WithTx`, Redis wrapper, in-code migration runner (GET_LOCK + checksum + DDL/DML rules) with `schema_migrations` + `001_app_meta`, scaffold packages, tests, this document. No trading logic. |
+| PR2 | `pr2-database-schema` | **in review** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
 | PR3 | `pr3-state-machine` | planned | Cycle/order models, state machine, validation. |
 | PR4 | `pr4-exchange-abstraction` | planned | Normalized exchange layer (ported from iranArb). |
 | PR5 | `pr5-redis-collector` | planned | Redis key schema + collector. |
