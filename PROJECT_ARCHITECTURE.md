@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR7 — Exchange-request queue and order-executor foundation.**
+Last updated: **PR12 — Startup reconciler.**
 
 ---
 
@@ -146,7 +146,7 @@ internal/
   orders/      order registration + order-event processing                  [PR9/PR10]
   queue/       DB-backed exchange-request priority queue                    [PR7]
   symbollock/  DB-backed symbol lock (composite scope)                      [PR9/PR12]
-  reconciler/  startup + periodic reconciliation                            [PR12]
+  reconciler/  startup + periodic reconciliation (read-only; never sends)  [PR12]
   collector/   collector service                                            [PR5]
   engine/      trade-engine loop                                            [PR8/PR9/PR11]
   executor/    order-executor worker pool                                   [PR7/PR10/PR11]
@@ -417,16 +417,70 @@ signal. It survives restarts and is recoverable by the reconciler.
 - The reconciler reclaims a stale lock **only after** positively determining the
   owning cycle is safe — never on lease expiry alone.
 
-## 11. Reconciler behaviour (PR12)
+## 11. Reconciler (implemented in PR12 — `internal/reconciler`)
 
-On startup (poll-only — WebSocket carries no history for the downtime gap): load
-open cycles/orders; per exchange fetch open orders, balances, recent fills;
-compare; per cycle decide **Continue / SafeClose / NEEDS_RECONCILE**. Locks are
-released only on `SafeClose`. The reconciler **never auto-cancels and never
-auto-sends**; the safe default for any ambiguity is `NEEDS_RECONCILE`.
-`SafeClose` requires positive proof every leg is terminal on the exchange (an
-order merely missing from open-orders is **not** proof it never filled). A
-periodic poll backstop complements steady-state WebSocket order updates.
+The reconciler makes the system safe after restart/timeout/partial-fill/
+disconnect/divergence. It is **READ-ONLY toward exchanges and never auto-sends or
+auto-cancels** — enforced by construction: it holds a `ReadOnlyClient` interface
+that **lacks** `PlaceOrder`/`CancelOrder` (a reflection-style test plus a
+panic-on-call fake confirm they are never invoked). The only writes it makes are
+local state transitions (via `internal/state`), conservative lock releases, and
+decision logs.
+
+**Startup + periodic flow.** `ReconcileStartup` loads open (non-terminal) cycles
+and their orders, reconciles each, and reports stuck `IN_FLIGHT` / `DEAD`
+requests (it observes but never resends them — PR7's `SweepStuck` already moves
+stuck mutating IN_FLIGHT to `DEAD` + order `NEEDS_RECONCILE`). `RunPeriodic` runs
+the same pass on an interval; it is **idempotent** — a `NEEDS_RECONCILE` cycle is
+left for the operator (no auto-exit), and the state machine's `UNIQUE(version)`
+prevents duplicate events, so repeated runs neither duplicate events nor oscillate
+state.
+
+**Capability-based (rule #4).** Behaviour depends on each exchange's PR4
+`Capabilities`. No client wired for an exchange → the order is **skipped**
+(NoAction), not flagged. A client present but lacking the needed capability (e.g.
+`GetOrder` unsupported) → `NEEDS_RECONCILE` (can't verify). Recent-fills is not
+yet exposed by the v3 adapters, so that resolution path always falls through to
+`NEEDS_RECONCILE`.
+
+**Per-order decision matrix** (`decide.go`, pure/unit-tested):
+- **Known `exchange_order_id` + `GetOrder` supported:** map the status —
+  `FILLED`→advance FILLED; `CANCELED`(zero fill)→advance CANCELLED (only legal
+  from `CANCEL_PENDING`, the cancel we requested); `REJECTED`/`EXPIRED`(zero
+  fill)→advance; `OPEN`/`NEW`/`PARTIALLY_FILLED`→Continue (still working);
+  `PARTIALLY_CANCELED` or any terminal-**with-a-fill**→`NEEDS_RECONCILE`
+  (inventory/accounting is PR10); `UNKNOWN`→`NEEDS_RECONCILE`.
+- **`GetOrder` returns "order unknown" / API error:** `NEEDS_RECONCILE` — **a
+  missing/unknown order is NOT proof it never filled**.
+- **Unknown `exchange_order_id` (only `local_client_order_id`):** **never
+  resend**. If `ClientOrderID`+`FetchByOrderID` are supported, look it up by the
+  client id and, if positively identified, **attach** the `exchange_order_id` and
+  continue; otherwise → `NEEDS_RECONCILE`.
+
+**Cycle decision.** After its orders are reconciled: any order needs-reconcile →
+cycle `NEEDS_RECONCILE` (lock kept); some order still active → Continue (resume,
+lock kept); all orders terminal **with any fill** → `NEEDS_RECONCILE` (exposure
+pending PR10 accounting); all orders terminal **with zero fill** → **SafeClose**
+to `FAILED` (no inventory) **and release the lock in the same transaction**.
+
+**Safe-close & lock-release criteria (rules #8/#9).** A lock is released **only**
+when its cycle is positively terminal/safe — never because it is old, the process
+died, no open order is visible, Redis lacks data, or an API call failed.
+`SafeClose` requires **positive proof of zero exposure** (every order terminal,
+zero fills); "missing from open orders" alone is never such proof.
+
+**Persistence (rule #11).** State changes go through the state machine
+(`order_events`/`cycle_state_events`, atomic with the row update). Each meaningful
+decision (checked / result / decision / reason / ids) is logged to `app_logs`
+(`source_binary='reconciler'`, JSON fields) — no new schema, no secrets.
+
+**Operator-only.** Exit from `NEEDS_RECONCILE` is never automatic; an operator
+path resolves it (later). The reconciler also does not perform fill accounting
+(PR10) — it conservatively flags filled/partial cases instead of closing them.
+
+The PR12 `reconciler` binary wires **no read-only clients yet** (credential
+decryption lands later), so it inspects DB state and safely leaves
+unverifiable-exchange orders alone.
 
 ## 12. Exchange abstraction layer (implemented in PR4)
 
@@ -652,11 +706,16 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR7 the safety core (queue + executor) exists, but nothing trades.**
-  No component enqueues requests yet (the trade-engine does, in PR8/PR9), so the
-  executor has nothing to claim; and the `order-executor` binary wires no real
-  private clients with `AllowLiveExecution=false`, so it cannot place a real
-  order. The collector caches market data; the config cache can serve snapshots.
+- **The safety core (PR1–PR7 + PR12) is complete, but nothing trades.** No
+  component enqueues requests yet (the trade-engine does, in PR8/PR9), so the
+  executor has nothing to claim; the `order-executor` binary wires no real
+  private clients (`AllowLiveExecution=false`); and the `reconciler` binary wires
+  no read-only clients yet (credential decryption is a later PR), so it inspects
+  DB state and safely skips orders for exchanges it cannot verify.
+- **PR12 reconciler does not do fill accounting** (PR10): it conservatively flags
+  filled/partial-fill cycles as `NEEDS_RECONCILE` rather than closing them. Exit
+  from `NEEDS_RECONCILE` is operator-only (the operator path is a later PR). The
+  recent-fills resolution path is unavailable until adapters expose it.
 - **PR7 order-state mapping is minimal:** PLACE_ORDER success advances
   `QUEUED→SUBMITTED`; ACK details, partial/full fills, and cancel resolution are
   **PR10**. The trade-engine consuming config/market events is **PR8**.
@@ -700,6 +759,25 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR12 — the reconciler holds a `ReadOnlyClient` interface** (no `PlaceOrder`/
+  `CancelOrder` methods), so auto-send is impossible by construction; a
+  panic-on-call fake + the interface design prove it in tests.
+- **PR12 — "missing/unknown order" is never proof of no fill** → `NEEDS_RECONCILE`,
+  never a clean close. SafeClose requires positive proof of zero exposure (all
+  orders terminal, zero fills) and only then releases the lock, in the same tx.
+- **PR12 — lock release is conservative:** only when the cycle is positively
+  terminal/safe — never on age, process death, missing open order, Redis gap, or
+  API failure.
+- **PR12 — filled/partial cycles → `NEEDS_RECONCILE`** (fill accounting is PR10);
+  the reconciler never closes a cycle with exposure.
+- **PR12 — `SUBMITTED→CANCELLED` is illegal** in the order machine; a clean
+  exchange-cancel is only advanced from `CANCEL_PENDING` (the cancel we
+  requested). An unexpected cancel from another state → `NEEDS_RECONCILE`.
+- **PR12 — decisions are logged to `app_logs`** (no new schema, no secrets);
+  state changes additionally produce state events.
+- **PR12 — `symbollock`** gained read/release helpers; the transactional Acquire
+  (acquire-lock + create-cycle + enqueue) remains PR9.
 
 - **PR7 — per-exchange concurrency uses `GET_LOCK`** around count+claim on a
   pinned connection (+ `FOR UPDATE SKIP LOCKED`), so the limit holds across
@@ -799,4 +877,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
+| PR12 | `pr12-startup-reconciler` | **in review** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose(FAILED+lock release, zero-exposure only)/NEEDS_RECONCILE; missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
 | PR12 | `pr12-startup-reconciler` | planned | Startup reconciler (closes the safety core). |

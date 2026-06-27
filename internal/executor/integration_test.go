@@ -127,7 +127,8 @@ func (it *intg) seedOrder(t *testing.T, st string) int64 {
 		return r
 	}
 	seedSeq++
-	u := func(p string) string { return fmt.Sprintf("%s%d", p, seedSeq) }
+	// Globally-unique across packages (go test ./... shares one DB): include nanos.
+	u := func(p string) string { return fmt.Sprintf("%s%d_%d", p, time.Now().UnixNano(), seedSeq) }
 	b := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", u("B")))
 	qa := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", u("Q")))
 	m := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", u("M"), b, qa))
