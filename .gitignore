@@ -1,0 +1,15 @@
+# Build output
+/bin/
+*.test
+*.out
+
+# Local config & secrets (never commit real DSNs / keys)
+/configs/config.toml
+.env
+*.local.toml
+
+# Editor / OS / local tooling
+.idea/
+.vscode/
+.DS_Store
+.claude/

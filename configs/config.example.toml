@@ -1,0 +1,51 @@
+# v3TradeBot BOOTSTRAP configuration (example).
+#
+# Copy to configs/config.toml and pass it with the -config flag:
+#   ./cmd/migrate -config configs/config.toml
+# (default path is configs/config.toml when -config is omitted).
+#
+# This project reads configuration from this FILE ONLY — no environment
+# variables. Bootstrap secrets that are needed before the database is reachable
+# (the DB password inside the DSN, the Redis password, the master key) live here.
+#
+# IMPORTANT: this file holds ONLY bootstrap/infrastructure config. All TRADING
+# configuration (exchanges, symbols, spreads, sizes, fees, retention, regime
+# baskets, concurrency limits) AND all exchange API keys/secrets are stored in
+# the database — API keys encrypted at rest — and edited from the dashboard, not
+# here. See PROJECT_ARCHITECTURE.md.
+
+[app]
+# development | staging | production
+environment = "development"
+
+[log]
+# debug | info | warn | error
+level = "info"
+# json | text
+format = "json"
+
+[mysql]
+# REQUIRED. Go MySQL driver DSN (embeds the DB password). Target: MariaDB 10.6+.
+# Keep this file out of version control (configs/config.toml is gitignored).
+dsn = "trader:CHANGE_ME@tcp(127.0.0.1:3306)/v3tradebot?parseTime=true&loc=UTC"
+# Pool sizing (0 = use built-in defaults: 25 / 10 / 30m / 5m).
+max_open_conns = 0
+max_idle_conns = 0
+conn_max_lifetime_sec = 0
+conn_max_idle_time_sec = 0
+
+[redis]
+# Live market data only. Losing Redis must not lose trading state.
+addr = "127.0.0.1:6379"
+password = ""
+db = 0
+pool_size = 0  # 0 = default 30
+
+[dashboard]
+listen_addr = "127.0.0.1:8080"
+
+[security]
+# Master key used to encrypt at-rest secrets (exchange API credentials stored in
+# the database) and to support masking of raw API logs. Set a strong value in
+# real deployments and keep this file secret.
+master_key = ""
