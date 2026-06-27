@@ -6,5 +6,7 @@
 // its own symbol strings to canonical ones. Quote units may be USDT or IRT/IRR;
 // the system tracks both and the per-exchange USDT price.
 //
-// Implemented in PR4 (exchange abstraction). Placeholder for the PR1 skeleton.
+// Implemented in PR4 (see market.go). The arbitrage-accounting types from the
+// sibling system are intentionally NOT ported here — domain holds only the clean
+// normalized market vocabulary.
 package domain

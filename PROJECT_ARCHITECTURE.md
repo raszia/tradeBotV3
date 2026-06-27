@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR3 — Core models, state machine, and validation.**
+Last updated: **PR4 — Exchange abstraction layer.**
 
 ---
 
@@ -125,6 +125,8 @@ Implemented (**PR2**, migrations `002`–`007`):
   `exchange_health_current`, `exchange_health_samples`, `api_call_logs`,
   `app_logs`, `comparison_events`, `signals`.
 - **Discovery runs (007):** `market_discovery_runs`.
+- **PR4 (008):** adds `api_call_logs.exchange_code` (+ index) so the raw-API IO
+  logger can attribute logs by exchange code.
 
 Planned (**PR15**): `market_regime_baskets`, `market_regime_basket_symbols`,
 `market_regime_timeframes`, `market_regime_current`, `market_regime_history`.
@@ -294,19 +296,73 @@ auto-sends**; the safe default for any ambiguity is `NEEDS_RECONCILE`.
 order merely missing from open-orders is **not** proof it never filled). A
 periodic poll backstop complements steady-state WebSocket order updates.
 
-## 12. Exchange abstraction design (PR4)
+## 12. Exchange abstraction layer (implemented in PR4)
 
-A normalized interface (`GetMarkets`, `GetBalances`, `PlaceOrder`, `CancelOrder`,
-`GetOrder`, `GetOpenOrders`, `SubscribeOrderBook`, `SubscribeOrderUpdates`) hides
-per-exchange differences, with normalized models (market, order book, balance,
-order status, **order event**, API error). Both WebSocket updates and polling
-results convert into the **same** normalized order-event model, so the order
-processor has one code path regardless of how an exchange reports.
+The required interface surface is split into two interfaces so the collector/
+regime modules never depend on private credentials (rule #8):
 
-Order **type/time-in-force** is a field set by the owner's trading logic; the
-abstraction does not impose IOC or any strategy. Clients are ported/adapted from
-the sibling system; **no new clients are written from scratch** without first
-inspecting the existing code (decision: copy & adapt from `iranArb`).
+- **`exchanges.PublicClient`** (no credentials): `GetMarkets`, `GetOrderBook`,
+  `SubscribeOrderBook`.
+- **`exchanges.PrivateClient`** (credentials): `GetBalances`, `PlaceOrder`,
+  `CancelOrder`, `GetOrder`, `GetOpenOrders`, `SubscribeOrderUpdates`.
+
+Normalized models: `domain.{OrderBook,Level,Balance,SymbolRules}`,
+`exchanges.NormalizedMarket`, `exchanges.NormalizedAPIError` (+ `ErrorCategory`,
+wraps `execution.Err*` sentinels), and `execution.{OrderRequest,OrderAck,
+OrderStatus,Fill,NormalizedOrderState,NormalizedOrderEvent}`. Both WebSocket and
+polling results convert into the **same** `NormalizedOrderEvent`
+(`EventFromStatus`/`EventFromAck`), so PR10's processor has one code path.
+
+- **Order type/time-in-force are request fields** set by the owner's logic — the
+  layer imposes no IOC/market/post-only.
+- **Credentials** come from a `CredentialProvider` (real impl reads encrypted DB
+  rows later; PR4 uses `StaticCredentialProvider` in tests). Never from env.
+- **Secret masking** is centralized: `BuildHTTPClient` wraps the transport with a
+  logging round-tripper (`internal/exchanges/mask.go` + `iolog.go`) that masks
+  API keys/secrets/passphrases/Authorization/signatures/tokens/cookies in
+  headers, JSON/form bodies, and signed URL query params **before** writing
+  `api_call_logs`. Adapters never log themselves. (PR4 added migration `008`
+  adding `api_call_logs.exchange_code`.)
+- **Factory**: each adapter self-registers in `init()` via `Register(...)` with
+  its capability matrix + public/private constructors. `NewPublicClient` /
+  `NewPrivateClient` build by code; unknown ops return a typed `ErrUnsupported`.
+
+**Exchanges ported (copy & adapt from `iranArb`):** Binance (public-only — it is
+the price REFERENCE; the strategy never trades on it), Nobitex, Wallex, Bitpin
+(public + private), Ramzinex, Tabdeal, Exir (public-only price sources).
+
+**Capability matrix** (✓ supported, — not / unsupported-for-now):
+
+| code | Markets | Book REST | Book WS | Balances | Place/Cancel/GetOrder/Open | OrderUpd WS | Status poll | ClientOrderID |
+|---|---|---|---|---|---|---|---|---|
+| binance | ✓ | ✓ | ✓ | — | — (read-only) | — | — | — |
+| nobitex | ✓ | ✓ | — | ✓ | ✓ | — | ✓ | ✓ |
+| wallex | ✓ | ✓ | — | ✓ | ✓ (keyed by client_id) | — | ✓ | ✓ |
+| bitpin | ✓ | ✓ | — | ✓ | ✓ | — | ✓ | ✓ (identifier) |
+| ramzinex | ✓ | ✓ | — | — | — | — | — | — |
+| tabdeal | — | ✓ | — | — | — | — | — | — |
+| exir | — | ✓ | — | — | — | — | — | — |
+
+**Per-exchange limitations (also in each adapter's file header):**
+- **Binance** read-only here; WS delivers `depth20@100ms` partial-book snapshots.
+- **Nobitex** quotes in RIAL (×0.1 → IRT); Token auth (no signing); `clientOrderId`
+  ≤32 chars; multipart-form placement, JSON reads; 200-with-`status:failed`
+  business errors; private/book WS (Centrifuge) deferred → polling.
+- **Wallex** orders are **keyed by `client_id`, not an exchange order id** (cancel/
+  get take the client id); TMN→IRT; `x-api-key` auth; WS deferred → polling.
+- **Bitpin** JWT access/refresh token flow (cached ~14m); rate-limit sensitive
+  (429 back-off); underscore symbols (`BTC_IRT`); `identifier` = client order id;
+  WS deferred → polling.
+- **Ramzinex** order book keyed by numeric pair-id (resolved from the pairs
+  endpoint); RIAL (×0.1 → IRT); Centrifuge WS deferred.
+- **Tabdeal / Exir** public-only price sources, TOMAN/IRT, no markets-list
+  endpoint (`GetMarkets` → `ErrUnsupported`); WS deferred.
+
+**Decision — WebSocket subscriptions deferred:** PR4 ports the REST surfaces
+faithfully and honestly reports `OrderBookWS`/`OrderUpdatesWS` = false for the
+Iranian venues (returning `ErrUnsupported`), with polling as the supported path.
+The reconciler/poll backstop already make polling the safety baseline; WS is an
+additive enhancement for a later PR. Binance order-book WS is implemented.
 
 ## 13. Config & versioning design (PR6)
 
@@ -438,13 +494,19 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR3 the system has schema + a state machine but no trading
-  behaviour.** Service binaries boot, verify the schema, and idle; no market data,
-  no signals, no orders, no reconciliation yet.
-- **PR3 implements only the state machine and minimal models.** Cycle/order
-  *creation* (the first inserts + lock + enqueue) is PR9; fill processing is PR10;
-  the operator/reconciler exit from `NEEDS_RECONCILE` is PR12. The state functions
-  exist and are tested but are not yet called by any service.
+- **Through PR4 the system has schema, a state machine, and exchange adapters but
+  still no trading behaviour.** Service binaries boot, verify the schema, and
+  idle; nothing reads market data, evaluates signals, places orders, or
+  reconciles yet. The exchange adapters are not wired into any running service.
+- **PR4 adapters: WebSocket subscriptions are deferred** for all Iranian venues
+  (`SubscribeOrderBook`/`SubscribeOrderUpdates` return `ErrUnsupported`; polling is
+  the supported path). Binance order-book WS is implemented. Adapter REST surfaces
+  are ported faithfully from iranArb but are tested only with httptest fakes
+  (rule #3 forbids live calls); they should be validated against each real venue
+  in the dry-run / limited-live phases (PR19/PR20) before trading.
+- **PR3 state machine** exists and is tested but is not yet called by any service.
+  Cycle/order *creation* is PR9; fill processing is PR10; the operator/reconciler
+  exit from `NEEDS_RECONCILE` is PR12.
 - Credential **encryption is not implemented** (PR2 added only the at-rest
   schema); **market-discovery execution** is not implemented (only its storage);
   the per-symbol enable/disable **behaviour** (§8a) is documented but enforced in
@@ -466,6 +528,20 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR4 — exchange abstraction is a redesign, not a verbatim copy.** iranArb's
+  `PlaceIOC` (forced IOC) + legacy `*IRT` field names were replaced with a generic
+  `PlaceOrder` (owner-set type/TIF) and quote-native normalized models. Public and
+  private interfaces are split (collector never sees credentials).
+- **PR4 — Binance is public-only** (price reference; the strategy trades on the
+  Iranian venues, never on Binance).
+- **PR4 — WebSocket subscriptions deferred** for Iranian venues; REST + polling is
+  the supported path now, honestly reported via capability flags. WS is additive
+  later. (Binance book WS implemented.)
+- **PR4 — secret masking centralized** in the logging round-tripper; all raw API
+  logs pass through it. Added migration `008` (`api_call_logs.exchange_code`).
+- **PR4 — adapters tested with httptest only** (no live exchange calls, rule #3);
+  real-venue validation happens in PR19/PR20.
 
 - **PR1 (amended) — config is file-only; no environment variables.** Bootstrap
   config is read from a TOML file located via the `-config` flag (default
@@ -505,7 +581,8 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 |---|---|---|---|
 | PR1 | `pr1-project-skeleton` | **accepted** | Project skeleton & shared foundation: module layout, all 9 binaries bootable, **file-only bootstrap config** (no env; `-config` flag; secret redaction), slog logging, `db.Store`+pool+`WithTx`, Redis wrapper, in-code migration runner (GET_LOCK + checksum + DDL/DML rules) with `schema_migrations` + `001_app_meta`, scaffold packages, tests, this document. No trading logic. |
 | PR2 | `pr2-database-schema` | **accepted** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
-| PR3 | `pr3-state-machine` | **in review** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
+| PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
+| PR4 | `pr4-exchange-abstraction` | **in review** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
 | PR4 | `pr4-exchange-abstraction` | planned | Normalized exchange layer (ported from iranArb). |
 | PR5 | `pr5-redis-collector` | planned | Redis key schema + collector. |
 | PR6 | `pr6-config-system` | planned | DB-backed versioned config + cache. |
