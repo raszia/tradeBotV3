@@ -7,9 +7,13 @@
 // PLACE_ORDER request in one transaction, or — if the scope is already locked —
 // refresh the existing unsent QUEUED buy instead of duplicating it (§2a).
 //
+// It also runs the sell-side Manager (internal/sellflow, PR11) on a periodic pass:
+// for cycles whose buy has filled it creates/polls/reprices the resting exit sell
+// using the Binance reference price, and closes the cycle on a full exit.
+//
 // HARD boundary: the engine NEVER calls an exchange (no private clients, no
-// PlaceOrder/CancelOrder) and NEVER sends an order — the order-executor does that
-// later (PR10+).
+// PlaceOrder/CancelOrder) and NEVER sends an order — it only writes DB rows + queue
+// requests; the order-executor is the sole component that talks to exchanges.
 package engine
 
 import (

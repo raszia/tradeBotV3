@@ -39,17 +39,20 @@ func TestLoadMarkets(t *testing.T) {
 		"sc_id", "min_spread_bps", "buy_size", "buy_size_unit", "sell_offset_bps",
 		"reprice_interval_seconds", "order_timeout_ms", "max_retries", "retry_backoff_ms", "config_version",
 		"maker_first_enabled", "maker_attempts_before_taker", "maker_signal_window_seconds",
-		"maker_wait_before_cancel_ms", "maker_price_offset_bps", "taker_price_mode", "max_taker_slippage_bps"}
+		"maker_wait_before_cancel_ms", "maker_price_offset_bps", "taker_price_mode", "max_taker_slippage_bps",
+		"tick_size", "step_size", "min_order_amount", "min_order_quantity"}
 	rows := sqlmock.NewRows(cols).
 		// market 1 with a symbol_config (maker-first, escalate after 2 attempts)
 		AddRow(int64(1), int64(3), "nobitex", "BTC/IRT", 1, 1, 1, 1,
 			int64(1), int64(50), "0.001", "base", int64(30),
 			int64(5), int64(3000), int64(3), int64(500), int64(7),
-			1, int64(2), int64(90), int64(2500), int64(8), "ASK", int64(40)).
-		// market 2 with NO symbol_config (LEFT JOIN nulls)
+			1, int64(2), int64(90), int64(2500), int64(8), "ASK", int64(40),
+			"0.01", "0.0001", "10", "0.001").
+		// market 2 with NO symbol_config (LEFT JOIN nulls); market still has venue precision
 		AddRow(int64(2), int64(4), "wallex", "ETH/IRT", 1, 0, 0, 1,
 			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
-			nil, nil, nil, nil, nil, nil, nil)
+			nil, nil, nil, nil, nil, nil, nil,
+			nil, nil, nil, nil)
 	mock.ExpectQuery("FROM exchange_markets").WillReturnRows(rows)
 
 	snap := emptySnapshot()
@@ -66,6 +69,10 @@ func TestLoadMarkets(t *testing.T) {
 	if !m1.Maker.MakerFirstEnabled || m1.Maker.MakerAttemptsBeforeTaker != 2 ||
 		m1.Maker.MakerPriceOffsetBps != 8 || m1.Maker.TakerPriceMode != "ASK" || m1.Maker.MaxTakerSlippageBps != 40 {
 		t.Errorf("market 1 maker policy = %+v", m1.Maker)
+	}
+	if !m1.TickSize.Equal(mustDec("0.01")) || !m1.StepSize.Equal(mustDec("0.0001")) ||
+		!m1.MinOrderAmount.Equal(mustDec("10")) || !m1.MinOrderQuantity.Equal(mustDec("0.001")) {
+		t.Errorf("market 1 precision = tick %s step %s minAmt %s minQty %s", m1.TickSize, m1.StepSize, m1.MinOrderAmount, m1.MinOrderQuantity)
 	}
 	m2 := snap.MarketsByID[2]
 	if m2.HasSymbolConfig {

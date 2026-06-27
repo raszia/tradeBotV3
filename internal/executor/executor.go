@@ -168,11 +168,17 @@ func (e *Executor) process(ctx context.Context, c queue.Claimed) {
 	case queue.TypeGetOrder:
 		var fp orders.FollowupPayload
 		_ = json.Unmarshal(c.Payload, &fp)
-		// A GET_ORDER tagged as the simulated-IOC final status check (and tied to an
-		// order+cycle) drives the fill processing; any other GET_ORDER is read-only.
-		if fp.Purpose == orders.PurposeFinalStatus && c.OrderID != nil && c.CycleID != nil {
-			e.handleFinalStatus(ctx, sendCtx, c, fp, client)
-			return
+		// Order-tied GET_ORDERs drive fill processing (buy final status / sell status);
+		// any other GET_ORDER is read-only.
+		if c.OrderID != nil && c.CycleID != nil {
+			switch fp.Purpose {
+			case orders.PurposeFinalStatus:
+				e.handleFinalStatus(ctx, sendCtx, c, fp, client)
+				return
+			case orders.PurposeSellStatus:
+				e.handleSellStatus(ctx, sendCtx, c, fp, client)
+				return
+			}
 		}
 		st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
 		e.handleReadOnly(ctx, c, mustJSON(st), err)
@@ -184,9 +190,20 @@ func (e *Executor) process(ctx context.Context, c queue.Claimed) {
 		list, err := client.GetOpenOrders(sendCtx, p.Symbol)
 		e.handleReadOnly(ctx, c, mustJSON(list), err)
 	case queue.TypePlaceOrder:
-		e.handlePlace(ctx, sendCtx, c, client)
+		// Buy = simulated IOC; sell = resting. Routed by the payload side.
+		if orders.PayloadSide(c.Payload) == "sell" {
+			e.handleSellPlace(ctx, sendCtx, c, client)
+		} else {
+			e.handlePlace(ctx, sendCtx, c, client)
+		}
 	case queue.TypeCancelOrder:
-		e.handleCancel(ctx, sendCtx, c, client)
+		var fp orders.FollowupPayload
+		_ = json.Unmarshal(c.Payload, &fp)
+		if fp.Purpose == orders.PurposeSellReprice {
+			e.handleSellCancel(ctx, sendCtx, c, fp, client)
+		} else {
+			e.handleCancel(ctx, sendCtx, c, client)
+		}
 	default:
 		e.failTx(ctx, c.ID, "unknown request type "+string(c.Type))
 	}
@@ -328,6 +345,95 @@ func (e *Executor) handleFinalStatus(ctx, sendCtx context.Context, c queue.Claim
 	})
 	if txErr != nil && e.log != nil {
 		e.log.Warn("final-status processing tx failed (rolled back)", "id", c.ID, "err", txErr)
+	}
+}
+
+// handleSellPlace sends a resting exit sell (no auto-cancel scheduled) and records
+// the ack via orders.OnSellPlaceAck. Same conservative classification as the buy:
+// definite rejection → clean fail; ambiguous → DEAD + NEEDS_RECONCILE, never re-sent.
+func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
+	intent, err := orders.ParseSellIntent(c.Payload)
+	if err != nil {
+		e.failTx(ctx, c.ID, "bad sell PLACE_ORDER payload: "+err.Error())
+		return
+	}
+	if c.OrderID == nil || c.CycleID == nil {
+		e.failTx(ctx, c.ID, "sell PLACE_ORDER missing order/cycle context")
+		return
+	}
+	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
+		return
+	}
+	ack, err := client.PlaceOrder(sendCtx, intent.OrderRequest(c.Symbol))
+	if err == nil {
+		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnSellPlaceAck(ctx, tx, e.q, orders.SellPlaceAckParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Ack: ack, RawResp: mustJSON(ack),
+			})
+		})
+		if txErr != nil && e.log != nil {
+			e.log.Warn("sell place completion tx failed (rolled back)", "id", c.ID, "err", txErr)
+		}
+		return
+	}
+	if isDefiniteRejection(err) {
+		_ = e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: "sell place rejected: " + err.Error(),
+			})
+		})
+		return
+	}
+	e.deadReconcile(ctx, c, "sell place ambiguous outcome: "+err.Error())
+}
+
+// handleSellCancel sends a reprice CANCEL and records it via orders.OnSellCancelResult
+// (which schedules the final sell-status read). Ambiguous cancel → NEEDS_RECONCILE.
+func (e *Executor) handleSellCancel(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
+	if c.OrderID == nil || c.CycleID == nil {
+		e.failTx(ctx, c.ID, "sell CANCEL_ORDER missing order/cycle context")
+		return
+	}
+	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
+		return
+	}
+	err := client.CancelOrder(sendCtx, fp.ExchangeOrderID)
+	if err == nil || isDefiniteRejection(err) {
+		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnSellCancelResult(ctx, tx, e.q, orders.SellCancelParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
+				Symbol: c.Symbol, ExchangeOrderID: fp.ExchangeOrderID,
+				RawResp: mustJSON(map[string]any{"cancelled": fp.ExchangeOrderID, "rejected": err != nil}), FinalCheckDelay: e.cfg.FinalStatusDelay,
+			})
+		})
+		if txErr != nil && e.log != nil {
+			e.log.Warn("sell cancel completion tx failed (rolled back)", "id", c.ID, "err", txErr)
+		}
+		return
+	}
+	e.deadReconcile(ctx, c, "sell cancel ambiguous outcome: "+err.Error())
+}
+
+// handleSellStatus reads a resting/cancelled sell's status and processes its fills via
+// orders.ProcessSellStatus. Transient errors reschedule; a missing order / definitive
+// error is processed as ambiguous → NEEDS_RECONCILE.
+func (e *Executor) handleSellStatus(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
+	st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
+	if err != nil && !errors.Is(err, execution.ErrOrderUnknown) && isRetryable(err) {
+		if _, sErr := e.q.ScheduleRetry(ctx, c.ID, err.Error()); sErr != nil && e.log != nil {
+			e.log.Warn("schedule sell-status retry failed", "id", c.ID, "err", sErr)
+		}
+		return
+	}
+	txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		_, perr := orders.ProcessSellStatus(ctx, tx, e.q, orders.SellStatusParams{
+			RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Scope: c.ExchangeCode,
+			Symbol: c.Symbol, Status: st, StatusErr: err, RawResp: mustJSON(st),
+		})
+		return perr
+	})
+	if txErr != nil && e.log != nil {
+		e.log.Warn("sell-status processing tx failed (rolled back)", "id", c.ID, "err", txErr)
 	}
 }
 

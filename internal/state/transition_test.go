@@ -102,6 +102,17 @@ func TestCycleCleanCancelFromBuyPhase(t *testing.T) {
 	}
 }
 
+func TestCyclePartialBuyCanStartSell(t *testing.T) {
+	// A partially-filled buy has real inventory (the filled portion) and may sell it
+	// directly (PR11) without first reaching BUY_FILLED.
+	if err := ValidateCycleTransition(CycleBuyPartiallyFilled, CycleSellRequestQueued); err != nil {
+		t.Errorf("BUY_PARTIALLY_FILLED->SELL_REQUEST_QUEUED should be legal: %v", err)
+	}
+	if err := ValidateCycleTransition(CycleBuyPartiallyFilled, CycleBuyFilled); err != nil {
+		t.Errorf("BUY_PARTIALLY_FILLED->BUY_FILLED should remain legal: %v", err)
+	}
+}
+
 func TestCycleHappyPathChainIsLegal(t *testing.T) {
 	chain := []CycleState{
 		CycleNew, CycleSignalDetected, CycleBuyRequestQueued, CycleBuySubmitted,

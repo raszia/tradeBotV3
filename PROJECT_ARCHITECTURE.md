@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR10 — Order/fill processing & simulated-IOC buy execution.**
+Last updated: **PR11 — Exit sell, management & repricing.**
 
 ---
 
@@ -695,6 +695,78 @@ error simply reschedules the read instead of finalizing.
 sell on the filled quantity, repricing, and closing the cycle. Steady-state WS order
 updates are also later. The operator exit from NEEDS_RECONCILE remains a later PR.
 
+## 10c. Exit sell, management & repricing (implemented in PR11 — `internal/sellflow`)
+
+PR11 is the exit side: once a buy is confirmed **filled or partially filled** (PR10
+leaves the cycle at `BUY_FILLED`/`BUY_PARTIALLY_FILLED`, lock held, with the buy
+order's `filled_quantity` recorded), the trade-engine's **sell Manager** creates and
+manages a resting limit sell on the **filled quantity only**, reprices it as Binance
+moves, and closes the cycle on a full exit. Like all decision-side code it NEVER
+calls an exchange — it writes DB rows + queue requests; the executor sends them and
+`internal/orders` processes the results.
+
+**Driver.** The trade-engine runs a periodic `sellflow.Manager.Pass` (default every
+2s) alongside the market-event loop. Each pass scans open sell cycles and, per cycle
+(only when `enabled_for_sell_manage`), dispatches: create the sell, poll its status,
+or reprice it. The Manager gets the Binance reference price (converted into the
+Iranian quote, same as the buy signal) from the engine; a missing/stale price simply
+skips price-dependent actions that pass.
+
+**Sell quantity = actual filled inventory.** `CreateSell` sells `bought − already
+sold` (the buy order's `filled_quantity` minus the sum of prior sell fills), floored
+to the venue `step_size`. The originally *requested* buy quantity is never treated as
+inventory.
+
+**Sell price (owner rule, not hardcoded).** `price = floor( binanceRef ×
+(1 − sell_offset_bps/10000) , tick_size )` — slightly below the Binance reference so
+the resting sell fills against local buyers, floored to the venue tick. Both
+`sell_offset_bps` and the venue `tick_size`/`step_size`/`min_order_*` come from DB
+config (`MarketConfig`). A sell below the venue minimum (`min_order_quantity` /
+`min_order_amount`) is not placed.
+
+**Transactional create (one tx).** Insert the `exit_sell` order → cycle
+`BUY_FILLED`/`BUY_PARTIALLY_FILLED`/`SELL_REPRICE_PENDING → SELL_REQUEST_QUEUED` +
+order `NEW→REGISTERED→QUEUED` (state machine) → enqueue the sell `PLACE_ORDER`
+(payload tagged `side:sell`) → commit. Rollback on any failure. **No-duplicate:** it
+refuses (`ErrSellExists`) when an active sell order already exists for the cycle.
+
+**Resting place + fill polling.** A sell `PLACE_ORDER` is routed by the executor
+(payload `side`) to `OnSellPlaceAck`: order `→ACKED`, cycle `→SELL_SUBMITTED`, and —
+unlike the buy IOC — **no auto-cancel** is scheduled (it rests). The Manager keeps at
+most one outstanding `sell_status` `GET_ORDER` poll per resting sell; the executor
+runs it through `ProcessSellStatus`, which records fills and drives the cycle on the
+**cumulative** sold-vs-bought quantity:
+- partial (resting) → order `PARTIALLY_FILLED`, cycle `SELL_PARTIALLY_FILLED` (keep
+  managing the remainder — never sell more than the held inventory);
+- full (cumulative sold ≥ bought) → close (below);
+- ambiguous / fetch error / missing order → order+cycle `NEEDS_RECONCILE` (lock held).
+
+**Repricing (cancel → replace, interval-gated).** When the reference moves, the
+Manager reprices — but only when `reprice_interval_seconds` has elapsed
+(`last_reprice_at`), and **never** while a sell place/cancel is `CLAIMED`/`IN_FLIGHT`.
+`RepriceSell` cancels the resting sell (cycle `→SELL_REPRICE_PENDING`, order
+`→CANCEL_PENDING`, enqueue a `sell_reprice` `CANCEL_ORDER`); `OnSellCancelResult`
+schedules a final `sell_status` read (the cancel may have raced a fill, so we never
+assume). That read records the cancelled order's fills, then the Manager creates the
+replacement sell for the **remaining** inventory at the fresh price (or, if the cancel
+raced a full fill, the cycle closes directly from `SELL_REPRICE_PENDING`). An
+ambiguous cancel/place → `NEEDS_RECONCILE`, never re-sent.
+
+**Close + PnL + lock release.** A full exit moves the cycle `→SELL_FILLED→CLOSED`,
+writes the exit accounting (`sold_quantity`, `avg_sell_price`, `sell_quote`,
+`sell_fee`/`sell_fee_asset`, `net_quantity`, `realized_quote`, `close_reason`,
+`closed_at`; migration 012), and **releases the symbol lock** — the only point a
+fully-exited cycle frees its scope. `realized_quote = sell_proceeds − buy_cost`, with
+fees netted **only when denominated in the quote currency** (fees in other assets are
+stored raw, not silently folded in). Everything (queue status, order/cycle
+transitions, fills, lock release) commits in one transaction; repeated processing is
+idempotent.
+
+**What PR11 does NOT do (→ later):** steady-state WebSocket order updates (polling is
+the supported path); per-venue individual fills (one aggregate fill row per status);
+multi-leg / cross-asset fee conversion for `realized_quote`; the operator exit from
+`NEEDS_RECONCILE`.
+
 ## 11. Reconciler (implemented in PR12 — `internal/reconciler`)
 
 The reconciler makes the system safe after restart/timeout/partial-fill/
@@ -1014,12 +1086,15 @@ start.
   filled/partial-fill cycles as `NEEDS_RECONCILE` rather than closing them. Exit
   from `NEEDS_RECONCILE` is operator-only (the operator path is a later PR). The
   recent-fills resolution path is unavailable until adapters expose it.
-- **PR10 processes the buy side only.** The sell side (exit sell on the filled
-  quantity, repricing, closing the cycle) is **PR11**; until then a `BUY_FILLED`/
-  `BUY_PARTIALLY_FILLED` cycle holds its lock and waits. Fills are recorded as one
-  aggregate row per final status (from `GET_ORDER` aggregates); per-venue individual
-  fills (via order-update streams) are a later refinement. The operator exit from
+- **PR11 closes the buy→sell round trip.** Fills (buy and sell) are recorded as one
+  aggregate row per status (from `GET_ORDER` aggregates); per-venue individual fills
+  (via order-update streams / WebSocket) are a later refinement, as is fee conversion
+  across non-quote assets for `realized_quote`. The operator exit from
   `NEEDS_RECONCILE` is still a later PR.
+- **Sell management is polling-based:** the engine reprices/polls on a periodic pass
+  (default 2s) reading the Binance reference from Redis; there is no steady-state
+  WebSocket order-update path yet. A cycle whose reference price is missing/stale is
+  left untouched that pass (never priced on stale data).
 - **Gated integration tests share one MariaDB/Redis** and include a global open-cycle
   scan (the reconciler), so the gated suite must be run with **`go test -p 1 ./...`**
   (serial packages) to avoid cross-package contention. The default offline
@@ -1064,6 +1139,27 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR11 — sell quantity is the actual filled inventory** (`bought − sold`, floored to
+  `step_size`), never the requested buy quantity. Partial buys sell their filled part
+  (added `BUY_PARTIALLY_FILLED → SELL_REQUEST_QUEUED`).
+- **PR11 — sell price** `floor(binanceRef × (1 − sell_offset_bps/10000), tick)`; offset
+  and venue tick/step/min are DB config (loaded into `MarketConfig` from
+  `exchange_markets`). Below-minimum sells are not placed.
+- **PR11 — the resting sell schedules no auto-cancel** (unlike the buy IOC); fills are
+  observed by a Manager-driven `sell_status` poll (one outstanding per sell). WS order
+  updates deferred.
+- **PR11 — repricing is cancel→replace, interval-gated** (`reprice_interval_seconds`,
+  `last_reprice_at`), skipped while a sell place/cancel is `CLAIMED`/`IN_FLIGHT`; the
+  cancel's final status is always read before reselling (cancel may race a fill);
+  ambiguous cancel/place → `NEEDS_RECONCILE`, never re-sent.
+- **PR11 — the symbol lock releases only on a full exit** (`SELL_FILLED → CLOSED`); a
+  clean zero-fill buy (PR10) is the only other release. `realized_quote` nets fees
+  only when they are denominated in the quote currency (other-asset fees stored raw).
+- **PR11 — the sell Manager runs in the trade-engine** (it has the Redis reference
+  price + config cache); it writes DB rows + queue requests only — the executor stays
+  the sole mutating exchange caller. `RETRY_SCHEDULED retry_count==0` marks scheduled
+  reprice/status steps (vs `>0` retries) — see §8.
 
 - **PR10 — simulated IOC is modelled as queued/scheduled work**, not a worker sleep:
   after a place ack the cancel is enqueued with a future `next_retry_at`, and after
@@ -1234,4 +1330,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
 | PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
 | PR9 | `pr9-cycle-creation-buy-enqueue` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
-| PR10 | `pr10-order-fill-processing` | **in review** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
+| PR10 | `pr10-order-fill-processing` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
+| PR11 | `pr11-sell-management` | **in review** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |

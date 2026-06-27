@@ -79,9 +79,13 @@ var cycleTransitions = map[CycleState]map[CycleState]bool{
 		CycleFailed:    true,
 	},
 	CycleBuyPartiallyFilled: {
-		CycleBuyFilled:     true,
-		CycleCancelPending: true,
-		CycleFailed:        true,
+		CycleBuyFilled: true,
+		// A partially-filled buy still has real inventory (the filled portion), so it
+		// may go straight to the sell flow on that quantity (PR11) — we don't wait for
+		// a full buy that won't come.
+		CycleSellRequestQueued: true,
+		CycleCancelPending:     true,
+		CycleFailed:            true,
 	},
 	CycleBuyFilled: {
 		CycleSellRequestQueued: true,
@@ -102,8 +106,11 @@ var cycleTransitions = map[CycleState]map[CycleState]bool{
 	CycleSellRepricePending: {
 		CycleSellRequestQueued: true,
 		CycleSellSubmitted:     true,
-		CycleCancelPending:     true,
-		CycleFailed:            true,
+		// The reprice cancel can race a fill: a full exit may be discovered while the
+		// cancel is in flight, so allow closing directly from here (PR11).
+		CycleSellFilled:    true,
+		CycleCancelPending: true,
+		CycleFailed:        true,
 	},
 	CycleSellPartiallyFilled: {
 		CycleSellFilled:         true,

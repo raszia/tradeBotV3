@@ -41,7 +41,8 @@ SELECT em.id, em.exchange_id, e.code, em.canonical_symbol,
        sc.exchange_market_id, sc.min_spread_bps, sc.buy_size, sc.buy_size_unit, sc.sell_offset_bps,
        sc.reprice_interval_seconds, sc.order_timeout_ms, sc.max_retries, sc.retry_backoff_ms, sc.config_version,
        sc.maker_first_enabled, sc.maker_attempts_before_taker, sc.maker_signal_window_seconds,
-       sc.maker_wait_before_cancel_ms, sc.maker_price_offset_bps, sc.taker_price_mode, sc.max_taker_slippage_bps
+       sc.maker_wait_before_cancel_ms, sc.maker_price_offset_bps, sc.taker_price_mode, sc.max_taker_slippage_bps,
+       em.tick_size, em.step_size, em.min_order_amount, em.min_order_quantity
 FROM exchange_markets em
 JOIN exchanges e ON e.id = em.exchange_id
 LEFT JOIN symbol_configs sc ON sc.exchange_market_id = em.id`
@@ -115,10 +116,15 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 			makerOffset             sql.NullInt64
 			takerMode               sql.NullString
 			takerSlippage           sql.NullInt64
+			tickSize                decimal.NullDecimal
+			stepSize                decimal.NullDecimal
+			minAmount               decimal.NullDecimal
+			minQty                  decimal.NullDecimal
 		)
 		if err := rows.Scan(&id, &exchangeID, &code, &canonical, &fCol, &fSig, &fTrd, &fSell,
 			&scID, &minSpread, &buySize, &buySizeUnit, &sellOffset, &reprice, &timeout, &maxRetries, &backoff, &scVersion,
-			&makerFirst, &makerAttempts, &makerWindow, &makerWait, &makerOffset, &takerMode, &takerSlippage); err != nil {
+			&makerFirst, &makerAttempts, &makerWindow, &makerWait, &makerOffset, &takerMode, &takerSlippage,
+			&tickSize, &stepSize, &minAmount, &minQty); err != nil {
 			return err
 		}
 		m := MarketConfig{
@@ -151,6 +157,10 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 				TakerPriceMode:           strOrDefault(takerMode, "ASK"),
 				MaxTakerSlippageBps:      int(takerSlippage.Int64), // 0 (incl. NULL) = no cap
 			},
+			TickSize:         tickSize.Decimal,  // zero = no tick constraint
+			StepSize:         stepSize.Decimal,  // zero = no step constraint
+			MinOrderAmount:   minAmount.Decimal, // zero = no min notional
+			MinOrderQuantity: minQty.Decimal,    // zero = no min quantity
 		}
 		snap.MarketsByID[id] = m
 		snap.MarketsBySymbol[canonical] = append(snap.MarketsBySymbol[canonical], m)

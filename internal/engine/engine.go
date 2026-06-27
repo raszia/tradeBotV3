@@ -16,6 +16,7 @@ import (
 	"v3TradeBot/internal/events"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/redis"
+	"v3TradeBot/internal/sellflow"
 )
 
 // Config tunes the signal loop. Defaults are filled by New.
@@ -31,6 +32,8 @@ type Config struct {
 	MaxBookAge time.Duration
 	// LockLeaseSeconds is the symbol-lock lease applied when a buy cycle is created.
 	LockLeaseSeconds int
+	// SellManageInterval is how often the sell-management pass runs (default 2s).
+	SellManageInterval time.Duration
 }
 
 func (c *Config) withDefaults() {
@@ -46,6 +49,9 @@ func (c *Config) withDefaults() {
 	if c.LockLeaseSeconds <= 0 {
 		c.LockLeaseSeconds = 600
 	}
+	if c.SellManageInterval <= 0 {
+		c.SellManageInterval = 2 * time.Second
+	}
 }
 
 // Engine is the trade-engine signal loop. It reads market data from Redis and
@@ -55,13 +61,14 @@ func (c *Config) withDefaults() {
 // PLACE_ORDER request, one transaction). It NEVER calls an exchange and NEVER sends
 // an order — the order-executor does that later (PR10+).
 type Engine struct {
-	store *db.Store
-	rc    *redis.Client
-	cache *configstore.Cache
-	q     *queue.Queue
-	clk   clock.Clock
-	log   *slog.Logger
-	cfg   Config
+	store   *db.Store
+	rc      *redis.Client
+	cache   *configstore.Cache
+	q       *queue.Queue
+	sellMgr *sellflow.Manager
+	clk     clock.Clock
+	log     *slog.Logger
+	cfg     Config
 }
 
 // New builds an Engine. cfg is copied and defaulted.
@@ -77,7 +84,43 @@ func New(store *db.Store, rc *redis.Client, cache *configstore.Cache, clk clock.
 	if store != nil {
 		q = queue.New(store.DB(), clk)
 	}
-	return &Engine{store: store, rc: rc, cache: cache, q: q, clk: clk, log: log, cfg: cfg}
+	e := &Engine{store: store, rc: rc, cache: cache, q: q, clk: clk, log: log, cfg: cfg}
+	if store != nil && rc != nil {
+		// Sell-side manager (PR11): drives exit-sell creation/poll/reprice using the
+		// engine's Binance reference price. It writes DB rows + queue requests only.
+		e.sellMgr = sellflow.NewManager(store, q, cache, e.sellRefPrice, clk, log)
+	}
+	return e
+}
+
+// sellRefPrice is the sellflow.RefPrice provider: the Binance reference for a market,
+// converted into the Iranian quote unit (same conversion as the buy signal).
+func (e *Engine) sellRefPrice(m configstore.MarketConfig) (decimal.Decimal, string, string, bool) {
+	return e.binanceRefFor(context.Background(), m)
+}
+
+// binanceRefFor returns the Binance best-bid reference for a market, converted into
+// the Iranian quote unit, with ok=false when any input is missing or stale.
+func (e *Engine) binanceRefFor(ctx context.Context, m configstore.MarketConfig) (decimal.Decimal, string, string, bool) {
+	now := e.clk.Now()
+	base := baseOf(m.CanonicalSymbol)
+	rb, err := e.rc.LoadOrderBook(ctx, e.cfg.ReferenceExchange, base+"/USDT")
+	if err != nil {
+		return decimal.Zero, "", "", false
+	}
+	refBid, ok := rb.Book.BestBid()
+	if !ok || !refBid.Price.IsPositive() || rb.Stale(e.cfg.MaxBookAge, now) {
+		return decimal.Zero, "", "", false
+	}
+	quote := quoteOf(m.CanonicalSymbol)
+	if isUSDTQuote(quote) {
+		return refBid.Price, quote, "", true
+	}
+	ps, err := e.rc.LoadPrice(ctx, m.ExchangeCode, e.cfg.QuoteRateSymbol)
+	if err != nil || !ps.BestBid.IsPositive() || ps.Stale(e.cfg.MaxBookAge, now) {
+		return decimal.Zero, "", "", false
+	}
+	return refBid.Price.Mul(ps.BestBid), quote, ps.BestBid.String(), true
 }
 
 // Run subscribes to market events and evaluates the affected Iranian markets until
@@ -90,6 +133,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	e.log.Info("trade-engine signal loop started",
 		"reference_exchange", e.cfg.ReferenceExchange, "max_book_age", e.cfg.MaxBookAge)
+
+	// Sell-side management runs on its own cadence (creating/polling/repricing exit
+	// sells for filled cycles) alongside the market-event signal loop.
+	if e.sellMgr != nil {
+		go e.runSellManagement(ctx)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -105,6 +155,22 @@ func (e *Engine) Run(ctx context.Context) error {
 					e.log.Warn("evaluate failed", "exchange", m.ExchangeCode,
 						"symbol", m.CanonicalSymbol, "err", err)
 				}
+			}
+		}
+	}
+}
+
+// runSellManagement ticks the sell Manager until ctx is cancelled.
+func (e *Engine) runSellManagement(ctx context.Context) {
+	t := time.NewTicker(e.cfg.SellManageInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := e.sellMgr.Pass(ctx); err != nil {
+				e.log.Warn("sell-management pass failed", "err", err)
 			}
 		}
 	}

@@ -42,6 +42,13 @@ type MarketConfig struct {
 	RetryBackoffMs         int
 	SymbolConfigVersion    int64 // the config_version stamped on this symbol_config
 
+	// Venue precision/limits (from exchange_markets) — used by the sell flow to snap
+	// price/quantity and enforce minimums. Zero means "not configured / no constraint".
+	TickSize         decimal.Decimal
+	StepSize         decimal.Decimal
+	MinOrderAmount   decimal.Decimal // min notional in quote
+	MinOrderQuantity decimal.Decimal // min base quantity
+
 	// Maker-first / taker-fallback buy policy (§2a). Used by PR9 cycle creation.
 	Maker MakerPolicy
 }
