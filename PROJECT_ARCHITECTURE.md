@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR5 — Redis market data and collector foundation.**
+Last updated: **PR6 — DB-backed versioned config system and cache.**
 
 ---
 
@@ -399,7 +399,7 @@ Iranian venues (returning `ErrUnsupported`), with polling as the supported path.
 The reconciler/poll backstop already make polling the safety baseline; WS is an
 additive enhancement for a later PR. Binance order-book WS is implemented.
 
-## 13. Config & versioning design (PR6)
+## 13. Config & versioning design (read path + versioning implemented in PR6)
 
 **Bootstrap vs database config — a hard split:**
 
@@ -422,11 +422,37 @@ additive enhancement for a later PR. Binance order-book WS is implemented.
   request/response logs). A temporary development-only path, if ever added, must
   be clearly marked temporary and never used in production. (Schema: PR2.)
 
-**All database config is versioned** and edited from the dashboard. Each config
-change records who/old/new/version/activation-time (auditable). The engine loads
-config into an in-memory cache and reloads it **without blocking the trading
-path**. Each cycle stores the `config_version` (and regime config version) used
-when its signal was created.
+**`internal/configstore` (PR6)** implements the DB-backed read path + versioning:
+
+- **Snapshot** — an immutable point-in-time view: per-market config
+  (`MarketConfig` = the four `enabled_for_*` flags from `exchange_markets` LEFT
+  JOIN the trading params from `symbol_configs`), per-exchange config
+  (concurrency/timeouts), fees, retention settings, and the active
+  `config_version`. `Store.LoadSnapshot` builds it; a missing active version is
+  tolerated (`Version = 0`, the "unconfigured" state).
+- **Cache** — a copy-on-write `atomic.Pointer[Snapshot]`. Readers (the trade-engine
+  hot path, later) call `cache.Snapshot()` with **no lock and no DB query**
+  (rule #4). `cache.Run` reloads off the trading path on an interval; a reload
+  **failure retains the previous good snapshot** (a DB blip never wipes config).
+- **Version stamping** (rule #5) — `Snapshot.ConfigVersion()` gives the value a
+  cycle stamps at signal time (PR9); `MarketConfig.SymbolConfigVersion` and
+  `ExchangeConfig.ConfigVersion` are available per entity.
+- **Versioned + audited writes** (rule #3) — `ActivateVersion` supersedes the
+  prior active `config_versions` row and inserts a new active one;
+  `UpdateMinSpreadBps` is the representative write that, in ONE transaction,
+  activates a new version, updates the row, and writes a `config_change_audit`
+  row (entity/field/old/new/changed_by/reason/version/time). **Audit rows never
+  contain secrets** (credential changes use `exchange_credential_audit`).
+- **Validation** (rule #6) — `ValidateMarket`/`ValidateExchange`/`ValidateSnapshot`
+  check value sanity (non-negative spreads/intervals/retries, positive timeouts/
+  concurrency, positive `buy_size` when trading is enabled, valid `buy_size_unit`)
+  and the **enable-flag hierarchy** `trading ⊆ signal ⊆ collection` (so a symbol
+  can't be half-enabled by incomplete config). Referential integrity is enforced
+  by schema FKs.
+
+The dashboard EDIT forms (creating versions/audit via this layer) are PR17; the
+trade-engine consuming the cache is PR8. Each cycle stores the `config_version`
+(and regime config version) used when its signal was created.
 
 ## 14. Dashboard responsibilities (PR16/PR17)
 
@@ -529,9 +555,15 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR5 the system collects market data but does not trade.** The
-  collector caches books/prices in Redis and publishes events; nothing yet
-  consumes those events to evaluate signals, place orders, or reconcile.
+- **Through PR6 the system collects market data and can load/version config, but
+  does not trade.** The collector caches books/prices; the config cache serves
+  snapshots — but nothing yet consumes events or config to evaluate signals,
+  place orders, or reconcile.
+- **PR6 is the config read path + versioning primitives.** The cache is not yet
+  wired into any binary (the trade-engine consumes it in PR8). The only
+  versioned-write helper is the representative `UpdateMinSpreadBps`; the full set
+  of dashboard edit forms is PR17. Credential encryption is still schema-only
+  (PR2); no plaintext is exposed anywhere.
 - **Collector data source:** until market-discovery (later PR) populates
   `exchange_markets` and the dashboard enables symbols, the collector has zero
   targets and idles. It reads `enabled_for_collection`; there is no discovery
@@ -568,6 +600,19 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR6 — config cache is copy-on-write** (`atomic.Pointer[Snapshot]`): readers
+  never lock or hit the DB; reloads swap a new immutable snapshot; a failed reload
+  keeps the last good one.
+- **PR6 — `MarketConfig` merges `exchange_markets` (enable flags) + `symbol_configs`
+  (trading params)** via LEFT JOIN, so a market with no symbol_config still shows
+  its flags (`HasSymbolConfig=false`).
+- **PR6 — enable-flag hierarchy `trading ⊆ signal ⊆ collection`** is enforced by
+  validation to prevent accidental half-enablement.
+- **PR6 — every config write is one transaction: activate version → update row →
+  audit** (`UpdateMinSpreadBps` is the reference). Audit never stores secrets.
+- **PR6 — no active config is a valid state** (`Version=0`); the system runs
+  unconfigured rather than erroring.
 
 - **PR5 — Redis key format keeps `/`.** Canonical symbols (`BTC/USDT`) are used
   verbatim in keys (`orderbook:nobitex:BTC/IRT`); Redis keys are binary-safe so no
@@ -635,6 +680,7 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
 | PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
+| PR6 | `pr6-config-system` | **in review** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR6 | `pr6-config-system` | planned | DB-backed versioned config + cache. |
 | PR7 | `pr7-exchange-request-queue` | planned | Queue + order-executor foundation. |
 | PR12 | `pr12-startup-reconciler` | planned | Startup reconciler (closes the safety core). |

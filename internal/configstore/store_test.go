@@ -1,0 +1,144 @@
+package configstore
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/shopspring/decimal"
+)
+
+func mustDec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
+
+func TestActiveVersion(t *testing.T) {
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	s := New(mockDB)
+
+	mock.ExpectQuery("FROM config_versions WHERE status = 'active'").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(5)))
+	if v, err := s.ActiveVersion(context.Background()); err != nil || v != 5 {
+		t.Fatalf("ActiveVersion = %d, %v", v, err)
+	}
+
+	mock.ExpectQuery("FROM config_versions WHERE status = 'active'").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if _, err := s.ActiveVersion(context.Background()); !errors.Is(err, ErrNoActiveVersion) {
+		t.Fatalf("expected ErrNoActiveVersion, got %v", err)
+	}
+}
+
+func TestLoadMarkets(t *testing.T) {
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	s := New(mockDB)
+
+	cols := []string{"id", "code", "canonical_symbol",
+		"enabled_for_collection", "enabled_for_signal", "enabled_for_trading", "enabled_for_sell_manage",
+		"sc_id", "min_spread_bps", "buy_size", "buy_size_unit", "sell_offset_bps",
+		"reprice_interval_seconds", "order_timeout_ms", "max_retries", "retry_backoff_ms", "config_version"}
+	rows := sqlmock.NewRows(cols).
+		// market 1 with a symbol_config
+		AddRow(int64(1), "nobitex", "BTC/IRT", 1, 1, 1, 1,
+			int64(1), int64(50), "0.001", "base", int64(30),
+			int64(5), int64(3000), int64(3), int64(500), int64(7)).
+		// market 2 with NO symbol_config (LEFT JOIN nulls)
+		AddRow(int64(2), "wallex", "ETH/IRT", 1, 0, 0, 1,
+			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	mock.ExpectQuery("FROM exchange_markets").WillReturnRows(rows)
+
+	snap := emptySnapshot()
+	if err := s.loadMarkets(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	m1 := snap.MarketsByID[1]
+	if !m1.HasSymbolConfig || m1.MinSpreadBps != 50 || m1.BuySizeUnit != "base" || m1.SellOffsetBps != 30 {
+		t.Errorf("market 1 = %+v", m1)
+	}
+	if !m1.EnabledForTrading || !m1.BuySize.Equal(mustDec("0.001")) {
+		t.Errorf("market 1 flags/size = %+v", m1)
+	}
+	m2 := snap.MarketsByID[2]
+	if m2.HasSymbolConfig {
+		t.Errorf("market 2 should have no symbol_config: %+v", m2)
+	}
+	if len(snap.MarketsBySymbol["BTC/IRT"]) != 1 {
+		t.Errorf("MarketsBySymbol not populated")
+	}
+}
+
+func TestLoadExchangeConfigsAndRetention(t *testing.T) {
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	s := New(mockDB)
+
+	mock.ExpectQuery("FROM exchange_configs").WillReturnRows(
+		sqlmock.NewRows([]string{"exchange_id", "code", "max_concurrent_requests", "request_timeout_ms", "max_retries", "retry_backoff_ms", "rate_limit_per_sec", "config_version"}).
+			AddRow(int64(3), "nobitex", 2, int64(5000), int64(4), int64(250), int64(10), int64(7)))
+	snap := emptySnapshot()
+	if err := s.loadExchangeConfigs(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	ec := snap.Exchanges["nobitex"]
+	if ec.MaxConcurrentRequests != 2 || ec.RequestTimeoutMs != 5000 || ec.RateLimitPerSec != 10 {
+		t.Errorf("exchange config = %+v", ec)
+	}
+
+	mock.ExpectQuery("FROM retention_settings").WillReturnRows(
+		sqlmock.NewRows([]string{"table_name", "retention_days", "max_rows", "max_total_bytes", "enabled", "config_version"}).
+			AddRow("api_call_logs", 7, nil, nil, 1, int64(7)))
+	if err := s.loadRetention(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	if r := snap.Retention["api_call_logs"]; r.RetentionDays != 7 || !r.Enabled {
+		t.Errorf("retention = %+v", r)
+	}
+}
+
+func TestActivateVersion(t *testing.T) {
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	s := New(mockDB)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE config_versions SET status='superseded'").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO config_versions").WillReturnResult(sqlmock.NewResult(9, 1))
+	mock.ExpectCommit()
+
+	id, err := s.ActivateVersion(context.Background(), "admin", "tune spreads")
+	if err != nil || id != 9 {
+		t.Fatalf("ActivateVersion = %d, %v", id, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateMinSpreadBpsIsVersionedAndAudited(t *testing.T) {
+	mockDB, mock, _ := sqlmock.New()
+	defer mockDB.Close()
+	s := New(mockDB)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT min_spread_bps FROM symbol_configs").
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"min_spread_bps"}).AddRow(int64(40)))
+	mock.ExpectExec("UPDATE config_versions SET status='superseded'").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO config_versions").WillReturnResult(sqlmock.NewResult(10, 1))
+	mock.ExpectExec("UPDATE symbol_configs SET min_spread_bps").
+		WithArgs(60, int64(10), int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO config_change_audit").
+		WithArgs(int64(10), "symbol_config", int64(1), "min_spread_bps", "40", "60", "admin", "widen").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	version, err := s.UpdateMinSpreadBps(context.Background(), 1, 60, "admin", "widen")
+	if err != nil || version != 10 {
+		t.Fatalf("UpdateMinSpreadBps = %d, %v", version, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

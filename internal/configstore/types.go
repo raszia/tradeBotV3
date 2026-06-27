@@ -1,0 +1,136 @@
+// Package configstore is the DB-backed, versioned TRADING configuration system.
+// It loads operational config (per-market trading params + enable flags,
+// per-exchange limits, fees, retention) from MariaDB into an immutable in-memory
+// Snapshot, served from a copy-on-write Cache so the trading hot path never
+// queries the database. Config changes are versioned (config_versions) and
+// audited (config_change_audit).
+//
+// This is NOT the bootstrap config (internal/config) — that stays a file-only
+// thing for DSN/Redis/secrets. Trading parameters and exchange API keys live in
+// the database, never in env or the bootstrap file.
+package configstore
+
+import (
+	"github.com/shopspring/decimal"
+)
+
+// MarketConfig is the merged per-exchange-market view: the enable flags live on
+// exchange_markets; the trading parameters live on symbol_configs (LEFT JOINed,
+// so a market with no symbol_config still appears with HasSymbolConfig=false).
+type MarketConfig struct {
+	ExchangeMarketID int64
+	ExchangeCode     string
+	CanonicalSymbol  string
+
+	// Per-symbol enable flags (rule #7 — represented here, enforced by the engine
+	// in later PRs).
+	EnabledForCollection bool
+	EnabledForSignal     bool
+	EnabledForTrading    bool
+	EnabledForSellManage bool
+
+	// Trading parameters (present only when HasSymbolConfig is true).
+	HasSymbolConfig        bool
+	MinSpreadBps           int
+	BuySize                decimal.Decimal
+	BuySizeUnit            string // "base" | "quote"
+	SellOffsetBps          int
+	RepriceIntervalSeconds int
+	OrderTimeoutMs         int
+	MaxRetries             int
+	RetryBackoffMs         int
+	SymbolConfigVersion    int64 // the config_version stamped on this symbol_config
+}
+
+// ExchangeConfig is per-exchange operational config (concurrency, timeouts).
+type ExchangeConfig struct {
+	ExchangeID            int64
+	ExchangeCode          string
+	MaxConcurrentRequests int
+	RequestTimeoutMs      int
+	MaxRetries            int
+	RetryBackoffMs        int
+	RateLimitPerSec       int
+	ConfigVersion         int64
+}
+
+// FeeConfig is a fee schedule entry. ExchangeMarketID == 0 means the
+// exchange-wide default.
+type FeeConfig struct {
+	ExchangeID       int64
+	ExchangeMarketID int64
+	MakerFee         decimal.Decimal
+	TakerFee         decimal.Decimal
+	ConfigVersion    int64
+}
+
+// RetentionSetting is the retention policy for one high-volume table.
+type RetentionSetting struct {
+	TableName     string
+	RetentionDays int
+	MaxRows       int64
+	MaxTotalBytes int64
+	Enabled       bool
+	ConfigVersion int64
+}
+
+// Snapshot is an immutable point-in-time view of all trading config. It is
+// produced by Store.LoadSnapshot and swapped atomically into the Cache. Readers
+// MUST treat it as read-only (never mutate its maps/slices) — copy-on-write means
+// a reload publishes a brand-new Snapshot rather than mutating this one.
+type Snapshot struct {
+	// Version is the active config_versions id at load time (0 if none active).
+	Version int64
+
+	MarketsByID     map[int64]MarketConfig    // keyed by exchange_market_id
+	MarketsBySymbol map[string][]MarketConfig // keyed by canonical symbol (across exchanges)
+	Exchanges       map[string]ExchangeConfig // keyed by exchange code
+	Fees            map[int64]FeeConfig       // keyed by exchange_market_id (0 = exchange default)
+	Retention       map[string]RetentionSetting
+
+	// LoadedAt is set by the loader (wall clock) for observability; not used for
+	// trading decisions.
+}
+
+// ConfigVersion returns the active global config version to stamp onto a cycle
+// at signal time (rule #5). Per-symbol/exchange versions are on their configs.
+func (s *Snapshot) ConfigVersion() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.Version
+}
+
+// Market returns the config for an exchange_market_id.
+func (s *Snapshot) Market(id int64) (MarketConfig, bool) {
+	if s == nil {
+		return MarketConfig{}, false
+	}
+	m, ok := s.MarketsByID[id]
+	return m, ok
+}
+
+// TradableMarkets returns markets currently enabled_for_trading.
+func (s *Snapshot) TradableMarkets() []MarketConfig {
+	var out []MarketConfig
+	if s == nil {
+		return out
+	}
+	for _, m := range s.MarketsByID {
+		if m.EnabledForTrading {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// emptySnapshot returns a usable, empty snapshot (no active config).
+func emptySnapshot() *Snapshot {
+	return &Snapshot{
+		MarketsByID:     map[int64]MarketConfig{},
+		MarketsBySymbol: map[string][]MarketConfig{},
+		Exchanges:       map[string]ExchangeConfig{},
+		Fees:            map[int64]FeeConfig{},
+		Retention:       map[string]RetentionSetting{},
+	}
+}
