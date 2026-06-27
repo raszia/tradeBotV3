@@ -357,25 +357,34 @@ func TestRefreshWindowExpiryResetsToMaker(t *testing.T) {
 	}
 }
 
-func TestRefreshNoOpWhenClaimed(t *testing.T) {
-	f := setupB(t)
-	m := f.market("USDT", "0.5", "base", policy(true, 2, 10))
-	r, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Simulate the executor having claimed the request.
-	if _, err := f.db.Exec("UPDATE exchange_requests SET status='CLAIMED' WHERE id=?", r.RequestID); err != nil {
-		t.Fatal(err)
-	}
-	ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("200"), f.sig())
-	if err != nil || ok {
-		t.Fatalf("refresh of CLAIMED = %v, %v; want false (not touched)", ok, err)
-	}
-	var ask string
-	f.db.QueryRow("SELECT ask_price_at_decision FROM orders WHERE id=?", r.OrderID).Scan(&ask)
-	if !decimal.RequireFromString(ask).Equal(dec("100")) {
-		t.Errorf("CLAIMED order's price changed to %s; must be untouched (100)", ask)
+func TestRefreshNoOpWhenClaimedOrInFlight(t *testing.T) {
+	// Once the executor has claimed or started sending the request, a refresh must
+	// be a no-op — the QUEUED guard excludes any non-QUEUED status identically.
+	for _, status := range []string{"CLAIMED", "IN_FLIGHT"} {
+		t.Run(status, func(t *testing.T) {
+			f := setupB(t)
+			m := f.market("USDT", "0.5", "base", policy(true, 2, 10))
+			r, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.db.Exec("UPDATE exchange_requests SET status=? WHERE id=?", status, r.RequestID); err != nil {
+				t.Fatal(err)
+			}
+			ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("200"), f.sig())
+			if err != nil || ok {
+				t.Fatalf("refresh of %s = %v, %v; want false (not touched)", status, ok, err)
+			}
+			var ask, payload, mode string
+			f.db.QueryRow("SELECT ask_price_at_decision, intended_execution_mode FROM orders WHERE id=?", r.OrderID).Scan(&ask, &mode)
+			f.db.QueryRow("SELECT payload FROM exchange_requests WHERE id=?", r.RequestID).Scan(&payload)
+			if !decimal.RequireFromString(ask).Equal(dec("100")) || mode != "MAKER_FIRST" {
+				t.Errorf("%s order changed (ask=%s mode=%s); must be untouched (100/MAKER_FIRST)", status, ask, mode)
+			}
+			if !strings.Contains(payload, `"intended_price":"99.9"`) {
+				t.Errorf("%s request payload changed: %s", status, payload)
+			}
+		})
 	}
 }
 
