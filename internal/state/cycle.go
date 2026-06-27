@@ -52,7 +52,10 @@ var terminalCycleStates = map[CycleState]bool{
 var cycleTransitions = map[CycleState]map[CycleState]bool{
 	CycleNew: {
 		CycleSignalDetected: true,
-		CycleFailed:         true,
+		// CANCELLED is the clean "abandoned with no exposure" terminal (e.g. a
+		// zero-fill simulated-IOC attempt); FAILED is reserved for real failures.
+		CycleCancelled: true,
+		CycleFailed:    true,
 	},
 	CycleSignalDetected: {
 		CycleBuyRequestQueued: true,
@@ -62,13 +65,18 @@ var cycleTransitions = map[CycleState]map[CycleState]bool{
 	CycleBuyRequestQueued: {
 		CycleBuySubmitted:  true,
 		CycleCancelPending: true,
-		CycleFailed:        true,
+		// A queued buy abandoned before submission with no exposure → CANCELLED.
+		CycleCancelled: true,
+		CycleFailed:    true,
 	},
 	CycleBuySubmitted: {
 		CycleBuyPartiallyFilled: true,
 		CycleBuyFilled:          true,
 		CycleCancelPending:      true,
-		CycleFailed:             true,
+		// A submitted buy that ends with zero fill and no exposure → CANCELLED
+		// (clean no-fill), not FAILED.
+		CycleCancelled: true,
+		CycleFailed:    true,
 	},
 	CycleBuyPartiallyFilled: {
 		CycleBuyFilled:     true,

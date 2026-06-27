@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,11 +208,18 @@ func TestSafeCloseZeroExposureReleasesLock(t *testing.T) {
 	if ordSt(t, f.db, ord) != string(state.OrderCancelled) {
 		t.Errorf("order = %s, want CANCELLED", ordSt(t, f.db, ord))
 	}
-	if cycState(t, f.db, cyc) != string(state.CycleFailed) {
-		t.Errorf("cycle = %s, want FAILED (safe close)", cycState(t, f.db, cyc))
+	// A clean zero-fill no-exposure cycle closes to CANCELLED (NO_FILL), NOT FAILED.
+	if cycState(t, f.db, cyc) != string(state.CycleCancelled) {
+		t.Errorf("cycle = %s, want CANCELLED (clean no-fill, not FAILED)", cycState(t, f.db, cyc))
 	}
 	if lockState(t, f.db, lock) != "RELEASED" {
 		t.Errorf("lock = %s, want RELEASED", lockState(t, f.db, lock))
+	}
+	// The recorded reason documents it as a no-fill, not a failure.
+	var msg string
+	f.db.QueryRow("SELECT message FROM cycle_state_events WHERE cycle_id=? ORDER BY id DESC LIMIT 1", cyc).Scan(&msg)
+	if !strings.Contains(msg, "ZERO_FILL") {
+		t.Errorf("close reason = %q, want a NO_FILL/ZERO_FILL reason", msg)
 	}
 }
 

@@ -249,11 +249,13 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 		rep.NeedsReconcile++
 	default:
 		// Positive proof: every order terminal with ZERO fill → no exposure → safe
-		// to close. Closes to FAILED (the attempt produced no inventory) and
-		// releases the symbol lock in the SAME transaction.
+		// to close. A clean no-fill is CANCELLED (not FAILED); the lock is released
+		// in the SAME transaction. If CANCELLED isn't legal from the current state,
+		// flag NEEDS_RECONCILE — never force FAILED for a clean no-fill.
 		if r.safeClose(ctx, c) {
 			rep.SafeClosed++
 		} else {
+			r.markCycleNeedsReconcile(ctx, c, "zero-fill but CANCELLED not legal from "+string(c.State)+"; operator review")
 			rep.NeedsReconcile++
 		}
 	}
@@ -358,10 +360,21 @@ func (r *Reconciler) markCycleNeedsReconcile(ctx context.Context, c cycleRow, re
 	r.logDecision(ctx, "cycle_reconcile", "needs_reconcile", c.ID, 0, reason, errStr(err))
 }
 
-// safeClose closes a zero-exposure cycle to FAILED and releases its lock in ONE
-// transaction. Returns false if the close could not be applied (then the caller
-// counts it as needs-reconcile). Reads the cycle state/version fresh inside the tx
-// for a correct CAS.
+// errCannotSafeClose signals that CANCELLED is not a legal transition from the
+// cycle's current state, so the cycle cannot be cleanly closed (the caller flags
+// it NEEDS_RECONCILE instead — never FAILED for a clean no-fill).
+var errCannotSafeClose = errors.New("reconciler: cannot safe-close (cancel not legal from current state)")
+
+// safeCloseReason documents the terminal-state decision for a clean no-fill
+// recovery (rule from the owner): a zero-fill, zero-exposure attempt is NOT a
+// failure — it is a clean abandon, so the cycle goes to CANCELLED, not FAILED.
+const safeCloseReason = "SIMULATED_IOC_ZERO_FILL: all orders terminal with zero fill — no exposure (clean no-fill abandon)"
+
+// safeClose closes a zero-exposure / zero-fill cycle to CANCELLED (a clean
+// no-fill, NOT a failure) and releases its lock in ONE transaction. Returns false
+// if the close could not be applied (CANCELLED illegal from the current state, or
+// a tx error) — the caller then flags NEEDS_RECONCILE, never FAILED. Reads the
+// cycle state/version fresh inside the tx for a correct CAS.
 func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
 	err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 		var curState string
@@ -374,12 +387,12 @@ func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
 		if state.IsTerminalCycle(from) {
 			return nil // already closed by someone else
 		}
-		if err := state.ValidateCycleTransition(from, state.CycleFailed); err != nil {
-			return err
+		if state.ValidateCycleTransition(from, state.CycleCancelled) != nil {
+			return errCannotSafeClose
 		}
 		if _, err := state.ApplyCycleTransition(ctx, tx, state.CycleTransition{
-			CycleID: c.ID, From: from, To: state.CycleFailed, Version: version,
-			EventType: "reconcile_safe_close", Reason: "all orders terminal with zero fill — no exposure",
+			CycleID: c.ID, From: from, To: state.CycleCancelled, Version: version,
+			EventType: "reconcile_no_fill", Reason: safeCloseReason,
 		}); err != nil {
 			return err
 		}
@@ -393,7 +406,10 @@ func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
 		}
 		return nil
 	})
-	r.logDecision(ctx, "cycle_reconcile", "safe_close", c.ID, 0, "zero-exposure terminal cycle closed; lock released", errStr(err))
+	if errors.Is(err, errCannotSafeClose) {
+		return false
+	}
+	r.logDecision(ctx, "cycle_reconcile", "safe_close_no_fill", c.ID, 0, safeCloseReason, errStr(err))
 	return err == nil
 }
 

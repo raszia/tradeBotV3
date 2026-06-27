@@ -460,8 +460,20 @@ yet exposed by the v3 adapters, so that resolution path always falls through to
 **Cycle decision.** After its orders are reconciled: any order needs-reconcile →
 cycle `NEEDS_RECONCILE` (lock kept); some order still active → Continue (resume,
 lock kept); all orders terminal **with any fill** → `NEEDS_RECONCILE` (exposure
-pending PR10 accounting); all orders terminal **with zero fill** → **SafeClose**
-to `FAILED` (no inventory) **and release the lock in the same transaction**.
+pending PR10 accounting); all orders terminal **with zero fill** → **SafeClose**.
+
+**Terminal-state decision for clean zero-fill (owner rule).** A zero-fill,
+zero-exposure attempt is **not a failure** — it is a clean no-fill/abandon. So
+SafeClose moves the cycle to **`CANCELLED`** (reason
+`SIMULATED_IOC_ZERO_FILL`/`NO_FILL`), **not `FAILED`**, and releases the lock in
+the same transaction. `FAILED` is reserved for real failures (unrecoverable
+internal error, confirmed exchange/business failure, unrecoverable invalid state).
+If `CANCELLED` is not a legal transition from the cycle's current state, the cycle
+is flagged `NEEDS_RECONCILE` for the operator — **never forced to `FAILED`**. (The
+state machine permits `CANCELLED` from the buy-phase states `NEW`,
+`SIGNAL_DETECTED`, `BUY_REQUEST_QUEUED`, `BUY_SUBMITTED`, and `CANCEL_PENDING` for
+exactly this clean-abandon case; a `FILLED` buy keeps `→CANCELLED` illegal because
+it holds inventory.)
 
 **Safe-close & lock-release criteria (rules #8/#9).** A lock is released **only**
 when its cycle is positively terminal/safe — never because it is old, the process
@@ -771,6 +783,12 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
   API failure.
 - **PR12 — filled/partial cycles → `NEEDS_RECONCILE`** (fill accounting is PR10);
   the reconciler never closes a cycle with exposure.
+- **PR12 (correction) — clean zero-fill closes to `CANCELLED`, not `FAILED`.** A
+  zero-fill, zero-exposure attempt is a clean no-fill (reason
+  `SIMULATED_IOC_ZERO_FILL`), not a trading failure. `FAILED` is reserved for real
+  failures. The state machine gained `→CANCELLED` from `NEW`/`BUY_REQUEST_QUEUED`/
+  `BUY_SUBMITTED` (in addition to `SIGNAL_DETECTED`/`CANCEL_PENDING`) so a buy-phase
+  abandon can cleanly cancel; `BUY_FILLED→CANCELLED` stays illegal (inventory).
 - **PR12 — `SUBMITTED→CANCELLED` is illegal** in the order machine; a clean
   exchange-cancel is only advanced from `CANCEL_PENDING` (the cancel we
   requested). An unexpected cancel from another state → `NEEDS_RECONCILE`.

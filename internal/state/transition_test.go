@@ -88,6 +88,20 @@ func TestCycleUnknownStateRejected(t *testing.T) {
 	}
 }
 
+func TestCycleCleanCancelFromBuyPhase(t *testing.T) {
+	// A clean no-fill abandon (e.g. zero-fill simulated-IOC) closes to CANCELLED;
+	// this must be legal from the buy-phase states the reconciler may observe.
+	for _, from := range []CycleState{CycleNew, CycleSignalDetected, CycleBuyRequestQueued, CycleBuySubmitted, CycleCancelPending} {
+		if err := ValidateCycleTransition(from, CycleCancelled); err != nil {
+			t.Errorf("clean-cancel %s->CANCELLED should be legal: %v", from, err)
+		}
+	}
+	// But a FILLED buy is not a clean cancel — keep that illegal.
+	if err := ValidateCycleTransition(CycleBuyFilled, CycleCancelled); err == nil {
+		t.Error("BUY_FILLED->CANCELLED must remain illegal (there is inventory)")
+	}
+}
+
 func TestCycleHappyPathChainIsLegal(t *testing.T) {
 	chain := []CycleState{
 		CycleNew, CycleSignalDetected, CycleBuyRequestQueued, CycleBuySubmitted,
