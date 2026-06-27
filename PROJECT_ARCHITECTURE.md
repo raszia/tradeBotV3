@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR6 — DB-backed versioned config system and cache.**
+Last updated: **PR7 — Exchange-request queue and order-executor foundation.**
 
 ---
 
@@ -216,29 +216,61 @@ The `collector` binary (`internal/collector`) is the read-only market-data plane
 - Decoupled via interfaces (`MarketStore`, `HealthRecorder`) so it is unit-tested
   with fakes and never needs a live exchange/Redis/DB in unit tests.
 
-## 8. Exchange-request queue design (PR7)
+## 8. Exchange-request queue + order-executor (implemented in PR7)
 
-A database-backed **priority queue** decouples decision-making (trade-engine,
-which enqueues) from API calls (order-executor, which claims and sends).
+A database-backed **priority queue** (`internal/queue`) decouples decision-making
+(trade-engine, which ENQUEUES) from API calls (order-executor in
+`internal/executor`, which CLAIMS and sends). Queue state is authoritative
+recovery state, so it lives in MariaDB — **never Redis** (a Redis flush must not
+lose what we were about to send / have sent).
 
-- **`exchange_requests`** columns include: exchange, symbol, cycle_id, order_id,
-  request_type (`PLACE_ORDER`/`CANCEL_ORDER`/`GET_ORDER`/`GET_OPEN_ORDERS`/
-  `GET_BALANCE`/...), priority, **status**, payload (JSON), timeout_ms,
+- **`exchange_requests`** columns (PR2): exchange_id, symbol, cycle_id, order_id,
+  `request_type`, priority, **status**, payload (JSON), response, timeout_ms,
   retry_count, max_retries, next_retry_at, **idempotency_key (UNIQUE)**,
-  claimed_by, claimed_at, response, created_at, updated_at.
-- **Status enum (fixed system-wide):** `QUEUED`, `CLAIMED`, `IN_FLIGHT`,
-  `SUCCEEDED`, `FAILED`, `RETRY_SCHEDULED`, `DEAD`. These exact names are used in
-  the schema, models, queue code, tests, and dashboard.
-- **Claiming** uses `FOR UPDATE SKIP LOCKED` (MariaDB 10.6+), ordered by priority
-  then age, respecting a **per-exchange concurrency limit**.
-- **Per-exchange concurrency across multiple executor processes:** the limit must
-  hold even if more than one `order-executor` runs. It is protected at the DB
-  level (per-exchange `GET_LOCK` around count+claim, or slot/lease rows). **Until
-  distributed slot leasing is implemented, only one `order-executor` instance per
-  exchange is supported, and that constraint is documented — not assumed away.**
-- **Transactional completion:** on a successful response, the queue row status
-  and the order state/event are updated in the **same transaction**.
-- **Idempotency & crash-after-send:** see §15.
+  claimed_by, claimed_at, inflight_at, last_error, created_at, updated_at.
+- **Status enum (fixed):** `QUEUED`, `CLAIMED`, `IN_FLIGHT`, `SUCCEEDED`,
+  `FAILED`, `RETRY_SCHEDULED`, `DEAD` (reused from `internal/state.RequestStatus`).
+- **Mutating vs read-only:** `PLACE_ORDER`/`CANCEL_ORDER` are MUTATING;
+  `GET_ORDER`/`GET_OPEN_ORDERS`/`GET_BALANCE` are read-only. They get different
+  retry/recovery policy (below).
+- **Enqueue** (`Enqueue(ctx, tx, Request)`) runs inside the caller's transaction
+  (atomic with the cycle/order rows that justify it). A duplicate
+  `idempotency_key` is rejected by the UNIQUE index and surfaced as
+  `ErrDuplicateIdempotencyKey` (rule #8).
+- **Claim algorithm** (cross-process safe — rule #3/#4): on a single pinned
+  connection, take a **per-exchange advisory lock** (`GET_LOCK`), then in one
+  transaction: count in-flight (`CLAIMED`+`IN_FLIGHT`), compute free slots vs the
+  per-exchange limit, `SELECT … WHERE status=QUEUED OR (RETRY_SCHEDULED AND
+  next_retry_at<=NOW) AND request_type IN (allowed) AND exchange enabled ORDER BY
+  priority,id LIMIT slots FOR UPDATE SKIP LOCKED`, and mark them `CLAIMED`. The
+  GET_LOCK makes the per-exchange limit exact even across multiple executor
+  processes; SKIP LOCKED is belt-and-suspenders. (Verified by a concurrent-claimer
+  test.)
+- **Retry/backoff:** `ScheduleRetry` bumps `retry_count`, sets
+  `RETRY_SCHEDULED` with exponential capped backoff, or → `DEAD` at max_retries.
+- **Crash-after-send (rule #6):** the executor commits `MarkInFlight` BEFORE
+  sending a mutating request. `SweepStuck` finds `IN_FLIGHT` rows past their
+  timeout and recovers them **conservatively**: read-only → re-queued; **mutating
+  → `DEAD` + the owning order pushed to `NEEDS_RECONCILE` (NEVER blindly re-sent)**.
+- **Order-executor** (`internal/executor`): the ONLY component that issues
+  order-mutating calls. It is driven SOLELY by the queue — **there is no exported
+  method/CLI that sends an order directly** (rule #1, asserted by a reflection
+  test). Outcome handling:
+  - read-only success → `SUCCEEDED`; retryable error → `RETRY_SCHEDULED`;
+    non-retryable → `FAILED`.
+  - mutating: `MarkInFlight` → send → on **success** complete the request AND
+    advance the order (`QUEUED→SUBMITTED`, stamping `exchange_order_id`) in **one
+    transaction** (rule #9; if the order transition fails the whole tx rolls back
+    and the request stays `IN_FLIGHT` for the sweeper); on a **definite rejection**
+    (clear 4xx / insufficient balance) → `FAILED` (order unchanged); on an
+    **ambiguous** outcome (timeout/network/5xx/unknown) → `DEAD` + order
+    `NEEDS_RECONCILE`.
+- **Live-execution guard (rule #2):** `Config.AllowLiveExecution` defaults
+  **false**; with it off the executor claims only read-only request types, so a
+  dev service can never place a real order by inserting a row. The PR7
+  `order-executor` binary wires **no real private clients** (credential decryption
+  + live gating land later), so it cannot send a real order. Richer order-state
+  mapping (ACK/partial/full fill, cancel resolution) is deferred to **PR10**.
 
 ## 8a. Per-symbol enable/disable (schema in PR2; behaviour enforced in later PRs)
 
@@ -555,15 +587,18 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR6 the system collects market data and can load/version config, but
-  does not trade.** The collector caches books/prices; the config cache serves
-  snapshots — but nothing yet consumes events or config to evaluate signals,
-  place orders, or reconcile.
-- **PR6 is the config read path + versioning primitives.** The cache is not yet
-  wired into any binary (the trade-engine consumes it in PR8). The only
-  versioned-write helper is the representative `UpdateMinSpreadBps`; the full set
-  of dashboard edit forms is PR17. Credential encryption is still schema-only
-  (PR2); no plaintext is exposed anywhere.
+- **Through PR7 the safety core (queue + executor) exists, but nothing trades.**
+  No component enqueues requests yet (the trade-engine does, in PR8/PR9), so the
+  executor has nothing to claim; and the `order-executor` binary wires no real
+  private clients with `AllowLiveExecution=false`, so it cannot place a real
+  order. The collector caches market data; the config cache can serve snapshots.
+- **PR7 order-state mapping is minimal:** PLACE_ORDER success advances
+  `QUEUED→SUBMITTED`; ACK details, partial/full fills, and cancel resolution are
+  **PR10**. The trade-engine consuming config/market events is **PR8**.
+- **Concurrency:** the per-exchange limit is enforced across processes via
+  `GET_LOCK` (no single-instance restriction needed). Distributed slot leasing
+  isn't implemented, but the GET_LOCK approach is sufficient on one MariaDB.
+- Credential encryption is still schema-only (PR2); no plaintext is exposed.
 - **Collector data source:** until market-discovery (later PR) populates
   `exchange_markets` and the dashboard enables symbols, the collector has zero
   targets and idles. It reads `enabled_for_collection`; there is no discovery
@@ -600,6 +635,23 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR7 — per-exchange concurrency uses `GET_LOCK`** around count+claim on a
+  pinned connection (+ `FOR UPDATE SKIP LOCKED`), so the limit holds across
+  multiple executor processes without a single-instance restriction.
+- **PR7 — live-execution is OFF by default** (`AllowLiveExecution=false`): a dev
+  executor claims only read-only request types and the binary wires no real
+  clients, so it cannot place a real order. There is intentionally NO direct-send
+  method/CLI (asserted by a reflection test).
+- **PR7 — conservative crash/ambiguous handling:** mutating requests are marked
+  `IN_FLIGHT` (committed) before sending; an ambiguous outcome or a stuck
+  `IN_FLIGHT` mutating row becomes `DEAD` + order `NEEDS_RECONCILE` and is NEVER
+  blindly re-sent. Read-only requests are re-queued freely.
+- **PR7 — completion is atomic with order state:** queue `SUCCEEDED` + the order
+  transition share one transaction; if the transition fails the request is not
+  marked succeeded (stays `IN_FLIGHT` for the sweeper).
+- **PR7 — queue state stays in MariaDB, never Redis** (it is authoritative
+  recovery state).
 
 - **PR6 — config cache is copy-on-write** (`atomic.Pointer[Snapshot]`): readers
   never lock or hit the DB; reloads swap a new immutable snapshot; a failed reload
@@ -681,5 +733,6 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
 | PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
+| PR7 | `pr7-exchange-request-queue` | **in review** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR7 | `pr7-exchange-request-queue` | planned | Queue + order-executor foundation. |
 | PR12 | `pr12-startup-reconciler` | planned | Startup reconciler (closes the safety core). |
