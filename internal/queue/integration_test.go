@@ -265,3 +265,47 @@ func seedOrderInState(t *testing.T, db *sql.DB, exID int64, st string) int64 {
 		VALUES (?, ?, ?, 'buy', 'entry_buy', ?, ?, '1')`, cycID, exID, emID, uniqueCode("loc"), st))
 	return ordID
 }
+
+// TestScheduledStepVsRetryConvention documents+verifies the RETRY_SCHEDULED
+// overloading: a scheduled next step (EnqueueScheduled) has retry_count 0; an actual
+// retry (ScheduleRetry) has retry_count > 0. Reporting uses retry_count to tell a
+// planned simulated-IOC/reprice step from a failed-and-retried request.
+func TestScheduledStepVsRetryConvention(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+
+	// Scheduled next step: RETRY_SCHEDULED, retry_count == 0.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedID, err := q.EnqueueScheduled(ctx, tx, Request{ExchangeID: exID, Type: TypeCancelOrder, IdempotencyKey: uniqueCode("sched")}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if s, rc := statusRetry(t, db, schedID); s != "RETRY_SCHEDULED" || rc != 0 {
+		t.Errorf("scheduled next step = %s/retry_count=%d, want RETRY_SCHEDULED/0", s, rc)
+	}
+
+	// Actual retry: RETRY_SCHEDULED, retry_count > 0.
+	reqID := seedRequest(t, db, exID, reqOpt{status: "IN_FLIGHT"})
+	if _, err := q.ScheduleRetry(ctx, reqID, "transient"); err != nil {
+		t.Fatal(err)
+	}
+	if s, rc := statusRetry(t, db, reqID); s != "RETRY_SCHEDULED" || rc < 1 {
+		t.Errorf("actual retry = %s/retry_count=%d, want RETRY_SCHEDULED/>=1", s, rc)
+	}
+}
+
+func statusRetry(t *testing.T, db *sql.DB, id int64) (string, int) {
+	t.Helper()
+	var s string
+	var rc int
+	if err := db.QueryRow("SELECT status, retry_count FROM exchange_requests WHERE id=?", id).Scan(&s, &rc); err != nil {
+		t.Fatal(err)
+	}
+	return s, rc
+}

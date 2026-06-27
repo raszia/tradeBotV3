@@ -418,6 +418,16 @@ lose what we were about to send / have sent).
   claimed_by, claimed_at, inflight_at, last_error, created_at, updated_at.
 - **Status enum (fixed):** `QUEUED`, `CLAIMED`, `IN_FLIGHT`, `SUCCEEDED`,
   `FAILED`, `RETRY_SCHEDULED`, `DEAD` (reused from `internal/state.RequestStatus`).
+- **`RETRY_SCHEDULED` is overloaded — disambiguated by `retry_count`** (no separate
+  `SCHEDULED` enum value; the enum stays fixed). A row is `RETRY_SCHEDULED` with a
+  future `next_retry_at` in two cases:
+  - **`retry_count == 0` → a scheduled NEXT STEP** (`EnqueueScheduled`): a *planned*
+    future request — the simulated-IOC cancel/status (PR10) or a sell reprice step
+    (PR11). **Not a failure.**
+  - **`retry_count > 0` → an actual RETRY** (`ScheduleRetry`): the request ran, hit a
+    transient error, and is backing off.
+  Dashboard/reporting MUST use `retry_count` to tell a planned step from a failed
+  retry. (Verified by `queue.TestScheduledStepVsRetryConvention`.)
 - **Mutating vs read-only:** `PLACE_ORDER`/`CANCEL_ORDER` are MUTATING;
   `GET_ORDER`/`GET_OPEN_ORDERS`/`GET_BALANCE` are read-only. They get different
   retry/recovery policy (below).

@@ -73,10 +73,22 @@ func (q *Queue) Enqueue(ctx context.Context, tx *sql.Tx, r Request) (int64, erro
 // EnqueueScheduled inserts a request that is NOT claimable until delay has elapsed,
 // by writing it as RETRY_SCHEDULED with next_retry_at = now + delay (the claim query
 // only picks up RETRY_SCHEDULED rows whose next_retry_at <= NOW). This models the
-// simulated-IOC wait (place → wait → cancel → status) as queued work, so an executor
-// worker is never blocked sleeping. Runs in the caller's tx for atomicity with the
-// state transition that triggers it. A duplicate idempotency_key returns
-// ErrDuplicateIdempotencyKey.
+// simulated-IOC wait (place → wait → cancel → status) and sell repricing intervals as
+// queued work, so an executor worker is never blocked sleeping. Runs in the caller's
+// tx for atomicity with the state transition that triggers it. A duplicate
+// idempotency_key returns ErrDuplicateIdempotencyKey.
+//
+// RETRY_SCHEDULED convention (kept deliberately — no separate SCHEDULED enum value):
+// the status RETRY_SCHEDULED is overloaded and disambiguated by retry_count:
+//
+//   - retry_count == 0  →  a SCHEDULED NEXT STEP (this method): a planned future
+//     request (e.g. the simulated-IOC cancel/status), NOT a failure.
+//   - retry_count  > 0  →  an ACTUAL RETRY (ScheduleRetry): the request previously
+//     ran and is being retried after a transient error, with backoff.
+//
+// Dashboard/reporting MUST use retry_count to tell the two apart so scheduled
+// simulated-IOC / reprice steps are not surfaced as failed retries. EnqueueScheduled
+// always leaves retry_count at its default 0.
 func (q *Queue) EnqueueScheduled(ctx context.Context, tx *sql.Tx, r Request, delay time.Duration) (int64, error) {
 	if delay < 0 {
 		delay = 0
