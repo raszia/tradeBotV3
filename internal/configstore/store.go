@@ -36,7 +36,7 @@ func (s *Store) ActiveVersion(ctx context.Context) (int64, error) {
 }
 
 const marketsQuery = `
-SELECT em.id, e.code, em.canonical_symbol,
+SELECT em.id, em.exchange_id, e.code, em.canonical_symbol,
        em.enabled_for_collection, em.enabled_for_signal, em.enabled_for_trading, em.enabled_for_sell_manage,
        sc.exchange_market_id, sc.min_spread_bps, sc.buy_size, sc.buy_size_unit, sc.sell_offset_bps,
        sc.reprice_interval_seconds, sc.order_timeout_ms, sc.max_retries, sc.retry_backoff_ms, sc.config_version
@@ -93,7 +93,7 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			id                      int64
+			id, exchangeID          int64
 			code, canonical         string
 			fCol, fSig, fTrd, fSell int
 			scID                    sql.NullInt64
@@ -107,12 +107,13 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 			backoff                 sql.NullInt64
 			scVersion               sql.NullInt64
 		)
-		if err := rows.Scan(&id, &code, &canonical, &fCol, &fSig, &fTrd, &fSell,
+		if err := rows.Scan(&id, &exchangeID, &code, &canonical, &fCol, &fSig, &fTrd, &fSell,
 			&scID, &minSpread, &buySize, &buySizeUnit, &sellOffset, &reprice, &timeout, &maxRetries, &backoff, &scVersion); err != nil {
 			return err
 		}
 		m := MarketConfig{
 			ExchangeMarketID:       id,
+			ExchangeID:             exchangeID,
 			ExchangeCode:           code,
 			CanonicalSymbol:        canonical,
 			EnabledForCollection:   fCol != 0,

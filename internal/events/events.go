@@ -101,3 +101,8 @@ func (b BookSnapshot) Age(now time.Time) time.Duration { return now.Sub(b.Exchan
 func (b BookSnapshot) Stale(maxAge time.Duration, now time.Time) bool {
 	return b.ExchangeTime.IsZero() || now.Sub(b.ExchangeTime) > maxAge
 }
+
+// Stale reports whether the price snapshot's exchange data is older than maxAge.
+func (p PriceSnapshot) Stale(maxAge time.Duration, now time.Time) bool {
+	return p.ExchangeTime.IsZero() || now.Sub(p.ExchangeTime) > maxAge
+}

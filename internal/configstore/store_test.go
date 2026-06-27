@@ -34,17 +34,17 @@ func TestLoadMarkets(t *testing.T) {
 	defer mockDB.Close()
 	s := New(mockDB)
 
-	cols := []string{"id", "code", "canonical_symbol",
+	cols := []string{"id", "exchange_id", "code", "canonical_symbol",
 		"enabled_for_collection", "enabled_for_signal", "enabled_for_trading", "enabled_for_sell_manage",
 		"sc_id", "min_spread_bps", "buy_size", "buy_size_unit", "sell_offset_bps",
 		"reprice_interval_seconds", "order_timeout_ms", "max_retries", "retry_backoff_ms", "config_version"}
 	rows := sqlmock.NewRows(cols).
 		// market 1 with a symbol_config
-		AddRow(int64(1), "nobitex", "BTC/IRT", 1, 1, 1, 1,
+		AddRow(int64(1), int64(3), "nobitex", "BTC/IRT", 1, 1, 1, 1,
 			int64(1), int64(50), "0.001", "base", int64(30),
 			int64(5), int64(3000), int64(3), int64(500), int64(7)).
 		// market 2 with NO symbol_config (LEFT JOIN nulls)
-		AddRow(int64(2), "wallex", "ETH/IRT", 1, 0, 0, 1,
+		AddRow(int64(2), int64(4), "wallex", "ETH/IRT", 1, 0, 0, 1,
 			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	mock.ExpectQuery("FROM exchange_markets").WillReturnRows(rows)
 

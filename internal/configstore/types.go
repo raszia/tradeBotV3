@@ -19,6 +19,7 @@ import (
 // so a market with no symbol_config still appears with HasSymbolConfig=false).
 type MarketConfig struct {
 	ExchangeMarketID int64
+	ExchangeID       int64
 	ExchangeCode     string
 	CanonicalSymbol  string
 

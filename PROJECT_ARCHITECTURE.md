@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR12 — Startup reconciler.**
+Last updated: **PR8 — Trade-engine signal loop.**
 
 ---
 
@@ -280,6 +280,60 @@ The `collector` binary (`internal/collector`) is the read-only market-data plane
 - Raw API calls are logged through the secret-masking IO logger (§12).
 - Decoupled via interfaces (`MarketStore`, `HealthRecorder`) so it is unit-tested
   with fakes and never needs a live exchange/Redis/DB in unit tests.
+
+## 7b. Trade-engine signal loop (implemented in PR8 — `internal/engine`)
+
+The `trade-engine` binary consumes `market_events`, reads the latest books/prices
+from Redis and trading config from the configstore cache, computes the spread, and
+writes `comparison_events` / `signals`. **Hard boundaries (PR8):** it NEVER calls
+an exchange (no private clients, no `PlaceOrder`/`CancelOrder` — a reflection guard
+asserts no engine field can place/cancel), and it does **not** create cycles or
+orders (that is PR9). Its only writes are the observability rows and, defensively,
+the update/removal of an existing not-yet-claimed QUEUED buy intent (§2a below).
+
+**Event fan-out (`targets`).** On a reference-venue (Binance) tick, every Iranian
+`enabled_for_signal` market on the same base asset is re-evaluated (its reference
+moved); on an Iranian tick, only that market is. An unconfigured system (active
+config **version 0**) produces no targets at all.
+
+**Spread formula (owner-confirmed).** The strategy buys on the Iranian exchange at
+its **best ask** when cheaper than the Binance **best bid**:
+
+```
+spread_bps        = (binanceRefBid_in_quote − iranianAsk) / iranianAsk × 10000
+fee_adjusted_bps  = spread_bps − buyFeeBps − sellFeeBps      (buy=taker, sell=maker)
+passed            = fee_adjusted_bps ≥ symbol_config.min_spread_bps
+```
+
+**Quote units (never mixed silently).** USDT-quoted Iranian markets compare
+directly with Binance `BASE/USDT`. IRT/IRR-quoted markets convert the Binance USDT
+bid into rial using the **same Iranian exchange's** `USDT/IRT` rate from Redis
+(`price:{exchange}:USDT/IRT`, best bid); if that rate is missing or stale there is
+**no signal**. `comparison_events`/`signals` store `binance_price` already
+converted into the Iranian quote, plus `quote_unit` and the `reference_rate` used
+(NULL for USDT), so every comparison is auditable (migration 009 added those two
+columns).
+
+**Stale / missing data → no signal (fail-safe).** A comparison is written only when
+both sides are present and **fresh** (`exchange_time` within `MaxBookAge`, default
+10s) and the prices are positive; otherwise nothing is written. Disabled-for-signal
+markets and markets without a `symbol_config` are skipped. Every comparison and
+signal row is stamped with the active `config_version`.
+
+**What PR8 writes:** `comparison_events` (every computable comparison, pass or
+fail) and `signals` (only when `passed`). It does **not** write `cycles`, `orders`,
+or new `exchange_requests`.
+
+**No-duplicate pending buy intent (§2a, scope = `exchange_market_id`).** PR8 does
+not create buy requests (PR9 does, transactionally under the symbol lock). It only
+keeps the one pending intent fresh: on a **passing** signal for a trading-enabled
+market it UPDATES the payload of an existing **QUEUED** entry-buy `PLACE_ORDER`
+request (so signal spam supersedes rather than duplicates); on an **invalidated**
+signal it DELETEs the not-yet-sent QUEUED request. Both helpers
+(`UpdatePendingBuyRequest`/`RemovePendingBuyRequest`) `SELECT … FOR UPDATE` the row
+and guard on `status='QUEUED'`, so a `CLAIMED`/`IN_FLIGHT`/already-sent request is
+**never** touched (left to the executor/reconciler), even against a concurrent
+claimer. Repeated identical events therefore never create competing requests.
 
 ## 8. Exchange-request queue + order-executor (implemented in PR7)
 
@@ -718,19 +772,27 @@ start.
 
 ## 18. Known limitations (current)
 
-- **The safety core (PR1–PR7 + PR12) is complete, but nothing trades.** No
-  component enqueues requests yet (the trade-engine does, in PR8/PR9), so the
-  executor has nothing to claim; the `order-executor` binary wires no real
-  private clients (`AllowLiveExecution=false`); and the `reconciler` binary wires
-  no read-only clients yet (credential decryption is a later PR), so it inspects
-  DB state and safely skips orders for exchanges it cannot verify.
+- **The safety core (PR1–PR7 + PR12) is complete; PR8 adds signal detection but
+  still nothing trades.** The trade-engine now writes `comparison_events`/`signals`
+  and keeps a pending buy intent fresh, but it does **not** create cycles/orders or
+  enqueue new requests (PR9), so the executor still has nothing to claim; the
+  `order-executor` binary wires no real private clients (`AllowLiveExecution=false`);
+  and the `reconciler` binary wires no read-only clients yet (credential decryption
+  is a later PR), so it inspects DB state and safely skips unverifiable exchanges.
+- **PR8 does not create the buy request, so its §2a intent helpers update/remove an
+  existing QUEUED request but never create one** — until PR9 creates buy requests,
+  the update/remove paths are exercised only by tests. The simulated-IOC execution
+  parameters (wait/cancel) are not in the schema yet; PR8's refreshed intent payload
+  carries only price/quantity/config context. `comparison_events` are written
+  synchronously (async batching is a later optimization). For IRT/IRR markets the
+  USDT→IRT conversion uses the same exchange's `USDT/IRT` best bid as the rate.
 - **PR12 reconciler does not do fill accounting** (PR10): it conservatively flags
   filled/partial-fill cycles as `NEEDS_RECONCILE` rather than closing them. Exit
   from `NEEDS_RECONCILE` is operator-only (the operator path is a later PR). The
   recent-fills resolution path is unavailable until adapters expose it.
 - **PR7 order-state mapping is minimal:** PLACE_ORDER success advances
   `QUEUED→SUBMITTED`; ACK details, partial/full fills, and cancel resolution are
-  **PR10**. The trade-engine consuming config/market events is **PR8**.
+  **PR10**.
 - **Concurrency:** the per-exchange limit is enforced across processes via
   `GET_LOCK` (no single-instance restriction needed). Distributed slot leasing
   isn't implemented, but the GET_LOCK approach is sufficient on one MariaDB.
@@ -771,6 +833,25 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR8 — spread basis is Iranian best ask vs Binance best bid** (owner-confirmed),
+  the most conservative realizable comparison; fee-adjusted by buy (taker) + sell
+  (maker) fees.
+- **PR8 — IRT/IRR markets convert via the same exchange's `USDT/IRT` best bid** from
+  Redis; missing/stale rate → no signal. The conversion rate and quote unit are
+  stored on `comparison_events`/`signals` (migration 009) so units are never mixed
+  silently. USDT markets compare directly (`reference_rate` NULL).
+- **PR8 — the signal loop holds no exchange client by construction** (a reflection
+  test asserts no engine field can `PlaceOrder`/`CancelOrder`); it never creates
+  cycles/orders (PR9). Only `comparison_events`/`signals` are written.
+- **PR8 — pending-intent scope is `exchange_market_id`** (one strategy today). PR8
+  refreshes/removes an existing QUEUED buy request but never creates one;
+  `SELECT … FOR UPDATE` + a `status='QUEUED'` guard make CLAIMED/IN_FLIGHT requests
+  untouchable.
+- **PR8 — `comparison_events` written synchronously** for now (low PR8 throughput);
+  async batching deferred. Stale/missing/invalid data writes nothing (fail-safe).
+- **PR8 — `MarketConfig` gained `ExchangeID`** so the engine can stamp
+  `comparison_events.exchange_id` without a hot-path DB read.
 
 - **PR12 — the reconciler holds a `ReadOnlyClient` interface** (no `PlaceOrder`/
   `CancelOrder` methods), so auto-send is impossible by construction; a
@@ -895,5 +976,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
-| PR12 | `pr12-startup-reconciler` | **in review** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose(FAILED+lock release, zero-exposure only)/NEEDS_RECONCILE; missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
-| PR12 | `pr12-startup-reconciler` | planned | Startup reconciler (closes the safety core). |
+| PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
+| PR8 | `pr8-trade-engine-signal` | **in review** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; spread = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. §2a pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates — PR9 does). NEVER calls an exchange (reflection guard). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
