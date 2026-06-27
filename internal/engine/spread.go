@@ -2,10 +2,14 @@
 // reads the latest books/prices from Redis and config from the in-memory
 // configstore cache, computes the spread, and writes comparison_events / signals.
 //
-// HARD boundaries (PR8): the engine NEVER calls an exchange (no private clients,
-// no PlaceOrder/CancelOrder). It does not create cycles/orders (PR9). It may
-// update/remove an existing not-yet-claimed QUEUED buy request to avoid duplicate
-// pending intent (§2a), but never sends anything.
+// On an accepted signal for a trading-enabled market it prepares the buy intent via
+// internal/buyflow (PR9): create the cycle + symbol lock + buy order + QUEUED
+// PLACE_ORDER request in one transaction, or — if the scope is already locked —
+// refresh the existing unsent QUEUED buy instead of duplicating it (§2a).
+//
+// HARD boundary: the engine NEVER calls an exchange (no private clients, no
+// PlaceOrder/CancelOrder) and NEVER sends an order — the order-executor does that
+// later (PR10+).
 package engine
 
 import (

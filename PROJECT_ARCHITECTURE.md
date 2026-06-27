@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR8 — Trade-engine signal loop.**
+Last updated: **PR9 — Cycle creation & buy enqueue.**
 
 ---
 

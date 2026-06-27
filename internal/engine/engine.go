@@ -9,10 +9,12 @@ import (
 
 	"github.com/shopspring/decimal"
 
+	"v3TradeBot/internal/buyflow"
 	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/events"
+	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/redis"
 )
 
@@ -27,6 +29,8 @@ type Config struct {
 	// MaxBookAge is the staleness threshold: any book/price older than this is
 	// rejected and produces no signal (rule: never trade on stale data).
 	MaxBookAge time.Duration
+	// LockLeaseSeconds is the symbol-lock lease applied when a buy cycle is created.
+	LockLeaseSeconds int
 }
 
 func (c *Config) withDefaults() {
@@ -39,17 +43,22 @@ func (c *Config) withDefaults() {
 	if c.MaxBookAge <= 0 {
 		c.MaxBookAge = 10 * time.Second
 	}
+	if c.LockLeaseSeconds <= 0 {
+		c.LockLeaseSeconds = 600
+	}
 }
 
 // Engine is the trade-engine signal loop. It reads market data from Redis and
 // trading config from the configstore cache, computes spreads, and writes
-// comparison_events / signals. It NEVER calls an exchange and NEVER creates
-// cycles/orders (that is PR9); the only writes it makes are observability rows and
-// (defensively) updates/removals of an existing not-yet-claimed QUEUED buy intent.
+// comparison_events / signals. On an accepted signal for a trading-enabled market
+// it prepares the buy intent via internal/buyflow (cycle + lock + order + QUEUED
+// PLACE_ORDER request, one transaction). It NEVER calls an exchange and NEVER sends
+// an order — the order-executor does that later (PR10+).
 type Engine struct {
 	store *db.Store
 	rc    *redis.Client
 	cache *configstore.Cache
+	q     *queue.Queue
 	clk   clock.Clock
 	log   *slog.Logger
 	cfg   Config
@@ -64,7 +73,11 @@ func New(store *db.Store, rc *redis.Client, cache *configstore.Cache, clk clock.
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Engine{store: store, rc: rc, cache: cache, clk: clk, log: log, cfg: cfg}
+	var q *queue.Queue
+	if store != nil {
+		q = queue.New(store.DB(), clk)
+	}
+	return &Engine{store: store, rc: rc, cache: cache, q: q, clk: clk, log: log, cfg: cfg}
 }
 
 // Run subscribes to market events and evaluates the affected Iranian markets until
@@ -204,31 +217,52 @@ func (e *Engine) evaluate(ctx context.Context, snap *configstore.Snapshot, m con
 		return err
 	}
 	if !passed {
-		// Signal no longer valid: if a not-yet-claimed QUEUED buy intent exists for
-		// this scope, remove it before it can be sent (§2a). Never touches a
-		// CLAIMED/IN_FLIGHT request.
-		if m.EnabledForTrading {
-			if _, err := RemovePendingBuyRequest(ctx, e.store, m.ExchangeMarketID); err != nil {
-				return err
-			}
-		}
+		// Signal not (or no longer) valid. PR9 does NOT delete a cycle-tied buy
+		// request (audit rule, §2a) — invalidating a started cycle's resting/queued
+		// buy is the PR10/PR11 lifecycle's job. So there is nothing to do here.
 		return nil
 	}
 
-	sigID, err := e.writeSignal(ctx, m, quote, binanceRef, iAsk.Price, refRate, res, snap.Version)
-	if err != nil {
+	if _, err := e.writeSignal(ctx, m, quote, binanceRef, iAsk.Price, refRate, res, snap.Version); err != nil {
 		return err
 	}
-	// One active pending buy intent per scope (§2a). PR8 does NOT create the buy
-	// request (that is PR9); it only refreshes an existing not-yet-claimed QUEUED
-	// intent so signal spam cannot create competing requests.
+	// Trading-enabled markets prepare the buy intent (§2a, §10a). PR9 creates the
+	// cycle/lock/order/request under the symbol lock — or, if the scope is already
+	// locked, refreshes the existing QUEUED (unsent) buy instead of duplicating it.
+	// It still NEVER calls an exchange or sends an order.
 	if m.EnabledForTrading {
-		payload := newIntentPayload(m, iAsk.Price, snap.Version, sigID)
-		if _, err := UpdatePendingBuyRequest(ctx, e.store, m.ExchangeMarketID, payload); err != nil {
-			return err
-		}
+		return e.prepareBuy(ctx, m, iAsk.Price, binanceRef, refRate, quote, fee, res, snap.Version)
 	}
 	return nil
+}
+
+// prepareBuy creates a new buy cycle for the scope, or refreshes the existing
+// not-yet-sent QUEUED buy when the scope already holds an active cycle (no
+// duplicate). ErrSymbolLocked is the normal "already have an active cycle" path,
+// not an error.
+func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask, binanceRef decimal.Decimal, refRate *decimal.Decimal, quote string, fee configstore.FeeConfig, res SpreadResult, version int64) error {
+	sig := buyflow.SignalContext{
+		ConfigVersion:  version,
+		BinancePrice:   binanceRef,
+		IranianPrice:   ask,
+		SpreadBps:      roundToInt(res.SpreadBps),
+		FeeAdjustedBps: roundToInt(res.FeeAdjustedBps),
+		QuoteUnit:      quote,
+		ReferenceRate:  refRate,
+		BuyFeeBps:      roundToInt(feeFractionToBps(fee.TakerFee)),
+		SellFeeBps:     roundToInt(feeFractionToBps(fee.MakerFee)),
+	}
+	_, err := buyflow.CreateBuyCycle(ctx, e.store, e.q, m, ask, sig, e.cfg.LockLeaseSeconds)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, buyflow.ErrSymbolLocked) {
+		// Scope already has an active cycle: refresh its QUEUED (unsent) buy to the
+		// newest valid signal rather than creating a competing intent.
+		_, rErr := buyflow.RefreshActiveCycleBuy(ctx, e.store, m, ask, sig)
+		return rErr
+	}
+	return err
 }
 
 // writeComparison records one comparison_event (config-version stamped, with the

@@ -39,7 +39,9 @@ const marketsQuery = `
 SELECT em.id, em.exchange_id, e.code, em.canonical_symbol,
        em.enabled_for_collection, em.enabled_for_signal, em.enabled_for_trading, em.enabled_for_sell_manage,
        sc.exchange_market_id, sc.min_spread_bps, sc.buy_size, sc.buy_size_unit, sc.sell_offset_bps,
-       sc.reprice_interval_seconds, sc.order_timeout_ms, sc.max_retries, sc.retry_backoff_ms, sc.config_version
+       sc.reprice_interval_seconds, sc.order_timeout_ms, sc.max_retries, sc.retry_backoff_ms, sc.config_version,
+       sc.maker_first_enabled, sc.maker_attempts_before_taker, sc.maker_signal_window_seconds,
+       sc.maker_wait_before_cancel_ms, sc.maker_price_offset_bps, sc.taker_price_mode, sc.max_taker_slippage_bps
 FROM exchange_markets em
 JOIN exchanges e ON e.id = em.exchange_id
 LEFT JOIN symbol_configs sc ON sc.exchange_market_id = em.id`
@@ -106,9 +108,17 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 			maxRetries              sql.NullInt64
 			backoff                 sql.NullInt64
 			scVersion               sql.NullInt64
+			makerFirst              sql.NullInt64
+			makerAttempts           sql.NullInt64
+			makerWindow             sql.NullInt64
+			makerWait               sql.NullInt64
+			makerOffset             sql.NullInt64
+			takerMode               sql.NullString
+			takerSlippage           sql.NullInt64
 		)
 		if err := rows.Scan(&id, &exchangeID, &code, &canonical, &fCol, &fSig, &fTrd, &fSell,
-			&scID, &minSpread, &buySize, &buySizeUnit, &sellOffset, &reprice, &timeout, &maxRetries, &backoff, &scVersion); err != nil {
+			&scID, &minSpread, &buySize, &buySizeUnit, &sellOffset, &reprice, &timeout, &maxRetries, &backoff, &scVersion,
+			&makerFirst, &makerAttempts, &makerWindow, &makerWait, &makerOffset, &takerMode, &takerSlippage); err != nil {
 			return err
 		}
 		m := MarketConfig{
@@ -130,6 +140,17 @@ func (s *Store) loadMarkets(ctx context.Context, snap *Snapshot) error {
 			MaxRetries:             int(maxRetries.Int64),
 			RetryBackoffMs:         int(backoff.Int64),
 			SymbolConfigVersion:    scVersion.Int64,
+			Maker: MakerPolicy{
+				// NULL only for a market without a symbol_config (which cannot trade
+				// anyway); fall back to safe defaults mirroring the DDL.
+				MakerFirstEnabled:        !makerFirst.Valid || makerFirst.Int64 != 0,
+				MakerAttemptsBeforeTaker: intOrDefault(makerAttempts, 1),
+				MakerSignalWindowSeconds: intOrDefault(makerWindow, 60),
+				MakerWaitBeforeCancelMs:  intOrDefault(makerWait, 2000),
+				MakerPriceOffsetBps:      intOrDefault(makerOffset, 5),
+				TakerPriceMode:           strOrDefault(takerMode, "ASK"),
+				MaxTakerSlippageBps:      int(takerSlippage.Int64), // 0 (incl. NULL) = no cap
+			},
 		}
 		snap.MarketsByID[id] = m
 		snap.MarketsBySymbol[canonical] = append(snap.MarketsBySymbol[canonical], m)
@@ -346,4 +367,20 @@ func nullIntStr(v sql.NullInt64) string {
 		return ""
 	}
 	return fmt.Sprint(v.Int64)
+}
+
+// intOrDefault returns v as an int, or def when the column was NULL.
+func intOrDefault(v sql.NullInt64, def int) int {
+	if !v.Valid {
+		return def
+	}
+	return int(v.Int64)
+}
+
+// strOrDefault returns v, or def when the column was NULL/empty.
+func strOrDefault(v sql.NullString, def string) string {
+	if !v.Valid || v.String == "" {
+		return def
+	}
+	return v.String
 }

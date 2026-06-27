@@ -37,15 +37,19 @@ func TestLoadMarkets(t *testing.T) {
 	cols := []string{"id", "exchange_id", "code", "canonical_symbol",
 		"enabled_for_collection", "enabled_for_signal", "enabled_for_trading", "enabled_for_sell_manage",
 		"sc_id", "min_spread_bps", "buy_size", "buy_size_unit", "sell_offset_bps",
-		"reprice_interval_seconds", "order_timeout_ms", "max_retries", "retry_backoff_ms", "config_version"}
+		"reprice_interval_seconds", "order_timeout_ms", "max_retries", "retry_backoff_ms", "config_version",
+		"maker_first_enabled", "maker_attempts_before_taker", "maker_signal_window_seconds",
+		"maker_wait_before_cancel_ms", "maker_price_offset_bps", "taker_price_mode", "max_taker_slippage_bps"}
 	rows := sqlmock.NewRows(cols).
-		// market 1 with a symbol_config
+		// market 1 with a symbol_config (maker-first, escalate after 2 attempts)
 		AddRow(int64(1), int64(3), "nobitex", "BTC/IRT", 1, 1, 1, 1,
 			int64(1), int64(50), "0.001", "base", int64(30),
-			int64(5), int64(3000), int64(3), int64(500), int64(7)).
+			int64(5), int64(3000), int64(3), int64(500), int64(7),
+			1, int64(2), int64(90), int64(2500), int64(8), "ASK", int64(40)).
 		// market 2 with NO symbol_config (LEFT JOIN nulls)
 		AddRow(int64(2), int64(4), "wallex", "ETH/IRT", 1, 0, 0, 1,
-			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+			nil, nil, nil, nil, nil, nil, nil)
 	mock.ExpectQuery("FROM exchange_markets").WillReturnRows(rows)
 
 	snap := emptySnapshot()
@@ -59,9 +63,17 @@ func TestLoadMarkets(t *testing.T) {
 	if !m1.EnabledForTrading || !m1.BuySize.Equal(mustDec("0.001")) {
 		t.Errorf("market 1 flags/size = %+v", m1)
 	}
+	if !m1.Maker.MakerFirstEnabled || m1.Maker.MakerAttemptsBeforeTaker != 2 ||
+		m1.Maker.MakerPriceOffsetBps != 8 || m1.Maker.TakerPriceMode != "ASK" || m1.Maker.MaxTakerSlippageBps != 40 {
+		t.Errorf("market 1 maker policy = %+v", m1.Maker)
+	}
 	m2 := snap.MarketsByID[2]
 	if m2.HasSymbolConfig {
 		t.Errorf("market 2 should have no symbol_config: %+v", m2)
+	}
+	// market 2 (no symbol_config) falls back to safe maker defaults.
+	if !m2.Maker.MakerFirstEnabled || m2.Maker.MakerAttemptsBeforeTaker != 1 || m2.Maker.MakerPriceOffsetBps != 5 {
+		t.Errorf("market 2 maker defaults = %+v", m2.Maker)
 	}
 	if len(snap.MarketsBySymbol["BTC/IRT"]) != 1 {
 		t.Errorf("MarketsBySymbol not populated")

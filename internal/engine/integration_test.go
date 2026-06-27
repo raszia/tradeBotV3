@@ -96,10 +96,12 @@ func (f *efix) seedMarket(quote string, minSpreadBps int, makerFee, takerFee str
 		}
 		return r
 	}
-	base := fmt.Sprintf("B%d", eseq)
+	// Include the (globally unique, monotonic) exID so symbols never collide across
+	// repeated runs against the same persistent test DB.
+	base := fmt.Sprintf("B%d_%d", f.exID, eseq)
 	canonical := base + "/" + quote
 	bID := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", base))
-	qID := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", fmt.Sprintf("Q%d", eseq)))
+	qID := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", fmt.Sprintf("Q%d_%d", f.exID, eseq)))
 	mID := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", canonical, bID, qID))
 	emID := last(ex(`INSERT INTO exchange_markets
 		(exchange_id, market_id, exchange_symbol, canonical_symbol, enabled_for_collection, enabled_for_signal, enabled_for_trading, enabled_for_sell_manage)
@@ -349,148 +351,110 @@ func TestFeeAdjustedReducesSpread(t *testing.T) {
 	}
 }
 
-// ---- pending-intent (§2a) ----
+// ---- buy-cycle creation wiring (§2a / §10a) — engine-level; buyflow internals
+// are tested in internal/buyflow ----
 
-// seedQueuedBuy creates a cycle + entry_buy order + QUEUED PLACE_ORDER request for
-// the market, with the given request status and payload. Returns the request id.
-func (f *efix) seedQueuedBuy(mc configstore.MarketConfig, status, payload string) int64 {
-	f.t.Helper()
-	eseq++
-	last := func(r sql.Result) int64 { id, _ := r.LastInsertId(); return id }
-	cyc := last(mustExec(f.t, f.db, "INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state) VALUES (?, ?, ?, 'BUY_REQUEST_QUEUED')",
-		mc.ExchangeMarketID, mc.ExchangeID, mc.CanonicalSymbol))
-	ord := last(mustExec(f.t, f.db, `INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, quantity)
-		VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'QUEUED', '1')`,
-		cyc, mc.ExchangeID, mc.ExchangeMarketID, fmt.Sprintf("loc%d", eseq)))
-	req := last(mustExec(f.t, f.db, `INSERT INTO exchange_requests (exchange_id, order_id, request_type, status, payload, idempotency_key)
-		VALUES (?, ?, 'PLACE_ORDER', ?, ?, ?)`,
-		mc.ExchangeID, ord, status, payload, fmt.Sprintf("idem%d", eseq)))
-	return req
-}
-
-func (f *efix) reqPayload(id int64) string {
-	var p string
-	f.db.QueryRow("SELECT payload FROM exchange_requests WHERE id=?", id).Scan(&p)
-	return p
-}
-func (f *efix) reqExists(id int64) bool {
+func (f *efix) buyRequestCount(mc configstore.MarketConfig) int {
 	var n int
-	f.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE id=?", id).Scan(&n)
-	return n == 1
+	f.db.QueryRow(`SELECT COUNT(*) FROM exchange_requests er JOIN orders o ON o.id=er.order_id
+		WHERE o.exchange_market_id=? AND er.request_type='PLACE_ORDER'`, mc.ExchangeMarketID).Scan(&n)
+	return n
+}
+func (f *efix) cycleCount(mc configstore.MarketConfig) int {
+	var n int
+	f.db.QueryRow("SELECT COUNT(*) FROM cycles WHERE exchange_market_id=?", mc.ExchangeMarketID).Scan(&n)
+	return n
 }
 
-func TestEnabledForTradingUpdatesPendingIntent(t *testing.T) {
+func TestPassingSignalCreatesBuyCycle(t *testing.T) {
 	f := setupE(t)
 	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true) // trading enabled
 	base := baseOf(sym)
-	req := f.seedQueuedBuy(mc, "QUEUED", `{"old":true}`)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
 	f.seedBook("binance", base+"/USDT", "101", "102", 0)
 	f.run(mc)
 
-	p := f.reqPayload(req)
-	if p == `{"old":true}` || !contains(p, "signal_id") {
-		t.Errorf("QUEUED intent should be refreshed to the new signal, got %s", p)
+	if f.cycleCount(mc) != 1 || f.buyRequestCount(mc) != 1 {
+		t.Fatalf("cycles=%d buyRequests=%d, want 1/1", f.cycleCount(mc), f.buyRequestCount(mc))
+	}
+	// The cycle, its lock, the buy order, and a QUEUED PLACE_ORDER request all exist.
+	var cycState, ordState, reqStatus, mode string
+	f.db.QueryRow(`SELECT c.state, o.state, er.status, o.intended_execution_mode
+		FROM cycles c JOIN orders o ON o.cycle_id=c.id JOIN exchange_requests er ON er.order_id=o.id
+		WHERE c.exchange_market_id=?`, mc.ExchangeMarketID).Scan(&cycState, &ordState, &reqStatus, &mode)
+	if cycState != "BUY_REQUEST_QUEUED" || ordState != "QUEUED" || reqStatus != "QUEUED" {
+		t.Errorf("states = cyc:%s ord:%s req:%s, want BUY_REQUEST_QUEUED/QUEUED/QUEUED", cycState, ordState, reqStatus)
+	}
+	if mode != "MAKER_FIRST" {
+		t.Errorf("first attempt mode = %s, want MAKER_FIRST", mode)
+	}
+	var lockN int
+	f.db.QueryRow("SELECT COUNT(*) FROM symbol_locks WHERE scope=? AND canonical_symbol=? AND state='ACTIVE'", f.exCode, sym).Scan(&lockN)
+	if lockN != 1 {
+		t.Errorf("active locks = %d, want 1", lockN)
 	}
 }
 
-func TestDisabledForTradingLeavesPendingIntent(t *testing.T) {
+func TestRepeatedSignalDoesNotDuplicateCycle(t *testing.T) {
 	f := setupE(t)
-	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, false) // trading disabled
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true)
 	base := baseOf(sym)
-	req := f.seedQueuedBuy(mc, "QUEUED", `{"old":true}`)
+	f.seedBook(f.exCode, sym, "99", "100", 0)
+	f.seedBook("binance", base+"/USDT", "101", "102", 0)
+	f.run(mc)
+	f.run(mc) // repeated event — must refresh, not duplicate
+
+	if f.cycleCount(mc) != 1 || f.buyRequestCount(mc) != 1 {
+		t.Errorf("after repeat: cycles=%d buyRequests=%d, want 1/1 (lock blocks duplicate)", f.cycleCount(mc), f.buyRequestCount(mc))
+	}
+}
+
+func TestRepeatedSignalRefreshesQueuedPrice(t *testing.T) {
+	f := setupE(t)
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true)
+	base := baseOf(sym)
+	f.seedBook(f.exCode, sym, "99", "100", 0)
+	f.seedBook("binance", base+"/USDT", "101", "102", 0)
+	f.run(mc) // creates the cycle at ask 100
+
+	// A newer, still-passing ask (99 vs Binance bid 101) -> the still-QUEUED buy is
+	// refreshed in place (no new cycle).
+	f.seedBook(f.exCode, sym, "98", "99", 0)
+	f.run(mc)
+
+	var ask string
+	f.db.QueryRow(`SELECT o.ask_price_at_decision FROM orders o JOIN cycles c ON c.id=o.cycle_id
+		WHERE c.exchange_market_id=? AND o.role='entry_buy'`, mc.ExchangeMarketID).Scan(&ask)
+	if !decimal.RequireFromString(ask).Equal(dec("99")) {
+		t.Errorf("refreshed ask_price_at_decision = %s, want 99", ask)
+	}
+}
+
+func TestDisabledForTradingNoCycle(t *testing.T) {
+	f := setupE(t)
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, false) // signal yes, trading no
+	base := baseOf(sym)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
 	f.seedBook("binance", base+"/USDT", "101", "102", 0)
 	f.run(mc)
 
-	if f.reqPayload(req) != `{"old":true}` {
-		t.Error("trading-disabled market must not touch the pending intent")
+	if f.cycleCount(mc) != 0 || f.buyRequestCount(mc) != 0 {
+		t.Error("trading-disabled market must create no cycle/buy request")
 	}
 	if f.signalCount(sym) != 1 {
 		t.Error("a signal should still be recorded (signal-enabled)")
 	}
 }
 
-func TestInvalidatedSignalRemovesPendingIntent(t *testing.T) {
+func TestBelowThresholdNoCycle(t *testing.T) {
 	f := setupE(t)
-	mc, sym := f.seedMarket("USDT", 500, "0", "0", true, true) // need 500 bps -> fails
+	mc, sym := f.seedMarket("USDT", 500, "0", "0", true, true) // need 500 bps
 	base := baseOf(sym)
-	req := f.seedQueuedBuy(mc, "QUEUED", `{"old":true}`)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
-	f.seedBook("binance", base+"/USDT", "101", "102", 0) // only 100 bps -> invalid
+	f.seedBook("binance", base+"/USDT", "101", "102", 0) // only 100 bps
 	f.run(mc)
-
-	if f.reqExists(req) {
-		t.Error("an invalidated signal must remove the not-yet-sent QUEUED intent")
-	}
-}
-
-func TestRepeatedEventsNoDuplicateIntent(t *testing.T) {
-	f := setupE(t)
-	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true)
-	base := baseOf(sym)
-	f.seedQueuedBuy(mc, "QUEUED", `{"old":true}`)
-	f.seedBook(f.exCode, sym, "99", "100", 0)
-	f.seedBook("binance", base+"/USDT", "101", "102", 0)
-	f.run(mc)
-	f.run(mc) // repeated event
-
-	var n int
-	f.db.QueryRow(`SELECT COUNT(*) FROM exchange_requests er JOIN orders o ON o.id=er.order_id
-		WHERE o.exchange_market_id=? AND er.request_type='PLACE_ORDER'`, mc.ExchangeMarketID).Scan(&n)
-	if n != 1 {
-		t.Errorf("pending buy requests = %d, want exactly 1 (no duplicate intent)", n)
-	}
-}
-
-func TestUpdatePendingBuyOnlyQueued(t *testing.T) {
-	f := setupE(t)
-	mc, _ := f.seedMarket("USDT", 50, "0", "0", true, true)
-	// QUEUED -> updated.
-	reqQ := f.seedQueuedBuy(mc, "QUEUED", `{"old":true}`)
-	updated, err := UpdatePendingBuyRequest(f.ctx, f.store, mc.ExchangeMarketID, []byte(`{"new":true}`))
-	if err != nil || !updated {
-		t.Fatalf("update QUEUED = %v, %v; want true", updated, err)
-	}
-	if f.reqPayload(reqQ) != `{"new":true}` {
-		t.Errorf("QUEUED payload not updated: %s", f.reqPayload(reqQ))
-	}
-	// CLAIMED -> not touched.
-	mc2, _ := f.seedMarket("USDT", 50, "0", "0", true, true)
-	reqC := f.seedQueuedBuy(mc2, "CLAIMED", `{"claimed":true}`)
-	updated, err = UpdatePendingBuyRequest(f.ctx, f.store, mc2.ExchangeMarketID, []byte(`{"new":true}`))
-	if err != nil || updated {
-		t.Fatalf("update CLAIMED = %v, %v; want false", updated, err)
-	}
-	if f.reqPayload(reqC) != `{"claimed":true}` {
-		t.Error("CLAIMED request must not be modified")
-	}
-}
-
-func TestRemovePendingBuyOnlyQueued(t *testing.T) {
-	f := setupE(t)
-	mc, _ := f.seedMarket("USDT", 50, "0", "0", true, true)
-	reqQ := f.seedQueuedBuy(mc, "QUEUED", `{}`)
-	removed, err := RemovePendingBuyRequest(f.ctx, f.store, mc.ExchangeMarketID)
-	if err != nil || !removed || f.reqExists(reqQ) {
-		t.Fatalf("remove QUEUED = %v, %v, exists=%v; want removed", removed, err, f.reqExists(reqQ))
-	}
-	mc2, _ := f.seedMarket("USDT", 50, "0", "0", true, true)
-	reqC := f.seedQueuedBuy(mc2, "IN_FLIGHT", `{}`)
-	removed, err = RemovePendingBuyRequest(f.ctx, f.store, mc2.ExchangeMarketID)
-	if err != nil || removed || !f.reqExists(reqC) {
-		t.Fatalf("remove IN_FLIGHT = %v, %v; must not remove a sent request", removed, err)
-	}
-}
-
-func TestPendingHelpersNoopWhenNone(t *testing.T) {
-	f := setupE(t)
-	mc, _ := f.seedMarket("USDT", 50, "0", "0", true, true) // no request seeded
-	if u, err := UpdatePendingBuyRequest(f.ctx, f.store, mc.ExchangeMarketID, []byte(`{}`)); u || err != nil {
-		t.Errorf("update with no pending = %v, %v; want false,nil", u, err)
-	}
-	if r, err := RemovePendingBuyRequest(f.ctx, f.store, mc.ExchangeMarketID); r || err != nil {
-		t.Errorf("remove with no pending = %v, %v; want false,nil", r, err)
+	if f.cycleCount(mc) != 0 || f.buyRequestCount(mc) != 0 {
+		t.Error("below-threshold signal must create no cycle/buy request")
 	}
 }
 
@@ -503,22 +467,4 @@ func b2i(b bool) int {
 		return 1
 	}
 	return 0
-}
-
-func mustExec(t *testing.T, db *sql.DB, q string, a ...any) sql.Result {
-	t.Helper()
-	r, err := db.Exec(q, a...)
-	if err != nil {
-		t.Fatalf("exec %q: %v", q, err)
-	}
-	return r
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

@@ -41,6 +41,31 @@ type MarketConfig struct {
 	MaxRetries             int
 	RetryBackoffMs         int
 	SymbolConfigVersion    int64 // the config_version stamped on this symbol_config
+
+	// Maker-first / taker-fallback buy policy (§2a). Used by PR9 cycle creation.
+	Maker MakerPolicy
+}
+
+// MakerPolicy is the per-symbol maker-first / taker-fallback buy configuration
+// (owner-defined, DB-configurable, versioned). See PROJECT_ARCHITECTURE.md §2a.
+type MakerPolicy struct {
+	// MakerFirstEnabled: try a maker-style limit below the ask first; if false,
+	// every attempt is a taker buy.
+	MakerFirstEnabled bool
+	// MakerAttemptsBeforeTaker: how many maker attempts (per scope, within the
+	// window) before escalating to a taker buy.
+	MakerAttemptsBeforeTaker int
+	// MakerSignalWindowSeconds: rolling window over which maker attempts are counted.
+	MakerSignalWindowSeconds int
+	// MakerWaitBeforeCancelMs: simulated-IOC wait before cancelling the remainder
+	// (executor uses it in PR10; carried in the request payload).
+	MakerWaitBeforeCancelMs int
+	// MakerPriceOffsetBps: how far below the ask to place the maker limit.
+	MakerPriceOffsetBps int
+	// TakerPriceMode: how the taker price is derived (e.g. "ASK").
+	TakerPriceMode string
+	// MaxTakerSlippageBps: cap on taker price vs the signal price (0 = no cap).
+	MaxTakerSlippageBps int
 }
 
 // ExchangeConfig is per-exchange operational config (concurrency, timeouts).

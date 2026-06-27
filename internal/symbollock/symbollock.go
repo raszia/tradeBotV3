@@ -3,11 +3,44 @@ package symbollock
 import (
 	"context"
 	"database/sql"
+	"errors"
+
+	"github.com/go-sql-driver/mysql"
 )
 
-// This file implements the parts of the symbol lock the reconciler (PR12) needs:
-// loading active locks and CONSERVATIVELY releasing one. Lock ACQUISITION (the
-// transactional acquire-lock + create-cycle + enqueue path) is implemented in PR9.
+// This file implements the symbol lock: ACQUIRE (PR9 — the cross-process
+// one-active-intent gate) plus the reconciler's (PR12) load + CONSERVATIVE release.
+
+// ErrSymbolLocked is returned by Acquire when the scope already has an ACTIVE lock
+// (a duplicate on the generated UNIQUE active_key). The caller's transaction should
+// roll back so no orphan cycle is created.
+var ErrSymbolLocked = errors.New("symbollock: scope already locked")
+
+// Acquire inserts an ACTIVE lock for (scope, canonicalSymbol) owned by cycleID,
+// within the caller's transaction tx. The unique-when-active generated column
+// (active_key) guarantees at most one ACTIVE lock per scope across all processes:
+// a duplicate maps to ErrSymbolLocked. The lease is leaseSeconds from the DB clock
+// (NOW(6)), so the database clock is authoritative.
+//
+// This MUST run in the SAME transaction that creates the cycle (and order/request),
+// so either the whole intent commits or nothing does (no lock without a cycle).
+func Acquire(ctx context.Context, tx *sql.Tx, scope, canonicalSymbol string, cycleID int64, leaseSeconds int) (int64, error) {
+	if leaseSeconds <= 0 {
+		leaseSeconds = 600
+	}
+	res, err := tx.ExecContext(ctx,
+		"INSERT INTO symbol_locks (scope, canonical_symbol, cycle_id, state, expires_at) "+
+			"VALUES (?, ?, ?, 'ACTIVE', NOW(6) + INTERVAL ? SECOND)",
+		scope, canonicalSymbol, cycleID, leaseSeconds)
+	if err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1062 { // duplicate active_key
+			return 0, ErrSymbolLocked
+		}
+		return 0, err
+	}
+	return res.LastInsertId()
+}
 
 // Lock is a row of symbol_locks.
 type Lock struct {
