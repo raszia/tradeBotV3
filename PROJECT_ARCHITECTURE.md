@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR11 — Exit sell, management & repricing.**
+Last updated: **PR13 — Balance sync.**
 
 ---
 
@@ -844,6 +844,53 @@ The PR12 `reconciler` binary wires **no read-only clients yet** (credential
 decryption lands later), so it inspects DB state and safely leaves
 unverifiable-exchange orders alone.
 
+## 11a. Balance sync (implemented in PR13 — `internal/balance`)
+
+The `balance-sync` binary continuously records exchange balances so inventory can be
+verified across a cycle (before/after buy, after sell, after close) and shown on the
+dashboard. **MariaDB is the source of truth** (`wallet_balances_current` +
+`wallet_balance_history`); Redis is not used.
+
+**Read-only by construction.** The syncer holds a narrow `BalanceClient` interface
+exposing **only** `Name()` + `GetBalances()` — no `PlaceOrder`/`CancelOrder` is
+reachable. It makes no trading decisions, creates no cycles, and mutates no queue.
+(A reflection test asserts the interface has exactly those two methods.)
+
+**Current + history with hash dedup.** Each poll, per exchange/asset:
+- compute a stable content hash `sha256(asset | available | locked | total)` over the
+  **canonical** decimal strings (so `1.50 == 1.5`, and any change to
+  available/locked/total flips the hash);
+- **`wallet_balance_history`** gets a new row **only when the hash changed** (or it's
+  the first observation) — unchanged balances never spam history;
+- **`wallet_balances_current`** is upserted every observation, bumping `last_seen_at`
+  (migration 013); the balance columns/hash effectively change only when the values
+  do. `updated_at` tracks the last write, the history rows are the change log.
+
+**Decimal-safe.** Balances are `decimal.Decimal` end-to-end into `DECIMAL(36,18)` —
+never float; exchange precision is preserved (verified to 18 dp). `total` is taken
+from the venue, or derived as `available + locked` when the venue omits it.
+
+**Failure isolation (never wipe/zero on error).** Each exchange is polled under a
+per-exchange timeout, bounded by a concurrency limit (no unbounded fan-out). If one
+exchange's `GetBalances` errors or times out, it is logged (no secrets) and **its
+current balances are left exactly as they were** — a failed read is never treated as
+zero — and the other exchanges sync normally.
+
+**Missing-asset behaviour (documented choice).** Only assets PRESENT in a response
+are touched. An asset that **stops appearing** is **not** deleted or zeroed; its
+`wallet_balances_current` row survives and its `last_seen_at` simply goes stale, which
+lets later reconciliation/dashboard flag it. A balance becomes zero only when the
+venue response explicitly reports zero.
+
+**Startup / secrets.** Real authenticated balance clients need decrypted credentials
+(a later PR); until then the binary wires **no clients** and idles safely (no panic,
+no live credentials required, even in tests). API keys/secrets are never logged; raw
+API logs still pass the secret masker.
+
+**Relationship to cycles.** PR13 changes **no** cycles or orders and never auto-fixes
+anything — it only records balances so PR12's reconciler and the dashboard can
+compare expected vs actual inventory later.
+
 ## 12. Exchange abstraction layer (implemented in PR4)
 
 The required interface surface is split into two interfaces so the collector/
@@ -1091,6 +1138,11 @@ start.
   (via order-update streams / WebSocket) are a later refinement, as is fee conversion
   across non-quote assets for `realized_quote`. The operator exit from
   `NEEDS_RECONCILE` is still a later PR.
+- **`balance-sync` wires no clients yet** (authenticated balance reads need decrypted
+  credentials — a later PR), so it boots and idles. The syncer logic is complete and
+  tested with fake read-only clients; once credentials land, real `BalanceClient`s
+  are injected with no logic change. Per-exchange timeout/concurrency are bounded; a
+  failed read never wipes balances and a missing asset is never zeroed.
 - **Sell management is polling-based:** the engine reprices/polls on a periodic pass
   (default 2s) reading the Binance reference from Redis; there is no steady-state
   WebSocket order-update path yet. A cycle whose reference price is missing/stale is
@@ -1139,6 +1191,23 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR13 — `balance-sync` is read-only by construction**: a narrow `BalanceClient`
+  (only `Name`+`GetBalances`) is held, so no order-mutating call is reachable. It
+  records balances only; it never touches cycles/orders/queue.
+- **PR13 — hash-deduped history**: `wallet_balance_history` gets a row only when the
+  `sha256(asset|available|locked|total)` content hash changes; `wallet_balances_current`
+  is upserted every poll with a fresh `last_seen_at` (migration 013).
+- **PR13 — a failed/timed-out balance read never wipes or zeros** the prior current
+  balances; one exchange's failure is isolated from the others (bounded concurrency +
+  per-exchange timeout).
+- **PR13 — a missing asset is never zeroed/deleted**: only assets present in a
+  response are touched; an absent asset's row survives and its `last_seen_at` goes
+  stale (detectable by reconciliation/dashboard). Zero requires an explicit venue zero.
+- **PR13 — balances are decimal end-to-end** into `DECIMAL(36,18)` (never float);
+  `total` is derived as `available+locked` only when the venue omits it.
+- **PR13 — the binary wires no clients yet** (credential decryption is later) and
+  idles safely; no secrets are logged.
 
 - **PR11 — sell quantity is the actual filled inventory** (`bought − sold`, floored to
   `step_size`), never the requested buy quantity. Partial buys sell their filled part
@@ -1331,4 +1400,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
 | PR9 | `pr9-cycle-creation-buy-enqueue` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
 | PR10 | `pr10-order-fill-processing` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
-| PR11 | `pr11-sell-management` | **in review** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
+| PR11 | `pr11-sell-management` | **accepted** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
+| PR13 | `pr13-balance-sync` | **in review** | `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
