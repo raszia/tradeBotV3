@@ -18,6 +18,7 @@ import (
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/execution"
 	"v3TradeBot/internal/migrate"
+	"v3TradeBot/internal/orders"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/state"
 )
@@ -30,6 +31,8 @@ type fakeClient struct {
 	placeErr  error
 	cancelErr error
 	balErr    error
+	getStatus execution.OrderStatus
+	getErr    error
 }
 
 func (f *fakeClient) Name() string { return f.code }
@@ -47,7 +50,7 @@ func (f *fakeClient) PlaceOrder(context.Context, execution.OrderRequest) (execut
 }
 func (f *fakeClient) CancelOrder(context.Context, string) error { return f.cancelErr }
 func (f *fakeClient) GetOrder(context.Context, string) (execution.OrderStatus, error) {
-	return execution.OrderStatus{}, nil
+	return f.getStatus, f.getErr
 }
 func (f *fakeClient) GetOpenOrders(context.Context, string) ([]execution.OrderStatus, error) {
 	return nil, nil
@@ -155,6 +158,15 @@ func ordState(t *testing.T, db *sql.DB, id int64) string {
 	return s
 }
 
+func cycState(t *testing.T, db *sql.DB, id int64) string {
+	t.Helper()
+	var s string
+	if err := db.QueryRow("SELECT state FROM cycles WHERE id=?", id).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func TestReadOnlySuccessAndErrors(t *testing.T) {
 	it := setup(t)
 
@@ -182,53 +194,100 @@ func TestReadOnlySuccessAndErrors(t *testing.T) {
 	}
 }
 
-func TestPlaceSuccessAdvancesOrderAtomically(t *testing.T) {
-	it := setup(t)
-	orderID := it.seedOrder(t, string(state.OrderQueued))
-	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX123", Status: execution.StateOpen}
+// seedBuyOrder seeds a cycle (cycleSt) + entry_buy order (orderSt) and returns both
+// ids — used by the PR10 place tests that need cycle context on the request.
+func (it *intg) seedBuyOrder(t *testing.T, cycleSt, orderSt string) (orderID, cycleID int64) {
+	t.Helper()
+	last := func(r sql.Result) int64 { id, _ := r.LastInsertId(); return id }
+	ex := func(q string, a ...any) sql.Result {
+		r, err := it.db.Exec(q, a...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	seedSeq++
+	u := func(p string) string { return fmt.Sprintf("%s%d_%d", p, time.Now().UnixNano(), seedSeq) }
+	b := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", u("B")))
+	qa := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", u("Q")))
+	m := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", u("M")+"/IRT", b, qa))
+	em := last(ex("INSERT INTO exchange_markets (exchange_id, market_id, exchange_symbol, canonical_symbol) VALUES (?, ?, ?, ?)", it.exID, m, u("ES"), u("M")+"/IRT"))
+	cycleID = last(ex("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state) VALUES (?, ?, ?, ?)", em, it.exID, u("M")+"/IRT", cycleSt))
+	orderID = last(ex(`INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, order_type, limit_price, quantity)
+		VALUES (?, ?, ?, 'buy', 'entry_buy', ?, ?, 'limit', '100', '1')`, cycleID, it.exID, em, u("loc"), orderSt))
+	return orderID, cycleID
+}
 
-	payload, _ := json.Marshal(execution.OrderRequest{Symbol: "X/Y", Side: execution.SideBuy,
-		Quantity: decimal.RequireFromString("1"), LimitPrice: decimal.RequireFromString("100"), OrderType: execution.OrderTypeLimit})
-	c := it.seedRequest(t, queue.TypePlaceOrder, string(payload), &orderID)
+// seedPlace seeds a CLAIMED PLACE_ORDER request (BuyIntentPayload) tied to an
+// order+cycle and returns the Claimed for direct process() dispatch.
+func (it *intg) seedPlace(t *testing.T, orderID, cycleID int64, intent orders.BuyIntentPayload) queue.Claimed {
+	t.Helper()
+	payload, _ := json.Marshal(intent)
+	seedSeq++
+	res, err := it.db.Exec(`INSERT INTO exchange_requests
+		(exchange_id, cycle_id, order_id, request_type, priority, status, payload, timeout_ms, max_retries, idempotency_key)
+		VALUES (?, ?, ?, 'PLACE_ORDER', 50, 'CLAIMED', ?, 10000, 5, ?)`,
+		it.exID, cycleID, orderID, payload, fmt.Sprintf("idem_%d_%d", time.Now().UnixNano(), seedSeq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	return queue.Claimed{ID: id, ExchangeID: it.exID, ExchangeCode: it.code, Type: queue.TypePlaceOrder,
+		Payload: json.RawMessage(payload), OrderID: &orderID, CycleID: &cycleID, Symbol: "X/IRT", TimeoutMS: 10000, MaxRetries: 5}
+}
+
+func TestPlaceSuccessAcksAndSchedulesCancel(t *testing.T) {
+	it := setup(t)
+	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
+	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX123", ClientOrderID: "loc-x", Status: execution.StateOpen}
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc-x", MakerWaitBeforeCancelMs: 2000})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s != "SUCCEEDED" {
 		t.Errorf("place success status = %s", s)
 	}
-	if os := ordState(t, it.db, orderID); os != string(state.OrderSubmitted) {
-		t.Errorf("order state = %s, want SUBMITTED", os)
+	if os := ordState(t, it.db, orderID); os != string(state.OrderAcked) {
+		t.Errorf("order state = %s, want ACKED", os)
+	}
+	if cs := cycState(t, it.db, cycleID); cs != string(state.CycleBuySubmitted) {
+		t.Errorf("cycle state = %s, want BUY_SUBMITTED", cs)
 	}
 	var exOID string
 	it.db.QueryRow("SELECT exchange_order_id FROM orders WHERE id=?", orderID).Scan(&exOID)
 	if exOID != "EX123" {
 		t.Errorf("exchange_order_id = %q, want EX123", exOID)
 	}
+	var scheduled int
+	it.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE order_id=? AND request_type='CANCEL_ORDER' AND status='RETRY_SCHEDULED'", orderID).Scan(&scheduled)
+	if scheduled != 1 {
+		t.Errorf("scheduled cancels = %d, want 1 (simulated-IOC wait, queued not slept)", scheduled)
+	}
 }
 
-func TestPlaceDefiniteRejectionFailsAndOrderUnchanged(t *testing.T) {
+func TestPlaceDefiniteRejectionFailsCleanly(t *testing.T) {
 	it := setup(t)
-	orderID := it.seedOrder(t, string(state.OrderQueued))
+	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
 	it.fake.placeErr = execution.ErrInsufficientBalance
-
-	payload, _ := json.Marshal(execution.OrderRequest{Symbol: "X/Y", Side: execution.SideBuy, Quantity: decimal.RequireFromString("1")})
-	c := it.seedRequest(t, queue.TypePlaceOrder, string(payload), &orderID)
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
 	it.exec.process(it.ctx, c)
 
+	// Definitely not placed -> no exposure: request FAILED, order + cycle FAILED.
 	if s := reqStatus(t, it.db, c.ID); s != "FAILED" {
 		t.Errorf("definite-rejection status = %s, want FAILED", s)
 	}
-	if os := ordState(t, it.db, orderID); os != string(state.OrderQueued) {
-		t.Errorf("order should be unchanged (QUEUED), got %s", os)
+	if os := ordState(t, it.db, orderID); os != string(state.OrderFailed) {
+		t.Errorf("order = %s, want FAILED", os)
+	}
+	if cs := cycState(t, it.db, cycleID); cs != string(state.CycleFailed) {
+		t.Errorf("cycle = %s, want FAILED", cs)
 	}
 }
 
 func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
 	it := setup(t)
-	orderID := it.seedOrder(t, string(state.OrderSubmitted))
+	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderSubmitted))
 	it.fake.placeErr = execution.ErrAckTimeout // ambiguous: maybe placed, maybe not
-
-	payload, _ := json.Marshal(execution.OrderRequest{Symbol: "X/Y", Side: execution.SideBuy, Quantity: decimal.RequireFromString("1")})
-	c := it.seedRequest(t, queue.TypePlaceOrder, string(payload), &orderID)
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s != "DEAD" {
@@ -237,17 +296,18 @@ func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
 	if os := ordState(t, it.db, orderID); os != string(state.OrderNeedsReconcile) {
 		t.Errorf("order state = %s, want NEEDS_RECONCILE", os)
 	}
+	if cs := cycState(t, it.db, cycleID); cs != string(state.CycleNeedsReconcile) {
+		t.Errorf("cycle state = %s, want NEEDS_RECONCILE", cs)
+	}
 }
 
 func TestPlaceSuccessRollsBackWhenOrderTransitionInvalid(t *testing.T) {
 	it := setup(t)
-	// Order already FILLED (terminal): QUEUED->SUBMITTED is invalid, so the whole
-	// completion tx must roll back -> request NOT marked SUCCEEDED.
-	orderID := it.seedOrder(t, string(state.OrderFilled))
+	// Order already FILLED (terminal): the place-ack transitions are invalid, so the
+	// whole completion tx must roll back -> request NOT marked SUCCEEDED.
+	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderFilled))
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX999", Status: execution.StateOpen}
-
-	payload, _ := json.Marshal(execution.OrderRequest{Symbol: "X/Y", Side: execution.SideBuy, Quantity: decimal.RequireFromString("1")})
-	c := it.seedRequest(t, queue.TypePlaceOrder, string(payload), &orderID)
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s == "SUCCEEDED" {

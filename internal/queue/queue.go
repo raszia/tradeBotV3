@@ -70,6 +70,35 @@ func (q *Queue) Enqueue(ctx context.Context, tx *sql.Tx, r Request) (int64, erro
 // pinned connection guarded by a per-exchange advisory lock (GET_LOCK), so the
 // per-exchange limit holds even with multiple executor processes. FOR UPDATE SKIP
 // LOCKED additionally prevents two claimers ever touching the same row.
+// EnqueueScheduled inserts a request that is NOT claimable until delay has elapsed,
+// by writing it as RETRY_SCHEDULED with next_retry_at = now + delay (the claim query
+// only picks up RETRY_SCHEDULED rows whose next_retry_at <= NOW). This models the
+// simulated-IOC wait (place → wait → cancel → status) as queued work, so an executor
+// worker is never blocked sleeping. Runs in the caller's tx for atomicity with the
+// state transition that triggers it. A duplicate idempotency_key returns
+// ErrDuplicateIdempotencyKey.
+func (q *Queue) EnqueueScheduled(ctx context.Context, tx *sql.Tx, r Request, delay time.Duration) (int64, error) {
+	if delay < 0 {
+		delay = 0
+	}
+	nextAt := q.clock.Now().Add(delay).UTC()
+	res, err := tx.ExecContext(ctx, `
+		INSERT INTO exchange_requests
+		  (exchange_id, symbol, cycle_id, order_id, request_type, priority, status,
+		   payload, timeout_ms, max_retries, idempotency_key, next_retry_at)
+		VALUES (?, ?, ?, ?, ?, ?, 'RETRY_SCHEDULED', ?, ?, ?, ?, ?)`,
+		r.ExchangeID, nullStr(r.Symbol), r.CycleID, r.OrderID, string(r.Type), r.Priority,
+		payloadOrEmpty(r.Payload), defaultTimeout(r.TimeoutMS), defaultMaxRetries(r.MaxRetries), r.IdempotencyKey, nextAt)
+	if err != nil {
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == 1062 {
+			return 0, ErrDuplicateIdempotencyKey
+		}
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
 func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, limit int, allowed []RequestType) ([]Claimed, error) {
 	if limit <= 0 || len(allowed) == 0 {
 		return nil, nil

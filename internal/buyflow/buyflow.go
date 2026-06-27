@@ -12,6 +12,7 @@ import (
 
 	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/db"
+	"v3TradeBot/internal/orders"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/state"
 	"v3TradeBot/internal/symbollock"
@@ -49,35 +50,8 @@ type CreateResult struct {
 	Quantity  decimal.Decimal
 }
 
-// intentPayload is the full instruction set carried on the PLACE_ORDER request so
-// the executor (PR10/PR11) can run the simulated-IOC buy without re-deriving
-// anything. It is JSON in exchange_requests.payload.
-type intentPayload struct {
-	ExecutionMode            Mode   `json:"execution_mode"`
-	Side                     string `json:"side"`
-	OrderType                string `json:"order_type"`
-	SimulatedIOC             bool   `json:"simulated_ioc"`
-	IntendedPrice            string `json:"intended_price"`
-	IntendedQuantity         string `json:"intended_quantity"`
-	BuySizeUnit              string `json:"buy_size_unit"`
-	MakerAttemptNumber       int    `json:"maker_attempt_number"`
-	MakerAttemptsBeforeTaker int    `json:"maker_attempts_before_taker"`
-	MakerOffsetBps           int    `json:"maker_offset_bps"`
-	MakerWaitBeforeCancelMs  int    `json:"maker_wait_before_cancel_ms"`
-	CancelAfterWait          bool   `json:"cancel_after_wait"`
-	FinalStatusCheckRequired bool   `json:"final_status_check_required"`
-	TakerPriceMode           string `json:"taker_price_mode"`
-	MaxTakerSlippageBps      int    `json:"max_taker_slippage_bps"`
-	AskPriceAtDecision       string `json:"ask_price_at_decision"`
-	SignalBinancePrice       string `json:"signal_binance_price"`
-	SignalIranianPrice       string `json:"signal_iranian_price"`
-	QuoteUnit                string `json:"quote_unit"`
-	ReferenceRate            string `json:"reference_rate,omitempty"`
-	BuyFeeBps                int    `json:"buy_fee_bps"`
-	SellFeeBps               int    `json:"sell_fee_bps"`
-	ConfigVersion            int64  `json:"config_version"`
-	LocalClientOrderID       string `json:"local_client_order_id"`
-}
+// The PLACE_ORDER request payload is the shared orders.BuyIntentPayload (defined in
+// internal/orders so the order-executor/processor can parse the same contract).
 
 // CreateBuyCycle creates the buy side of a new cycle in ONE transaction:
 // cycle → symbol lock → buy order → state-machine transitions → PLACE_ORDER enqueue.
@@ -340,8 +314,8 @@ func advanceOrderToQueued(ctx context.Context, tx *sql.Tx, orderID int64) error 
 }
 
 func buildPayload(m configstore.MarketConfig, dec Decision, qty, ask decimal.Decimal, sig SignalContext, localCOID string) json.RawMessage {
-	p := intentPayload{
-		ExecutionMode:            dec.Mode,
+	p := orders.BuyIntentPayload{
+		ExecutionMode:            string(dec.Mode),
 		Side:                     "buy",
 		OrderType:                "limit",
 		SimulatedIOC:             true,

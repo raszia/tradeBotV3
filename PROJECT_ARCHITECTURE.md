@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR9 — Cycle creation & buy enqueue.**
+Last updated: **PR10 — Order/fill processing & simulated-IOC buy execution.**
 
 ---
 
@@ -608,6 +608,83 @@ is left to the PR10/PR11 lifecycle (the engine does not delete it).
 actual execution mode; run the simulated-IOC wait/cancel/status sequence; release
 the lock (only the safe terminal flow / reconciler does). Those are PR10/PR11/PR12.
 
+## 10b. Order/fill processing & simulated-IOC buy execution (implemented in PR10 — `internal/orders`)
+
+PR10 is the buy-side order-processing layer: it turns order-executor *results* into
+persisted order/cycle state and fills, and runs the buy as a **simulated IOC**. It
+still never calls an exchange itself — the executor (PR7) does the transport and
+hands the typed result to `internal/orders`, which does the database work inside the
+executor's transaction. **Conservative throughout: ambiguity is always
+NEEDS_RECONCILE, never a guess; a missing order is never proof of zero fill.**
+
+**Simulated IOC as queued work (no worker sleeps).** Iranian venues lack native IOC,
+so it is simulated by chaining queued/scheduled requests — a worker is never blocked
+sleeping for the wait:
+
+```
+PLACE_ORDER ──(ack)──► OnPlaceAck:  order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED,
+                                    schedule CANCEL_ORDER  (next_retry_at = now + maker_wait)
+CANCEL_ORDER ─(ok)──► OnCancelResult: order →CANCEL_PENDING,
+                                    schedule GET_ORDER     (next_retry_at = now + final_status_delay)
+GET_ORDER ───────────► ProcessFinalStatus: classify → fills + transitions + lock
+```
+
+`queue.EnqueueScheduled` inserts the next step as `RETRY_SCHEDULED` with a future
+`next_retry_at`, which the claimer only picks up once due. Native IOC/TIF is never
+forced — `OrderRequest.TimeInForce` is left empty (the IOC behaviour is the flow).
+
+**Classification (`orders.Classify`, pure, unit-tested).** From the final
+`execution.OrderStatus` (+ any fetch error):
+- **Full** — `filled`, remaining 0, qty agrees.
+- **Partial** — `canceled`/`expired`/`partially_canceled` with a usable partial fill.
+- **Zero** — settled with filled = 0 (the only *proven* no-exposure outcome).
+- **Ambiguous** — a fetch error (incl. `ErrOrderUnknown`/missing — **never** proof of
+  zero fill), a contradictory "filled" (qty short), a partial with no price, still
+  open/new/unknown, or a `rejected` arriving after a successful place (contradictory).
+
+**Outcome → state machine (always via `internal/state`; NEEDS_RECONCILE is the safe
+fallback for any illegal/ambiguous case):**
+
+| Class | order → | cycle → | symbol lock | fill row |
+|---|---|---|---|---|
+| Full | `FILLED` | `BUY_FILLED` | **held** (sell pending) | recorded |
+| Partial | `PARTIALLY_FILLED` | `BUY_PARTIALLY_FILLED` | **held** (sell the filled qty) | recorded |
+| Zero | `CANCELLED` | `CANCELLED` (reason `SIMULATED_IOC_ZERO_FILL`) | **released** | none |
+| Ambiguous | `NEEDS_RECONCILE` | `NEEDS_RECONCILE` | **held** | — |
+
+Zero-fill is a clean no-fill → **CANCELLED, never FAILED** (owner rule). A definite
+**place rejection** (the order never reached the book — insufficient balance, bad
+request) is handled separately by `OnPlaceRejected`: request FAILED, order + cycle
+FAILED, lock released (no exposure). An **ambiguous** place/cancel (timeout, network)
+→ request DEAD + order **and** cycle NEEDS_RECONCILE, lock held, never re-sent.
+
+**Fill accounting (`orders` + the `fills` table).** The order persists
+`filled_quantity`, `remaining_quantity`, `avg_fill_price`, `quote_spent`,
+`fee_amount`, `fee_asset`, `actual_execution_mode`, `fill_result`, and
+`last_normalized_status` (migration 011 added `remaining_quantity`/`fill_result`/
+`last_normalized_status`; `actual_execution_mode` came in 010). Partial fills
+**continue with the filled quantity only** — the unfilled remainder is not inventory
+(PR11's sell uses `filled_quantity`, not the requested qty). One aggregate `fills`
+row is written per final status with a **deterministic** `exchange_fill_id`
+(`final:<exchange_order_id>`) so repeated processing is idempotent
+(`UNIQUE(order_id, exchange_fill_id)`).
+
+**actual_execution_mode** is mapped from the venue's liquidity flag
+(`execution.OrderStatus.Liquidity`): `maker`→`MAKER`, `taker`→`TAKER`, otherwise
+`UNKNOWN` (never guessed).
+
+**Atomicity + idempotency.** Each result is processed in ONE executor transaction:
+the queue status update, order/cycle transitions, fill upsert, and lock release all
+commit together or roll back together — a request is never marked SUCCEEDED if the
+state/fill work failed (it stays for the sweeper). Repeated processing of the same
+final status does not duplicate fills (unique key) or state events (the state machine
+replays a same-state transition as a no-op). A transient (retryable) status-fetch
+error simply reschedules the read instead of finalizing.
+
+**What PR10 does NOT do (→ PR11):** the sell side — enqueueing/managing the exit
+sell on the filled quantity, repricing, and closing the cycle. Steady-state WS order
+updates are also later. The operator exit from NEEDS_RECONCILE remains a later PR.
+
 ## 11. Reconciler (implemented in PR12 — `internal/reconciler`)
 
 The reconciler makes the system safe after restart/timeout/partial-fill/
@@ -927,9 +1004,16 @@ start.
   filled/partial-fill cycles as `NEEDS_RECONCILE` rather than closing them. Exit
   from `NEEDS_RECONCILE` is operator-only (the operator path is a later PR). The
   recent-fills resolution path is unavailable until adapters expose it.
-- **PR7 order-state mapping is minimal:** PLACE_ORDER success advances
-  `QUEUED→SUBMITTED`; ACK details, partial/full fills, and cancel resolution are
-  **PR10**.
+- **PR10 processes the buy side only.** The sell side (exit sell on the filled
+  quantity, repricing, closing the cycle) is **PR11**; until then a `BUY_FILLED`/
+  `BUY_PARTIALLY_FILLED` cycle holds its lock and waits. Fills are recorded as one
+  aggregate row per final status (from `GET_ORDER` aggregates); per-venue individual
+  fills (via order-update streams) are a later refinement. The operator exit from
+  `NEEDS_RECONCILE` is still a later PR.
+- **Gated integration tests share one MariaDB/Redis** and include a global open-cycle
+  scan (the reconciler), so the gated suite must be run with **`go test -p 1 ./...`**
+  (serial packages) to avoid cross-package contention. The default offline
+  `go test ./...` (no `V3_TEST_*` env) stays fully parallel.
 - **Concurrency:** the per-exchange limit is enforced across processes via
   `GET_LOCK` (no single-instance restriction needed). Distributed slot leasing
   isn't implemented, but the GET_LOCK approach is sufficient on one MariaDB.
@@ -970,6 +1054,30 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR10 — simulated IOC is modelled as queued/scheduled work**, not a worker sleep:
+  after a place ack the cancel is enqueued with a future `next_retry_at`, and after
+  the cancel the final `GET_ORDER` is likewise scheduled (`queue.EnqueueScheduled`).
+  No executor goroutine is blocked for the wait.
+- **PR10 — a missing order / status-fetch error is never proof of zero fill** →
+  Ambiguous → NEEDS_RECONCILE (lock held). Only a settled `filled=0` is a proven
+  zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`), never FAILED. A definite *place*
+  rejection (no exposure) is the distinct clean-fail path (`OnPlaceRejected`):
+  order+cycle FAILED + lock released.
+- **PR10 — partial fills continue with the filled quantity only**; the remainder is
+  not inventory (PR11 sells `filled_quantity`). A partial with no usable price is
+  ambiguous → NEEDS_RECONCILE.
+- **PR10 — `actual_execution_mode` is mapped from the venue liquidity flag**
+  (`OrderStatus.Liquidity`), defaulting to `UNKNOWN` — never inferred/guessed. Added
+  `execution.OrderStatus.Liquidity` (additive contract field).
+- **PR10 — one aggregate fill row per final status** with a deterministic
+  `exchange_fill_id` (`final:<exchange_order_id>`), so repeated processing is
+  idempotent via `UNIQUE(order_id, exchange_fill_id)`. Per-venue fills are deferred.
+- **PR10 — the PLACE payload (`BuyIntentPayload`) moved to `internal/orders`** as the
+  shared producer/consumer contract (buyflow produces it, the executor/processor
+  consume it); JSON field names unchanged.
+- **PR10 — the gated suite runs serially** (`-p 1`) because the reconciler's global
+  open-cycle scan shares the test DB; offline tests stay parallel.
 
 - **PR8 — spread basis is Iranian best ask vs Binance best bid** (owner-confirmed),
   the most conservative realizable comparison; fee-adjusted by buy (taker) + sell
@@ -1115,4 +1223,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
 | PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
-| PR9 | `pr9-cycle-creation-buy-enqueue` | **in review** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
+| PR9 | `pr9-cycle-creation-buy-enqueue` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
+| PR10 | `pr10-order-fill-processing` | **in review** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |

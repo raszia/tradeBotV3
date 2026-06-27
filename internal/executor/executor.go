@@ -25,8 +25,8 @@ import (
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/execution"
+	"v3TradeBot/internal/orders"
 	"v3TradeBot/internal/queue"
-	"v3TradeBot/internal/state"
 )
 
 // Config tunes the executor.
@@ -44,6 +44,9 @@ type Config struct {
 	// LimitFor returns the per-exchange concurrency limit for an exchange code.
 	// Defaults to 1 if nil.
 	LimitFor func(exchangeCode string) int
+	// FinalStatusDelay is the grace before the simulated-IOC final GET_ORDER status
+	// check is claimable after a successful cancel (default 500ms).
+	FinalStatusDelay time.Duration
 }
 
 // Executor claims and processes exchange requests for a set of private clients.
@@ -67,6 +70,9 @@ func New(store *db.Store, q *queue.Queue, clients map[string]exchanges.PrivateCl
 	}
 	if cfg.LimitFor == nil {
 		cfg.LimitFor = func(string) int { return 1 }
+	}
+	if cfg.FinalStatusDelay <= 0 {
+		cfg.FinalStatusDelay = 500 * time.Millisecond
 	}
 	return &Executor{store: store, q: q, clients: clients, exIDs: map[string]int64{}, log: log, cfg: cfg}
 }
@@ -160,11 +166,15 @@ func (e *Executor) process(ctx context.Context, c queue.Claimed) {
 		bals, err := client.GetBalances(sendCtx)
 		e.handleReadOnly(ctx, c, mustJSON(bals), err)
 	case queue.TypeGetOrder:
-		var p struct {
-			ExchangeOrderID string `json:"exchange_order_id"`
+		var fp orders.FollowupPayload
+		_ = json.Unmarshal(c.Payload, &fp)
+		// A GET_ORDER tagged as the simulated-IOC final status check (and tied to an
+		// order+cycle) drives the fill processing; any other GET_ORDER is read-only.
+		if fp.Purpose == orders.PurposeFinalStatus && c.OrderID != nil && c.CycleID != nil {
+			e.handleFinalStatus(ctx, sendCtx, c, fp, client)
+			return
 		}
-		_ = json.Unmarshal(c.Payload, &p)
-		st, err := client.GetOrder(sendCtx, p.ExchangeOrderID)
+		st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
 		e.handleReadOnly(ctx, c, mustJSON(st), err)
 	case queue.TypeGetOpenOrders:
 		var p struct {
@@ -201,11 +211,16 @@ func (e *Executor) handleReadOnly(ctx context.Context, c queue.Claimed, resp jso
 }
 
 // handlePlace processes a PLACE_ORDER. It marks IN_FLIGHT (committed) BEFORE
-// sending so a crash is recoverable, then records the outcome conservatively.
+// sending so a crash is recoverable, then records the outcome conservatively and
+// (on success) schedules the simulated-IOC cancel via internal/orders.
 func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
-	var req execution.OrderRequest
-	if err := json.Unmarshal(c.Payload, &req); err != nil {
+	intent, err := orders.ParseBuyIntent(c.Payload)
+	if err != nil {
 		e.failTx(ctx, c.ID, "bad PLACE_ORDER payload: "+err.Error())
+		return
+	}
+	if c.OrderID == nil || c.CycleID == nil {
+		e.failTx(ctx, c.ID, "PLACE_ORDER missing order/cycle context")
 		return
 	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
@@ -215,105 +230,114 @@ func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, cl
 		return
 	}
 
-	ack, err := client.PlaceOrder(sendCtx, req)
+	ack, err := client.PlaceOrder(sendCtx, intent.OrderRequest(c.Symbol))
 	if err == nil {
-		// Success: complete the request AND advance the order, atomically.
-		e.completePlaceSuccess(ctx, c, ack)
+		e.completePlaceSuccess(ctx, c, ack, intent)
 		return
 	}
 	// Conservative outcome classification (rule #6): a definite rejection means
-	// the order was NOT placed (safe FAILED); anything ambiguous (timeout, network,
-	// 5xx, unknown) must NOT be re-sent — DEAD + order NEEDS_RECONCILE.
+	// the order was NOT placed (no exposure) — fail the request AND cleanly resolve
+	// the order/cycle + release the lock. Anything ambiguous (timeout, network, 5xx,
+	// unknown) must NOT be re-sent — DEAD + order/cycle NEEDS_RECONCILE.
 	if isDefiniteRejection(err) {
-		e.failTx(ctx, c.ID, "place rejected (not placed): "+err.Error())
+		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: "place rejected (not placed): " + err.Error(),
+			})
+		})
+		if txErr != nil && e.log != nil {
+			e.log.Warn("place-rejected tx failed (rolled back)", "id", c.ID, "err", txErr)
+		}
 		return
 	}
 	e.deadReconcile(ctx, c, "place ambiguous outcome: "+err.Error())
 }
 
-// handleCancel processes a CANCEL_ORDER with the same conservative discipline.
-// NOTE: the order-state resolution of a successful cancel (e.g. CANCEL_PENDING →
-// CANCELLED) is deferred to PR10 order-status processing; PR7 only records the
-// queue outcome on success.
-func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
-	var p struct {
-		ExchangeOrderID string `json:"exchange_order_id"`
+// completePlaceSuccess records the PLACE result and schedules the cancel of the
+// remainder (simulated IOC) in ONE transaction (rule #9), via orders.OnPlaceAck.
+func (e *Executor) completePlaceSuccess(ctx context.Context, c queue.Claimed, ack execution.OrderAck, intent orders.BuyIntentPayload) {
+	err := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		return orders.OnPlaceAck(ctx, tx, e.q, orders.PlaceAckParams{
+			RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
+			Symbol: c.Symbol, Ack: ack, Intent: intent, RawResp: mustJSON(ack),
+		})
+	})
+	if err != nil && e.log != nil {
+		// The whole tx rolled back; the request stays IN_FLIGHT and will be picked
+		// up by the sweeper rather than wrongly marked succeeded.
+		e.log.Warn("place completion tx failed (rolled back)", "id", c.ID, "err", err)
 	}
-	if err := json.Unmarshal(c.Payload, &p); err != nil {
+}
+
+// handleCancel processes the simulated-IOC CANCEL_ORDER. On a clean (or definite)
+// cancel it schedules the final GET_ORDER status check; an AMBIGUOUS cancel
+// (timeout/network) goes to NEEDS_RECONCILE (never guess whether it took).
+func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
+	var fp orders.FollowupPayload
+	if err := json.Unmarshal(c.Payload, &fp); err != nil {
 		e.failTx(ctx, c.ID, "bad CANCEL_ORDER payload: "+err.Error())
 		return
 	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
 		return
 	}
-	err := client.CancelOrder(sendCtx, p.ExchangeOrderID)
-	if err == nil {
-		_ = e.store.WithTx(ctx, func(tx *sql.Tx) error {
-			return e.q.MarkSucceeded(ctx, tx, c.ID, mustJSON(map[string]string{"cancelled": p.ExchangeOrderID}))
+	err := client.CancelOrder(sendCtx, fp.ExchangeOrderID)
+	// A clean cancel OR a definite rejection (e.g. order already gone/filled) both
+	// resolve via the final GET_ORDER — the cancel is best-effort, the status is
+	// authoritative. Only an ambiguous cancel (we cannot tell if it took) is unsafe.
+	if err == nil || isDefiniteRejection(err) {
+		if c.OrderID == nil || c.CycleID == nil {
+			_ = e.store.WithTx(ctx, func(tx *sql.Tx) error {
+				return e.q.MarkSucceeded(ctx, tx, c.ID, mustJSON(map[string]string{"cancelled": fp.ExchangeOrderID}))
+			})
+			return
+		}
+		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnCancelResult(ctx, tx, e.q, orders.CancelResultParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
+				Symbol: c.Symbol, ExchangeOrderID: fp.ExchangeOrderID, LocalClientID: fp.LocalClientOrderID,
+				RawResp: mustJSON(map[string]any{"cancelled": fp.ExchangeOrderID, "rejected": err != nil}), FinalCheckDelay: e.cfg.FinalStatusDelay,
+			})
 		})
-		return
-	}
-	if isDefiniteRejection(err) {
-		e.failTx(ctx, c.ID, "cancel rejected: "+err.Error())
+		if txErr != nil && e.log != nil {
+			e.log.Warn("cancel completion tx failed (rolled back)", "id", c.ID, "err", txErr)
+		}
 		return
 	}
 	e.deadReconcile(ctx, c, "cancel ambiguous outcome: "+err.Error())
 }
 
-// completePlaceSuccess records SUCCEEDED and advances the order QUEUED→SUBMITTED
-// (stamping exchange_order_id) in ONE transaction (rule #9). Richer ack/fill
-// mapping (ACKED/PARTIALLY_FILLED/FILLED) is PR10.
-func (e *Executor) completePlaceSuccess(ctx context.Context, c queue.Claimed, ack execution.OrderAck) {
-	err := e.store.WithTx(ctx, func(tx *sql.Tx) error {
-		if err := e.q.MarkSucceeded(ctx, tx, c.ID, mustJSON(ack)); err != nil {
-			return err
+// handleFinalStatus fetches the order's final status and processes the fills +
+// classification via internal/orders. A transient (retryable) fetch error simply
+// reschedules the read; ErrOrderUnknown / a missing order is NOT proof of zero fill
+// — it is processed as ambiguous → NEEDS_RECONCILE.
+func (e *Executor) handleFinalStatus(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
+	st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
+	if err != nil && !errors.Is(err, execution.ErrOrderUnknown) && isRetryable(err) {
+		if _, sErr := e.q.ScheduleRetry(ctx, c.ID, err.Error()); sErr != nil && e.log != nil {
+			e.log.Warn("schedule final-status retry failed", "id", c.ID, "err", sErr)
 		}
-		if c.OrderID == nil {
-			return nil
-		}
-		var curState string
-		var version int64
-		if err := tx.QueryRowContext(ctx, "SELECT state, version FROM orders WHERE id=?", *c.OrderID).
-			Scan(&curState, &version); err != nil {
-			return err
-		}
-		if ack.ExchangeOrderID != "" {
-			if _, err := tx.ExecContext(ctx, "UPDATE orders SET exchange_order_id=? WHERE id=?",
-				ack.ExchangeOrderID, *c.OrderID); err != nil {
-				return err
-			}
-		}
-		_, err := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
-			OrderID: *c.OrderID, From: state.OrderState(curState), To: state.OrderSubmitted, Version: version,
-			EventType: "place_ack", Reason: "order acknowledged by exchange",
+		return
+	}
+	txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		_, perr := orders.ProcessFinalStatus(ctx, tx, e.q, orders.FinalStatusParams{
+			RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Scope: c.ExchangeCode,
+			Status: st, StatusErr: err, RawResp: mustJSON(st),
 		})
-		return err
+		return perr
 	})
-	if err != nil && e.log != nil {
-		// The whole tx rolled back; the request stays IN_FLIGHT and will be picked
-		// up by the sweeper (conservatively) rather than wrongly marked succeeded.
-		e.log.Warn("place completion tx failed (rolled back)", "id", c.ID, "err", err)
+	if txErr != nil && e.log != nil {
+		e.log.Warn("final-status processing tx failed (rolled back)", "id", c.ID, "err", txErr)
 	}
 }
 
-// deadReconcile marks a mutating request DEAD and pushes its order to
-// NEEDS_RECONCILE in one transaction. Used for ambiguous send outcomes.
+// deadReconcile marks a mutating request DEAD and pushes its order AND cycle to
+// NEEDS_RECONCILE in one transaction. Used for ambiguous send/cancel outcomes.
 func (e *Executor) deadReconcile(ctx context.Context, c queue.Claimed, cause string) {
 	_ = e.store.WithTx(ctx, func(tx *sql.Tx) error {
 		if c.OrderID != nil {
-			var curState string
-			var version int64
-			if err := tx.QueryRowContext(ctx, "SELECT state, version FROM orders WHERE id=?", *c.OrderID).
-				Scan(&curState, &version); err == nil {
-				from := state.OrderState(curState)
-				if state.ValidateOrderTransition(from, state.OrderNeedsReconcile) == nil {
-					if _, err := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
-						OrderID: *c.OrderID, From: from, To: state.OrderNeedsReconcile, Version: version,
-						EventType: "ambiguous_send", Reason: cause,
-					}); err != nil {
-						return err
-					}
-				}
+			if err := orders.MarkNeedsReconcile(ctx, tx, *c.OrderID, c.CycleID, cause); err != nil {
+				return err
 			}
 		}
 		return e.q.MarkDead(ctx, tx, c.ID, cause)

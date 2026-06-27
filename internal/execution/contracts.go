@@ -99,9 +99,13 @@ type OrderStatus struct {
 	ExecutedQuote   decimal.Decimal
 	Fee             decimal.Decimal
 	FeeAsset        string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	Raw             string
+	// Liquidity is the venue-reported maker/taker classification of the fills when
+	// available ("maker" | "taker"); empty when the venue does not report it (the
+	// order processor then records actual_execution_mode as UNKNOWN).
+	Liquidity string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Raw       string
 }
 
 // Fill is one trade fill.
