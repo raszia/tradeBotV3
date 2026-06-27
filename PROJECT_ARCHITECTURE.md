@@ -63,6 +63,63 @@ a symbol that already has a pending buy:
 (Enforced in PR8/PR9 when the engine creates/updates queued buy requests; PR9
 cycle/order/request creation respects the one-active-intent rule.)
 
+**How PR9 enforces "one active intent" — the symbol lock is the gate.** From PR9 on,
+a buy intent is a **cycle** that owns an **ACTIVE `symbol_locks` row** (`UNIQUE`
+`active_key = scope|canonical_symbol`). The lock is acquired in the **same
+transaction** that creates the cycle/order/request, so a second concurrent signal
+for the same scope fails on the unique key → `ErrSymbolLocked` → the whole
+transaction rolls back (no orphan cycle) → no competing cycle. While the cycle's
+buy request is still **QUEUED (unsent)**, a newer valid signal **updates that
+request's payload** (price/mode) rather than enqueuing a second one.
+
+**Audit rule — do not physically delete a cycle-tied request.** A standalone
+*pre-cycle* QUEUED intent may be deleted, but once a request is tied to a
+cycle/order (which, from PR9, is always — `orders.cycle_id` is `NOT NULL`) it must
+**not** be physically deleted; it is marked obsolete/`DEAD` or carried with an event
+trail so audit/recovery stay intact. Consequently **PR9 never deletes** a buy
+request: when the latest signal *invalidates* a started cycle's still-QUEUED buy,
+PR9 leaves it untouched and the **lifecycle logic (PR10/PR11)** cancels/abandons it
+through the state machine. PR9 only **creates** (no active lock) or **refreshes the
+QUEUED payload** (active lock, request still unsent); `CLAIMED`/`IN_FLIGHT`/sent
+requests are never mutated by the engine.
+
+**Maker-first / taker-fallback buy policy (owner-defined; DB-configurable per
+exchange-market/symbol).** The buy intent supports a configurable maker-first,
+taker-fallback escalation to reduce fees when possible while still capturing a
+persistent edge:
+
+- **First attempt → maker-style.** The first valid signal for a scope prepares a
+  maker-style limit buy **below** the Iranian ask by a configured offset
+  (`maker_price_offset_bps`): `limit = ask × (1 − maker_price_offset_bps/10000)`.
+- **Repeated opportunity → taker fallback.** Maker attempts are counted **per scope
+  within a rolling window** (`maker_signal_window_seconds`): the attempt number for
+  a new cycle is `1 + (count of maker cycles created for the scope in the window)`.
+  While `attempt ≤ maker_attempts_before_taker` the mode is `MAKER_FIRST` (attempt
+  1) / `MAKER_RETRY` (attempt > 1); once exhausted the mode is `TAKER_FALLBACK` and
+  the limit is the **ask** (`taker_price_mode='ASK'`), capped by `max_taker_slippage_bps`
+  against the signal price. When the window elapses, old maker cycles drop out of the
+  count, so the counter resets naturally. If `maker_first_enabled=false`, every
+  attempt is taker. (The cross-cycle counter advances only when a prior maker attempt
+  has **finished and released the lock** — within a single still-QUEUED cycle,
+  repeated signals only refresh the price, they do not re-escalate.)
+- **Config parameters** (on `symbol_configs`, versioned): `maker_first_enabled`,
+  `maker_attempts_before_taker`, `maker_signal_window_seconds`,
+  `maker_wait_before_cancel_ms`, `maker_price_offset_bps`, `taker_price_mode`,
+  `max_taker_slippage_bps`.
+- **Both modes still execute via the simulated-IOC flow** (below): maker = place
+  below ask → wait `maker_wait_before_cancel_ms` → cancel remainder → confirm fill;
+  taker = place at/near ask (slippage-capped) → confirm fill. Execution and fill
+  accounting are PR10/PR11.
+- **Persisted for audit/dashboard** (PR9 stamps what it knows; PR10/PR11 fill the
+  rest): `orders.intended_execution_mode` / `actual_execution_mode` /
+  `maker_attempt_number` / `maker_offset_bps` / `ask_price_at_decision`;
+  `cycles.intended_execution_mode` / `maker_attempt_number` /
+  `opportunity_window_started_at`; and, in the `PLACE_ORDER` request payload, the
+  full executor instruction set (mode, intended price/qty, maker wait + cancel-after,
+  final-status-check flag, offset, taker price mode + slippage cap, signal price
+  context, quote unit + reference rate, fee assumptions, config version,
+  `local_client_order_id`, idempotency key).
+
 **Simulated IOC buy (Iranian venues lack native IOC).** From the strategy's view
 the buy is IOC, but the system SIMULATES it via the flow rather than assuming a
 native capability:
@@ -97,12 +154,15 @@ no-open-order is not proof of zero fill; proven zero-fill may safely close/expir
 the attempt; proven partial/full fill must preserve the filled amount and keep the
 cycle safe for later sell management.
 
-**Implementation placement:** no-duplicate-queued-signal + update/remove-before-send
-→ PR8/PR9; one-active-pending-intent → PR9; fill/status recording → PR10;
-sell/reprice on filled qty → PR11; reconciler crash/ambiguity handling → PR12;
-dashboard exposes the simulated-IOC wait interval + related settings → PR17. Each
+**Implementation placement:** pre-cycle no-duplicate-queued-signal (update/remove an
+unsent intent) → PR8; one-active-pending-intent via the **symbol lock** +
+maker/taker decision + buy enqueue → **PR9**; simulated-IOC execution + fill/status
+recording + `actual_execution_mode` → PR10; sell/reprice on filled qty → PR11;
+reconciler crash/ambiguity handling → PR12; dashboard exposes the maker/taker policy,
+simulated-IOC wait interval, and per-attempt mode/fill reporting → PR16/PR17. Each
 of those PRs adds the corresponding tests (duplicate-signal-updates-not-inserts,
-invalid-signal-removes-pending, claimed/in-flight-not-mutated, zero-fill-abandons,
+claimed/in-flight-not-mutated, duplicate-lock-blocks-second-cycle, atomic-rollback,
+maker-first-then-taker-after-N-attempts, window-reset, zero-fill-abandons-as-CANCELLED,
 partial-fill-continues-with-filled-amount, ambiguous→NEEDS_RECONCILE,
 no-open-order-not-proof-of-zero-fill).
 
@@ -455,21 +515,86 @@ Rules enforced:
   (`ErrStaleVersion`), **state mismatch** (`ErrStateMismatch`), or **missing row**
   (`ErrUnknownRow`). This is how crash/duplicate-event replays stay safe.
 
-## 10. Symbol-lock design (PR9/PR12)
+## 10. Symbol-lock design (acquire in PR9, release/reclaim in PR12)
 
 A DB-backed lock prevents a symbol with an active cycle from accepting a new
 signal. It survives restarts and is recoverable by the reconciler.
 
 - **Scope is explicit and composite** — it includes the **exchange** and the
-  **canonical market** (and, later, strategy), e.g. `nobitex|BTC/USDT`. So
-  `BTC/USDT` on Nobitex does not block `BTC/USDT` on Wallex unless a deliberately
-  global scope is configured.
+  **canonical market** (and, later, strategy), e.g. `nobitex|BTC/IRT`. So
+  `BTC/IRT` on Nobitex does not block `BTC/IRT` on Wallex unless a deliberately
+  global scope is configured. (PR9 uses the exchange **code** as the scope.)
 - Acquiring the lock, creating the cycle, and enqueuing the first request happen
   in **one transaction** (no lock without a cycle; no cycle without its request).
-- A unique-when-active constraint (generated column) enforces one active lock per
-  scope; released locks free the scope.
+- A unique-when-active constraint (generated column `active_key`) enforces one
+  active lock per scope; released locks free the scope. PR9's
+  `symbollock.Acquire(tx, scope, symbol, cycleID, expiresAt)` inserts the lock and
+  maps a duplicate-key (1062) to **`ErrSymbolLocked`**, so the creating transaction
+  rolls back cleanly when the scope is already locked.
 - The reconciler reclaims a stale lock **only after** positively determining the
-  owning cycle is safe — never on lease expiry alone.
+  owning cycle is safe — never on lease expiry alone. (Lease heartbeat renewal is a
+  later PR; PR9 sets `expires_at` from a configured lease.)
+
+## 10a. Cycle creation & buy enqueue (implemented in PR9 — `internal/buyflow`)
+
+PR9 is the first code that **creates** trading rows. It is driven by an *accepted*
+signal from the engine and, like everything before PR10, **executes nothing**: it
+prepares and persists the buy intent and enqueues a `PLACE_ORDER` request for the
+order-executor to claim later. It never calls an exchange (no private client) and
+never sends an order.
+
+**The critical path is one transaction** (`db.WithTx`), all-or-nothing — if any
+step fails the whole thing rolls back and **no** cycle/lock/order/request exists
+(source-of-truth rule #1: nothing is sent before it is committed, and an uncommitted
+intent simply does not exist):
+
+1. **Eligibility (pre-tx, fail-safe):** the market must be `enabled_for_signal` **and**
+   `enabled_for_trading`, have a `symbol_config`, an active `config_version`, and a
+   **fresh** Iranian ask (stale/missing market data ⇒ no cycle). Disabled or stale ⇒
+   return without creating anything.
+2. **Maker/taker decision (pure):** read the per-scope maker count in the rolling
+   window, compute `attempt_number`, choose `MAKER_FIRST`/`MAKER_RETRY`/`TAKER_FALLBACK`
+   and the limit price (see §2a). This is a pure function (`buyflow.Decide`), unit-
+   tested offline.
+3. **Insert the cycle** (`state='NEW'`), stamped with `config_version`, the signal
+   context (`signal_time`, prices, spread, `buy_size`), the chosen
+   `intended_execution_mode`, `maker_attempt_number`, and `opportunity_window_started_at`.
+4. **Acquire the symbol lock** referencing the new cycle — duplicate active scope ⇒
+   `ErrSymbolLocked` ⇒ rollback (no orphan cycle). **This is the one-active-intent gate.**
+5. **Insert the buy order** (`side='buy'`, `role='entry_buy'`, `state='NEW'`,
+   `order_type='limit'`, **`time_in_force` left NULL — native IOC is never forced**),
+   with a generated **`local_client_order_id`** (`c{cycleID}-buy`, `UNIQUE`), the
+   intended `limit_price`/`quantity`, and the execution-mode audit columns.
+6. **Advance states through the state machine** (never ad-hoc SQL): cycle
+   `NEW → SIGNAL_DETECTED → BUY_REQUEST_QUEUED`; order `NEW → REGISTERED → QUEUED`.
+   Each transition writes its `*_state_events` row in the same tx.
+7. **Enqueue the `PLACE_ORDER` request** (`queue.Enqueue`, status `QUEUED`) tied to
+   the cycle+order, with a deterministic **idempotency key** (`place-order:c{cycleID}:buy`,
+   `UNIQUE`), `timeout_ms`/`max_retries` from config, and the full intent **payload**.
+8. **Commit.** The executor (PR7) later claims the QUEUED request and sends it; until
+   PR10 wires real private clients with `AllowLiveExecution=true`, nothing is sent.
+
+**Request payload shape** (everything PR10/PR11 need to execute the simulated-IOC
+buy without re-deriving anything): `execution_mode`, `order_type='limit'`,
+`side='buy'`, `intended_price`, `intended_quantity`, `buy_size_unit`,
+`maker_attempt_number`, `maker_attempts_before_taker`, `maker_offset_bps`,
+`maker_wait_before_cancel_ms`, `cancel_after_wait=true`, `final_status_check_required=true`,
+`simulated_ioc=true`, `taker_price_mode`, `max_taker_slippage_bps`,
+`ask_price_at_decision`, `signal_binance_price`, `signal_iranian_price`,
+`quote_unit`, `reference_rate`, `buy_fee_bps`, `sell_fee_bps`, `config_version`,
+`local_client_order_id`.
+
+**No-duplicate / refresh / invalidation** (per §2a): if the scope is already locked,
+PR9 does **not** create a second cycle; if that cycle's buy request is still
+**QUEUED (unsent)** a newer valid signal **refreshes its payload/price**
+(`buyflow.RefreshActiveCycleBuy`, `SELECT … FOR UPDATE` + `status='QUEUED'` guard) —
+never a duplicate, never touching a `CLAIMED`/`IN_FLIGHT`/sent request, never
+physically deleting a cycle-tied request. Invalidation of a started cycle's buy is
+left to the PR10/PR11 lifecycle (the engine does not delete it).
+
+**What PR9 does NOT do:** place/cancel/query any exchange order; record fills or
+actual execution mode; run the simulated-IOC wait/cancel/status sequence; release
+the lock (only the safe terminal flow / reconciler does). Those are PR10/PR11/PR12.
 
 ## 11. Reconciler (implemented in PR12 — `internal/reconciler`)
 
@@ -977,4 +1102,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
-| PR8 | `pr8-trade-engine-signal` | **in review** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; spread = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. §2a pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates — PR9 does). NEVER calls an exchange (reflection guard). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
+| PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
+| PR9 | `pr9-cycle-creation-buy-enqueue` | **in review** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds` (counted from cycles); persists intended mode/attempt/offset/ask. No-duplicate via the lock; active cycle's still-QUEUED buy is refreshed not duplicated; cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, refresh-not-dup, CLAIMED untouched, idem-key unique, config stamp, flags/stale block, state-machine events, maker→taker by attempt count, no private client). |
