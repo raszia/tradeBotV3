@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR4 — Exchange abstraction layer.**
+Last updated: **PR5 — Redis market data and collector foundation.**
 
 ---
 
@@ -168,18 +168,53 @@ NNN_name.sql` files applied by the `migrate` binary. **No external/manual SQL.**
 - **Fail-fast:** service binaries call `migrate.EnsureCurrent` on startup and
   refuse to run if any migration is pending. Services never self-migrate.
 
-## 7. Redis key structure
+## 7. Redis key structure (implemented in PR5)
 
-Redis holds **live market data only** and is **never** the source of truth. Key
-schema is finalized in PR5; the planned layout (ported from the sibling system):
+Redis holds **live market data only** and is **never** the source of truth.
 
-- `orderbook:{exchange}:{canonical_symbol}` — latest normalized order book (JSON).
-- `price:{exchange}:{canonical_symbol}` — latest price/best bid-ask (JSON).
-- Pub/sub channel for price/book updates with a compact `exchange|symbol` payload.
+**Keys** (`internal/redis/market.go`):
 
-If Redis is flushed or restarted, the system loses at most fresh market data
-(repopulated by collectors); it never loses cycles, orders, fills, locks,
-balances, or queue state.
+- `orderbook:{exchange_code}:{canonical_symbol}` → JSON `events.BookSnapshot`
+  (the full normalized book + timestamps).
+- `price:{exchange_code}:{canonical_symbol}` → JSON `events.PriceSnapshot`
+  (top-of-book: best bid/ask + qty + timestamps).
+- Both keys carry a TTL (default 5m) so stale data expires if a collector dies.
+
+Canonical symbols (e.g. `BTC/USDT`) contain `/`. Redis keys are binary-safe, so
+`/` is kept verbatim — the format stays human-readable and consistent. The
+`{exchange_code}` is the normalized exchange code (`binance`, `nobitex`, …).
+
+**Pub/sub:** a single shared channel **`market_events`** carries JSON
+`events.MarketEvent` (`type`, `exchange`, `symbol`, `best_bid`/`best_ask`, +
+timestamps). Subscribers (trade-engine, regime) read one channel and filter by
+exchange/symbol.
+
+**Timestamps (rule #4)** on every payload/event so later PRs can detect
+staleness: `exchange_time` (when the data is from), `received_at` (collector
+received), `stored_at`/`published_at` (written to / published on Redis), plus
+`exchange` and canonical `symbol`. `BookSnapshot.Stale(maxAge, now)` is provided.
+
+**Restart safety:** if Redis is flushed/restarted, the system loses at most fresh
+market data — collectors reconnect and repopulate. It never loses cycles, orders,
+fills, locks, balances, or queue state (all in MariaDB). The collector itself is
+stateless: on restart it reloads its collection set from the DB and resumes.
+
+## 7a. Collector (implemented in PR5)
+
+The `collector` binary (`internal/collector`) is the read-only market-data plane:
+
+- Uses **only** `exchanges.PublicClient` (no credentials, no private calls). It
+  makes **no** trading decisions, creates **no** cycles, writes **no** orders.
+- Loads its collection set from the DB (`exchange_markets.enabled_for_collection`
+  on enabled exchanges) — the dashboard/discovery toggles this later.
+- For each exchange: a WebSocket order-book subscriber when the venue supports it
+  (Binance), otherwise a REST poll loop (the Iranian venues — WS deferred, see
+  §12). Each observed book is normalized, written to the `orderbook:`/`price:`
+  keys, and published on `market_events`; per-exchange health is recorded in
+  `exchange_health_current`/`exchange_health_samples`.
+- Raw API calls are logged through the secret-masking IO logger (§12).
+- Decoupled via interfaces (`MarketStore`, `HealthRecorder`) so it is unit-tested
+  with fakes and never needs a live exchange/Redis/DB in unit tests.
 
 ## 8. Exchange-request queue design (PR7)
 
@@ -494,10 +529,15 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR4 the system has schema, a state machine, and exchange adapters but
-  still no trading behaviour.** Service binaries boot, verify the schema, and
-  idle; nothing reads market data, evaluates signals, places orders, or
-  reconciles yet. The exchange adapters are not wired into any running service.
+- **Through PR5 the system collects market data but does not trade.** The
+  collector caches books/prices in Redis and publishes events; nothing yet
+  consumes those events to evaluate signals, place orders, or reconcile.
+- **Collector data source:** until market-discovery (later PR) populates
+  `exchange_markets` and the dashboard enables symbols, the collector has zero
+  targets and idles. It reads `enabled_for_collection`; there is no discovery
+  execution yet (PR-deferred).
+- The Iranian adapters poll (WS deferred, §12), so collector latency for those
+  venues is the poll interval; Binance uses WS.
 - **PR4 adapters: WebSocket subscriptions are deferred** for all Iranian venues
   (`SubscribeOrderBook`/`SubscribeOrderUpdates` return `ErrUnsupported`; polling is
   the supported path). Binance order-book WS is implemented. Adapter REST surfaces
@@ -528,6 +568,17 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR5 — Redis key format keeps `/`.** Canonical symbols (`BTC/USDT`) are used
+  verbatim in keys (`orderbook:nobitex:BTC/IRT`); Redis keys are binary-safe so no
+  escaping is needed, and it stays readable/consistent.
+- **PR5 — single shared `market_events` channel** (JSON `MarketEvent`) rather than
+  per-symbol channels, so a consumer subscribes once and filters.
+- **PR5 — collector reads its collection set from the DB** (`enabled_for_collection`),
+  not from a config file; Redis stays a pure cache with a TTL.
+- **PR5 — collector decoupled via `MarketStore`/`HealthRecorder` interfaces** so
+  unit tests use fakes (no live exchange/Redis/DB); a gated test covers the real
+  Redis store.
 
 - **PR4 — exchange abstraction is a redesign, not a verbatim copy.** iranArb's
   `PlaceIOC` (forced IOC) + legacy `*IRT` field names were replaced with a generic
@@ -583,6 +634,7 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR2 | `pr2-database-schema` | **accepted** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
 | PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
+| PR5 | `pr5-redis-collector` | **in review** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
 | PR5 | `pr5-redis-collector` | planned | Redis key schema + collector. |
 | PR6 | `pr6-config-system` | planned | DB-backed versioned config + cache. |
 | PR7 | `pr7-exchange-request-queue` | planned | Queue + order-executor foundation. |

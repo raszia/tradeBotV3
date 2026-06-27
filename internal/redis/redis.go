@@ -27,11 +27,18 @@ const (
 	defaultMinIdleConns = 3
 	defaultIdleTimeout  = 5 * time.Minute
 	defaultMaxLifetime  = 1 * time.Hour
+
+	// defaultMarketTTL bounds how long a cached order book / price snapshot lives
+	// in Redis. Because Redis is only a cache (never source of truth), expiry is
+	// harmless: collectors repopulate it. A short TTL means stale data disappears
+	// rather than lingering after a collector dies.
+	defaultMarketTTL = 5 * time.Minute
 )
 
 // Client wraps *goredis.Client. Safe for concurrent use.
 type Client struct {
-	rdb *goredis.Client
+	rdb       *goredis.Client
+	marketTTL time.Duration
 }
 
 // New constructs the client and pings to fail fast on a bad address.
@@ -41,7 +48,14 @@ func New(ctx context.Context, cfg config.RedisConfig) (*Client, error) {
 		_ = rdb.Close()
 		return nil, err
 	}
-	return &Client{rdb: rdb}, nil
+	return &Client{rdb: rdb, marketTTL: defaultMarketTTL}, nil
+}
+
+// SetMarketTTL overrides the TTL applied to cached order-book/price snapshots.
+func (c *Client) SetMarketTTL(d time.Duration) {
+	if d > 0 {
+		c.marketTTL = d
+	}
 }
 
 // buildOptions is pure (no I/O) so default application is unit-testable without

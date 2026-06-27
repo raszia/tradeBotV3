@@ -178,3 +178,78 @@ func (f *FakePrivateClient) emit(ev execution.NormalizedOrderEvent) {
 	default:
 	}
 }
+
+// FakePublicClient is an in-memory PublicClient for tests (collector, regime). It
+// makes no network calls. Order books are set via SetOrderBook; GetOrderBook
+// returns the set book (or GetOrderBookErr). It supports a WS channel only when
+// Caps.OrderBookWS is true.
+type FakePublicClient struct {
+	code string
+
+	mu      sync.Mutex
+	books   map[string]domain.OrderBook
+	markets []NormalizedMarket
+
+	// Caps overrides the reported capabilities (zero value = REST-only default).
+	Caps *Capabilities
+	// GetOrderBookErr, if set, is returned by GetOrderBook (simulates a venue error).
+	GetOrderBookErr error
+	// WS, if non-nil and Caps.OrderBookWS is true, is returned by SubscribeOrderBook.
+	WS chan domain.OrderBook
+}
+
+// NewFakePublicClient builds a fake public client for the given code.
+func NewFakePublicClient(code string) *FakePublicClient {
+	return &FakePublicClient{code: code, books: map[string]domain.OrderBook{}}
+}
+
+func (f *FakePublicClient) Name() string { return f.code }
+
+func (f *FakePublicClient) Capabilities() Capabilities {
+	if f.Caps != nil {
+		return *f.Caps
+	}
+	return Capabilities{MarketMetadata: true, OrderBookREST: true}
+}
+
+// SetOrderBook records the book returned by GetOrderBook for a canonical symbol.
+func (f *FakePublicClient) SetOrderBook(canonicalSymbol string, book domain.OrderBook) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.books[canonicalSymbol] = book
+}
+
+// SetMarkets records the markets returned by GetMarkets.
+func (f *FakePublicClient) SetMarkets(m []NormalizedMarket) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.markets = m
+}
+
+func (f *FakePublicClient) GetMarkets(context.Context) ([]NormalizedMarket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]NormalizedMarket, len(f.markets))
+	copy(out, f.markets)
+	return out, nil
+}
+
+func (f *FakePublicClient) GetOrderBook(_ context.Context, symbol string) (domain.OrderBook, error) {
+	if f.GetOrderBookErr != nil {
+		return domain.OrderBook{}, f.GetOrderBookErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.books[symbol]
+	if !ok {
+		return domain.OrderBook{}, Unsupported(f.code, "GetOrderBook("+symbol+") (no fake book set)")
+	}
+	return b, nil
+}
+
+func (f *FakePublicClient) SubscribeOrderBook(_ context.Context, _ []string) (<-chan domain.OrderBook, error) {
+	if f.Caps == nil || !f.Caps.OrderBookWS || f.WS == nil {
+		return nil, Unsupported(f.code, "SubscribeOrderBook")
+	}
+	return f.WS, nil
+}
