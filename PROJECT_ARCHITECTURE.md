@@ -91,17 +91,26 @@ persistent edge:
 - **First attempt → maker-style.** The first valid signal for a scope prepares a
   maker-style limit buy **below** the Iranian ask by a configured offset
   (`maker_price_offset_bps`): `limit = ask × (1 − maker_price_offset_bps/10000)`.
-- **Repeated opportunity → taker fallback.** Maker attempts are counted **per scope
-  within a rolling window** (`maker_signal_window_seconds`): the attempt number for
-  a new cycle is `1 + (count of maker cycles created for the scope in the window)`.
-  While `attempt ≤ maker_attempts_before_taker` the mode is `MAKER_FIRST` (attempt
-  1) / `MAKER_RETRY` (attempt > 1); once exhausted the mode is `TAKER_FALLBACK` and
-  the limit is the **ask** (`taker_price_mode='ASK'`), capped by `max_taker_slippage_bps`
-  against the signal price. When the window elapses, old maker cycles drop out of the
-  count, so the counter resets naturally. If `maker_first_enabled=false`, every
-  attempt is taker. (The cross-cycle counter advances only when a prior maker attempt
-  has **finished and released the lock** — within a single still-QUEUED cycle,
-  repeated signals only refresh the price, they do not re-escalate.)
+- **Repeated opportunity → taker fallback.** Each valid signal for the scope is an
+  *opportunity* and **advances one shared attempt counter within a rolling window**
+  (`maker_signal_window_seconds`), whether the signal **creates** a new cycle or
+  **refreshes** the existing still-QUEUED (unsent) one. The attempt number is
+  `1 + (the most recent in-window cycle's attempt)`; while `attempt ≤
+  maker_attempts_before_taker` the mode is `MAKER_FIRST` (attempt 1) / `MAKER_RETRY`
+  (attempt > 1); once exhausted the mode is `TAKER_FALLBACK` and the limit is the
+  **ask** (`taker_price_mode='ASK'`), capped by `max_taker_slippage_bps` against the
+  signal price. When the window elapses the counter **resets to maker-first**. If
+  `maker_first_enabled=false`, every attempt is taker.
+- **One shared counter across create AND refresh (load-bearing).** Because the
+  symbol lock means only one cycle is active per scope at a time, repeated signals
+  hit the still-QUEUED cycle and **refresh it in place** — and that refresh
+  **re-runs the maker/taker decision**, so the SAME QUEUED request can escalate
+  `MAKER_FIRST → MAKER_RETRY → TAKER_FALLBACK` (updating its mode, price, attempt,
+  and payload) **without ever creating a duplicate request**. A new cycle created
+  after a prior attempt released the lock continues the same counter from the most
+  recent in-window cycle. Either path escalates identically; neither double-counts
+  (a refresh advances the active cycle's own counter; a new cycle advances from the
+  prior cycle's counter). `CLAIMED`/`IN_FLIGHT`/sent requests are never refreshed.
 - **Config parameters** (on `symbol_configs`, versioned): `maker_first_enabled`,
   `maker_attempts_before_taker`, `maker_signal_window_seconds`,
   `maker_wait_before_cancel_ms`, `maker_price_offset_bps`, `taker_price_mode`,
@@ -552,9 +561,10 @@ intent simply does not exist):
    `enabled_for_trading`, have a `symbol_config`, an active `config_version`, and a
    **fresh** Iranian ask (stale/missing market data ⇒ no cycle). Disabled or stale ⇒
    return without creating anything.
-2. **Maker/taker decision (pure):** read the per-scope maker count in the rolling
-   window, compute `attempt_number`, choose `MAKER_FIRST`/`MAKER_RETRY`/`TAKER_FALLBACK`
-   and the limit price (see §2a). This is a pure function (`buyflow.Decide`), unit-
+2. **Maker/taker decision (pure):** continue the shared per-scope attempt counter
+   from the most recent in-window cycle (reset on window expiry), compute
+   `attempt_number`, choose `MAKER_FIRST`/`MAKER_RETRY`/`TAKER_FALLBACK` and the limit
+   price (see §2a). The choice itself is a pure function (`buyflow.Decide`), unit-
    tested offline.
 3. **Insert the cycle** (`state='NEW'`), stamped with `config_version`, the signal
    context (`signal_time`, prices, spread, `buy_size`), the chosen
@@ -586,11 +596,13 @@ buy without re-deriving anything): `execution_mode`, `order_type='limit'`,
 
 **No-duplicate / refresh / invalidation** (per §2a): if the scope is already locked,
 PR9 does **not** create a second cycle; if that cycle's buy request is still
-**QUEUED (unsent)** a newer valid signal **refreshes its payload/price**
+**QUEUED (unsent)** a newer valid signal **refreshes it in place**
 (`buyflow.RefreshActiveCycleBuy`, `SELECT … FOR UPDATE` + `status='QUEUED'` guard) —
-never a duplicate, never touching a `CLAIMED`/`IN_FLIGHT`/sent request, never
-physically deleting a cycle-tied request. Invalidation of a started cycle's buy is
-left to the PR10/PR11 lifecycle (the engine does not delete it).
+re-running the maker/taker decision so the SAME request can escalate
+`MAKER_FIRST → MAKER_RETRY → TAKER_FALLBACK` (mode + price + attempt + payload all
+updated) without a duplicate, never touching a `CLAIMED`/`IN_FLIGHT`/sent request,
+never physically deleting a cycle-tied request. Invalidation of a started cycle's buy
+is left to the PR10/PR11 lifecycle (the engine does not delete it).
 
 **What PR9 does NOT do:** place/cancel/query any exchange order; record fills or
 actual execution mode; run the simulated-IOC wait/cancel/status sequence; release
@@ -1103,4 +1115,4 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
 | PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |
-| PR9 | `pr9-cycle-creation-buy-enqueue` | **in review** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds` (counted from cycles); persists intended mode/attempt/offset/ask. No-duplicate via the lock; active cycle's still-QUEUED buy is refreshed not duplicated; cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, refresh-not-dup, CLAIMED untouched, idem-key unique, config stamp, flags/stale block, state-machine events, maker→taker by attempt count, no private client). |
+| PR9 | `pr9-cycle-creation-buy-enqueue` | **in review** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |

@@ -216,8 +216,9 @@ func TestWindowResetReturnsToMaker(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.releaseLock(r1.CycleID)
-	// Backdate the first cycle beyond the window so it no longer counts.
-	if _, err := f.db.Exec("UPDATE cycles SET created_at = NOW(6) - INTERVAL 2 HOUR WHERE id=?", r1.CycleID); err != nil {
+	// Backdate the first cycle's opportunity window beyond the configured window so
+	// it no longer counts (the new attempt resets to maker-first).
+	if _, err := f.db.Exec("UPDATE cycles SET opportunity_window_started_at = NOW(6) - INTERVAL 2 HOUR WHERE id=?", r1.CycleID); err != nil {
 		t.Fatal(err)
 	}
 	r2, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600)
@@ -261,28 +262,98 @@ func TestConfigVersionStamped(t *testing.T) {
 	}
 }
 
-func TestRefreshActiveCycleBuyUpdatesQueued(t *testing.T) {
+// snapshot of an active cycle's buy state (cycle mode/attempt, order mode/attempt/
+// price, request payload) for cross-entity consistency assertions.
+func (f *bfix) buyState(m configstore.MarketConfig) (cycMode string, cycAttempt int, ordMode string, ordAttempt int, limit, ask, payload string) {
+	f.t.Helper()
+	err := f.db.QueryRow(`SELECT c.intended_execution_mode, c.maker_attempt_number,
+		o.intended_execution_mode, o.maker_attempt_number, o.limit_price, o.ask_price_at_decision, er.payload
+		FROM symbol_locks sl JOIN cycles c ON c.id=sl.cycle_id
+		JOIN orders o ON o.cycle_id=c.id AND o.role='entry_buy'
+		JOIN exchange_requests er ON er.order_id=o.id AND er.request_type='PLACE_ORDER'
+		WHERE sl.state='ACTIVE' AND sl.canonical_symbol=?`, m.CanonicalSymbol).
+		Scan(&cycMode, &cycAttempt, &ordMode, &ordAttempt, &limit, &ask, &payload)
+	if err != nil {
+		f.t.Fatalf("buyState: %v", err)
+	}
+	return
+}
+
+// TestRefreshAdvancesAttemptAndEscalates is the owner-required edge case: repeated
+// valid signals on a still-QUEUED request advance the attempt counter and escalate
+// MAKER_FIRST -> MAKER_RETRY -> TAKER_FALLBACK on the SAME request (no duplicate),
+// with cycle/order/request kept consistent.
+func TestRefreshAdvancesAttemptAndEscalates(t *testing.T) {
 	f := setupB(t)
-	m := f.market("USDT", "0.5", "base", policy(true, 2, 10)) // maker offset 10
+	m := f.market("USDT", "0.5", "base", policy(true, 2, 10)) // taker after 2 maker attempts, offset 10
 	if _, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("200"), f.sig())
-	if err != nil || !ok {
-		t.Fatalf("refresh = %v, %v; want true", ok, err)
+	// Attempt 1 at create.
+	cm, ca, om, oa, limit, _, payload := f.buyState(m)
+	if cm != "MAKER_FIRST" || ca != 1 || om != "MAKER_FIRST" || oa != 1 || !decimal.RequireFromString(limit).Equal(dec("99.9")) {
+		t.Fatalf("after create: cyc=%s/%d ord=%s/%d limit=%s, want MAKER_FIRST/1 .. 99.9", cm, ca, om, oa, limit)
 	}
-	var limit, ask, payload string
-	f.db.QueryRow(`SELECT o.limit_price, o.ask_price_at_decision, er.payload
-		FROM orders o JOIN exchange_requests er ON er.order_id=o.id
-		WHERE o.exchange_market_id=? AND o.role='entry_buy'`, m.ExchangeMarketID).Scan(&limit, &ask, &payload)
+
+	// Refresh 1 -> attempt 2, MAKER_RETRY, new ask 200 -> limit 199.8 (offset 10).
+	if ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("200"), f.sig()); err != nil || !ok {
+		t.Fatalf("refresh1 = %v, %v; want true", ok, err)
+	}
+	cm, ca, om, oa, limit, ask, payload := f.buyState(m)
+	if cm != "MAKER_RETRY" || ca != 2 || om != "MAKER_RETRY" || oa != 2 {
+		t.Errorf("after refresh1: cyc=%s/%d ord=%s/%d, want MAKER_RETRY/2", cm, ca, om, oa)
+	}
 	if !decimal.RequireFromString(limit).Equal(dec("199.8")) || !decimal.RequireFromString(ask).Equal(dec("200")) {
-		t.Errorf("refreshed limit/ask = %s/%s, want 199.8/200 (maker offset preserved)", limit, ask)
+		t.Errorf("after refresh1: limit/ask = %s/%s, want 199.8/200", limit, ask)
 	}
-	if !strings.Contains(payload, `"intended_price":"199.8"`) {
-		t.Errorf("payload price not refreshed: %s", payload)
+
+	// Refresh 2 -> attempt 3 exceeds threshold 2 -> TAKER_FALLBACK at the ask.
+	if ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("300"), f.sig()); err != nil || !ok {
+		t.Fatalf("refresh2 = %v, %v; want true", ok, err)
+	}
+	cm, ca, om, oa, limit, ask, payload = f.buyState(m)
+	if cm != "TAKER_FALLBACK" || ca != 3 || om != "TAKER_FALLBACK" || oa != 3 {
+		t.Errorf("after refresh2: cyc=%s/%d ord=%s/%d, want TAKER_FALLBACK/3", cm, ca, om, oa)
+	}
+	if !decimal.RequireFromString(limit).Equal(dec("300")) || !decimal.RequireFromString(ask).Equal(dec("300")) {
+		t.Errorf("after refresh2: taker limit/ask = %s/%s, want 300/300 (at ask)", limit, ask)
+	}
+	// Payload reflects the escalated mode/price, and NO duplicate request was made.
+	if !strings.Contains(payload, `"execution_mode":"TAKER_FALLBACK"`) || !strings.Contains(payload, `"intended_price":"300"`) {
+		t.Errorf("payload not escalated: %s", payload)
 	}
 	if n := f.buyReqs(m); n != 1 {
-		t.Errorf("buy requests after refresh = %d, want 1 (no duplicate)", n)
+		t.Errorf("buy requests after two refreshes = %d, want exactly 1 (no duplicate)", n)
+	}
+}
+
+func TestRefreshWindowExpiryResetsToMaker(t *testing.T) {
+	f := setupB(t)
+	m := f.market("USDT", "0.5", "base", policy(true, 1, 10)) // taker after 1 maker attempt
+	if _, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600); err != nil {
+		t.Fatal(err)
+	}
+	// One refresh escalates to taker (threshold 1 -> attempt 2 is taker).
+	if ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("100"), f.sig()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if cm, _, _, _, _, _, _ := f.buyState(m); cm != "TAKER_FALLBACK" {
+		t.Fatalf("expected TAKER_FALLBACK before window reset, got %s", cm)
+	}
+	// Expire the window, then a refresh resets the decision to maker-first.
+	var cid int64
+	if err := f.db.QueryRow("SELECT cycle_id FROM symbol_locks WHERE state='ACTIVE' AND canonical_symbol=?", m.CanonicalSymbol).Scan(&cid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.Exec("UPDATE cycles SET opportunity_window_started_at = NOW(6) - INTERVAL 2 HOUR WHERE id=?", cid); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("100"), f.sig()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	cm, ca, _, _, _, _, _ := f.buyState(m)
+	if cm != "MAKER_FIRST" || ca != 1 {
+		t.Errorf("after window expiry: mode/attempt = %s/%d, want MAKER_FIRST/1 (reset)", cm, ca)
 	}
 }
 

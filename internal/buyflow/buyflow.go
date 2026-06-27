@@ -89,10 +89,11 @@ func CreateBuyCycle(ctx context.Context, store *db.Store, q *queue.Queue, m conf
 		return out, errors.New("buyflow: non-positive ask")
 	}
 	err := store.WithTx(ctx, func(tx *sql.Tx) error {
-		// 1. Count prior maker attempts for this scope within the rolling window, and
-		//    find the window start (for reporting). The symbol lock guarantees only
-		//    one creator per scope at a time, so this count cannot race for a scope.
-		prior, windowStart, err := priorMakerAttempts(ctx, tx, m.ExchangeMarketID, m.Maker.MakerSignalWindowSeconds)
+		// 1. Continue the per-scope maker/taker attempt counter from the most recent
+		//    cycle within the rolling window (resets when the window has expired). The
+		//    symbol lock guarantees one creator per scope at a time, so this read
+		//    cannot race for a scope.
+		prior, windowStart, err := priorAttemptAndWindow(ctx, tx, m.ExchangeMarketID, m.Maker.MakerSignalWindowSeconds)
 		if err != nil {
 			return err
 		}
@@ -162,27 +163,36 @@ func CreateBuyCycle(ctx context.Context, store *db.Store, q *queue.Queue, m conf
 	return out, nil
 }
 
-// RefreshActiveCycleBuy updates the price/payload of the active cycle's still-QUEUED
-// (unsent) buy request for a scope, so a newer valid signal supersedes the stale
-// intent WITHOUT creating a duplicate. The mode/attempt are NOT re-escalated within
-// a single unsent cycle (escalation is cross-cycle). Returns true iff a QUEUED
-// request was refreshed. CLAIMED/IN_FLIGHT/sent requests are never touched, and a
-// cycle-tied request is never deleted.
+// RefreshActiveCycleBuy supersedes the active cycle's still-QUEUED (unsent) buy
+// request with a newer valid signal WITHOUT creating a duplicate. A refresh counts
+// as another opportunity in the window (§2a): it ADVANCES the maker attempt counter,
+// re-runs the maker/taker decision, and so can escalate the SAME request maker →
+// taker once maker_attempts_before_taker is reached. If the window has expired the
+// counter resets to maker-first. Returns true iff a QUEUED request was refreshed.
+// CLAIMED/IN_FLIGHT/sent requests are never touched, and a cycle-tied request is
+// never deleted.
 func RefreshActiveCycleBuy(ctx context.Context, store *db.Store, m configstore.MarketConfig, ask decimal.Decimal, sig SignalContext) (bool, error) {
 	if !ask.IsPositive() {
 		return false, nil
 	}
+	window := m.Maker.MakerSignalWindowSeconds
+	if window <= 0 {
+		window = 60
+	}
 	var refreshed bool
 	err := store.WithTx(ctx, func(tx *sql.Tx) error {
 		var (
-			reqID, orderID int64
-			modeStr        string
-			offset         sql.NullInt64
+			reqID, orderID, cycleID int64
+			curAttempt              int
+			localCOID               string
+			expired                 sql.NullBool
 		)
 		// Lock the active cycle's QUEUED buy request (FOR UPDATE) so a concurrent
-		// claimer cannot grab it between the SELECT and the UPDATEs.
+		// claimer cannot grab it between the SELECT and the UPDATEs. Also read the
+		// current attempt and whether the opportunity window has expired.
 		err := tx.QueryRowContext(ctx, `
-SELECT er.id, o.id, o.intended_execution_mode, o.maker_offset_bps
+SELECT er.id, o.id, c.id, c.maker_attempt_number, o.local_client_order_id,
+       (c.opportunity_window_started_at < NOW(6) - INTERVAL ? SECOND)
 FROM symbol_locks sl
 JOIN cycles c  ON c.id = sl.cycle_id
 JOIN orders o  ON o.cycle_id = c.id AND o.role = 'entry_buy'
@@ -190,7 +200,7 @@ JOIN exchange_requests er ON er.order_id = o.id AND er.request_type = 'PLACE_ORD
 WHERE sl.state = 'ACTIVE' AND sl.scope = ? AND sl.canonical_symbol = ? AND er.status = 'QUEUED'
 ORDER BY er.id DESC
 LIMIT 1
-FOR UPDATE`, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &modeStr, &offset)
+FOR UPDATE`, window, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &cycleID, &curAttempt, &localCOID, &expired)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil // nothing unsent to refresh
 		}
@@ -198,27 +208,32 @@ FOR UPDATE`, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &modeStr,
 			return err
 		}
 
-		// Recompute the limit from the new ask using the order's EXISTING mode/offset.
-		mode := Mode(modeStr)
-		limit := ask
-		if mode.IsMaker() {
-			limit = ask.Mul(bpsDenom.Sub(decimal.NewFromInt(offset.Int64))).Div(bpsDenom)
+		// Each refresh is another opportunity: advance the counter (reset on window
+		// expiry) and re-decide. priorAttempts feeds Decide, which computes the new
+		// attempt number = priorAttempts + 1.
+		windowExpired := expired.Valid && expired.Bool
+		prior := curAttempt
+		if windowExpired {
+			prior = 0
 		}
+		dec := Decide(m.Maker, ask, prior)
+		qty := resolveQuantity(m.BuySize, m.BuySizeUnit, dec.LimitPrice)
 
-		// Update the (still-QUEUED) order's price fields (not a state change).
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE orders SET limit_price = ?, ask_price_at_decision = ? WHERE id = ?",
-			limit.String(), ask.String(), orderID); err != nil {
+		// Update the cycle's mode/attempt (and reset the window anchor if it expired).
+		if _, err := tx.ExecContext(ctx, `
+UPDATE cycles SET intended_execution_mode = ?, maker_attempt_number = ?,
+  opportunity_window_started_at = CASE WHEN ? THEN NOW(6) ELSE opportunity_window_started_at END
+WHERE id = ?`, string(dec.Mode), dec.AttemptNumber, windowExpired, cycleID); err != nil {
 			return err
 		}
-
-		// Rebuild the payload with the refreshed price/signal context (mode/attempt
-		// preserved) and update the request, guarded on status='QUEUED'.
-		qty := resolveQuantity(m.BuySize, m.BuySizeUnit, limit)
-		dec := Decision{Mode: mode, AttemptNumber: 0, LimitPrice: limit, OffsetBps: int(offset.Int64)}
-		var local string
-		_ = tx.QueryRowContext(ctx, "SELECT local_client_order_id FROM orders WHERE id = ?", orderID).Scan(&local)
-		payload := buildPayload(m, dec, qty, ask, sig, local)
+		// Update the still-QUEUED order's price + mode fields (not a state change).
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE orders SET limit_price = ?, quantity = ?, ask_price_at_decision = ?, intended_execution_mode = ?, maker_attempt_number = ?, maker_offset_bps = ? WHERE id = ?",
+			dec.LimitPrice.String(), qty.String(), ask.String(), string(dec.Mode), dec.AttemptNumber, dec.OffsetBps, orderID); err != nil {
+			return err
+		}
+		// Rebuild the payload and update the request, guarded on status='QUEUED'.
+		payload := buildPayload(m, dec, qty, ask, sig, localCOID)
 		res, err := tx.ExecContext(ctx,
 			"UPDATE exchange_requests SET payload = ? WHERE id = ? AND status = 'QUEUED'", payload, reqID)
 		if err != nil {
@@ -233,27 +248,40 @@ FOR UPDATE`, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &modeStr,
 
 // ---- helpers ----
 
-// priorMakerAttempts counts the maker cycles created for a scope within the rolling
-// window and returns the earliest such cycle's created_at as the window start
-// (NOW(6) when there are none — this is the first attempt).
-func priorMakerAttempts(ctx context.Context, tx *sql.Tx, exchangeMarketID int64, windowSeconds int) (int, sql.NullTime, error) {
+// priorAttemptAndWindow returns the maker/taker attempt count to continue from for a
+// new cycle on this scope, plus the window-start to carry. It looks at the most
+// recent cycle for the scope: if its opportunity window is still open, the new cycle
+// continues the count (carrying the window start); if the window has expired (or
+// there is no prior cycle) the count resets to 0 and the window restarts at NOW.
+// This shares one counter with RefreshActiveCycleBuy so escalation is continuous
+// whether repeated signals hit a still-QUEUED cycle (refresh) or a fresh cycle
+// created after a prior attempt released the lock.
+func priorAttemptAndWindow(ctx context.Context, tx *sql.Tx, exchangeMarketID int64, windowSeconds int) (int, sql.NullTime, error) {
 	if windowSeconds <= 0 {
 		windowSeconds = 60
 	}
 	var (
-		count       int
+		attempt     sql.NullInt64
 		windowStart sql.NullTime
+		expired     sql.NullBool
 	)
 	err := tx.QueryRowContext(ctx, `
-SELECT COUNT(*), MIN(created_at)
+SELECT maker_attempt_number, opportunity_window_started_at,
+       (opportunity_window_started_at < NOW(6) - INTERVAL ? SECOND)
 FROM cycles
 WHERE exchange_market_id = ?
-  AND intended_execution_mode IN ('MAKER_FIRST','MAKER_RETRY')
-  AND created_at >= NOW(6) - INTERVAL ? SECOND`, exchangeMarketID, windowSeconds).Scan(&count, &windowStart)
+ORDER BY id DESC
+LIMIT 1`, windowSeconds, exchangeMarketID).Scan(&attempt, &windowStart, &expired)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, sql.NullTime{}, nil // first attempt ever for this scope
+	}
 	if err != nil {
 		return 0, sql.NullTime{}, err
 	}
-	return count, windowStart, nil
+	if !windowStart.Valid || (expired.Valid && expired.Bool) {
+		return 0, sql.NullTime{}, nil // window expired -> reset to maker-first
+	}
+	return int(attempt.Int64), windowStart, nil
 }
 
 func insertCycle(ctx context.Context, tx *sql.Tx, m configstore.MarketConfig, sig SignalContext, dec Decision, qty decimal.Decimal, windowStart sql.NullTime) (int64, error) {
