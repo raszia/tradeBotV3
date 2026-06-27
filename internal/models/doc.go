@@ -1,12 +1,9 @@
-// Package models holds the plain Go row structs that mirror the MariaDB tables
-// (Cycle, Order, Fill, ExchangeRequest, SymbolLock, Balance, Signal,
-// ComparisonEvent, ConfigVersion, ...) plus their column/enum string constants.
+// Package models holds the plain Go row structs that mirror the MariaDB tables.
+// It is the shared vocabulary between the persistence layer and the services and
+// holds NO behaviour (no DB calls, no business logic), so it can be imported
+// freely without cycles.
 //
-// It is the shared vocabulary between the persistence layer and the services.
-// Keeping models free of behaviour (no DB calls, no business logic) avoids
-// import cycles: the state machine (internal/state), queue (internal/queue) and
-// repositories all depend on models, not the reverse.
-//
-// Implemented in PR2/PR3 alongside the schema. This file is a placeholder so the
-// package exists in the PR1 skeleton.
+// State-typed fields use the enums from internal/state (models depends on state,
+// never the reverse). Structs are introduced lean and grown by the PRs that need
+// them; PR3 adds Cycle, Order, and StateEvent for the state-machine work.
 package models

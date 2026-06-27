@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR2 — Database schema and migrations.**
+Last updated: **PR3 — Core models, state machine, and validation.**
 
 ---
 
@@ -225,13 +225,11 @@ the prices that sell/reprice decisions need — so it must be used with care whi
 cycle is open. PR2 provides only the flags; this behaviour is enforced in the
 engine (PR8/PR9), executor (PR10/PR11), and reconciler (PR12).
 
-## 9. State-machine design (PR3)
+## 9. State-machine design (implemented in PR3 — `internal/state`)
 
-Cycle and order states change **only** through defined transitions; every
-transition is persisted as an event row, and rows carry a `version` column for
-optimistic concurrency (the update is guarded by `WHERE id=? AND state=? AND
-version=?`). Transition + event insert + any side effect (e.g. enqueue) share one
-transaction.
+Cycle and order states change **only** through the validated transitions in
+`internal/state`; no other package mutates a `state` column with ad-hoc SQL. This
+is what keeps the lifecycle deterministic and auditable.
 
 - **CycleState:** `NEW`, `SIGNAL_DETECTED`, `BUY_REQUEST_QUEUED`, `BUY_SUBMITTED`,
   `BUY_PARTIALLY_FILLED`, `BUY_FILLED`, `SELL_REQUEST_QUEUED`, `SELL_SUBMITTED`,
@@ -240,8 +238,34 @@ transaction.
 - **OrderState:** `NEW`, `REGISTERED`, `QUEUED`, `SUBMITTED`, `ACKED`,
   `PARTIALLY_FILLED`, `FILLED`, `CANCEL_PENDING`, `CANCELLED`, `REJECTED`,
   `EXPIRED`, `FAILED`, `NEEDS_RECONCILE`.
-- `NEEDS_RECONCILE` is reachable from any non-terminal state and is exited only by
-  an **operator** path — never automatically.
+- **RequestStatus** constants (`QUEUED`/`CLAIMED`/`IN_FLIGHT`/`SUCCEEDED`/`FAILED`/
+  `RETRY_SCHEDULED`/`DEAD`) are defined here too, so the queue (PR7), dashboard and
+  tests share one vocabulary matching the DB enum.
+
+Rules enforced:
+
+- **Authoritative transition maps** (`cycleTransitions`, `orderTransitions`) with
+  **no self-loops** and **no exits from terminal states**. `ValidateCycleTransition`
+  / `ValidateOrderTransition` are pure legality checks.
+- **Terminal states:** cycle = `CLOSED`/`CANCELLED`/`FAILED`; order =
+  `FILLED`/`CANCELLED`/`REJECTED`/`EXPIRED`/`FAILED`. They have no outgoing normal
+  transitions. `NEEDS_RECONCILE` is **not** terminal — it is a holding state.
+- **`NEEDS_RECONCILE`** is reachable from any non-terminal state but has **no
+  automatic exit** — there is deliberately no normal transition out of it. The
+  only sanctioned exit is a future explicit operator/reconciler resolution path
+  (PR12); it is not implemented in the normal transition functions.
+- **Optimistic concurrency + atomic event:** `ApplyCycleTransition` /
+  `ApplyOrderTransition` take a caller-supplied `*sql.Tx` and, in that one
+  transaction, run `UPDATE … SET state=?, version=version+1 WHERE id=? AND state=?
+  AND version=?` and insert the `*_state_events` row (`from_state`, `to_state`,
+  new `version`, `event_type`, `message`, `payload_json`). Same tx ⇒ both commit
+  or both roll back. `UNIQUE(parent_id, version)` additionally blocks duplicate
+  events.
+- **Zero-row disambiguation:** when the guarded update affects 0 rows the row is
+  re-read and the outcome is classified as **replay** (already in target →
+  idempotent no-op, `Result.Replayed=true`, no second event), **stale version**
+  (`ErrStaleVersion`), **state mismatch** (`ErrStateMismatch`), or **missing row**
+  (`ErrUnknownRow`). This is how crash/duplicate-event replays stay safe.
 
 ## 10. Symbol-lock design (PR9/PR12)
 
@@ -414,14 +438,17 @@ start.
 
 ## 18. Known limitations (current)
 
-- **Through PR2 the system has schema but no behaviour.** Service binaries boot,
-  verify the schema, and idle; no market data, no signals, no orders, no
-  reconciliation yet.
-- **PR2 is schema/migrations only.** The tables exist, but: Go models + the state
-  machine are PR3; credential **encryption is not implemented** (only the at-rest
-  schema exists); **market-discovery execution is not implemented** (only its
-  storage); the per-symbol enable/disable **behaviour** (§8a) is documented but
-  enforced in PR8–PR12.
+- **Through PR3 the system has schema + a state machine but no trading
+  behaviour.** Service binaries boot, verify the schema, and idle; no market data,
+  no signals, no orders, no reconciliation yet.
+- **PR3 implements only the state machine and minimal models.** Cycle/order
+  *creation* (the first inserts + lock + enqueue) is PR9; fill processing is PR10;
+  the operator/reconciler exit from `NEEDS_RECONCILE` is PR12. The state functions
+  exist and are tested but are not yet called by any service.
+- Credential **encryption is not implemented** (PR2 added only the at-rest
+  schema); **market-discovery execution** is not implemented (only its storage);
+  the per-symbol enable/disable **behaviour** (§8a) is documented but enforced in
+  PR8–PR12.
 - The exchange-request queue's multi-process per-exchange concurrency protection
   and the conservative crash-after-send recovery are **designed** (§8, §17) but
   implemented in PR7+. Until then, assume one executor per exchange.
@@ -477,8 +504,8 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR | Branch | Status | Summary |
 |---|---|---|---|
 | PR1 | `pr1-project-skeleton` | **accepted** | Project skeleton & shared foundation: module layout, all 9 binaries bootable, **file-only bootstrap config** (no env; `-config` flag; secret redaction), slog logging, `db.Store`+pool+`WithTx`, Redis wrapper, in-code migration runner (GET_LOCK + checksum + DDL/DML rules) with `schema_migrations` + `001_app_meta`, scaffold packages, tests, this document. No trading logic. |
-| PR2 | `pr2-database-schema` | **in review** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
-| PR3 | `pr3-state-machine` | planned | Cycle/order models, state machine, validation. |
+| PR2 | `pr2-database-schema` | **accepted** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
+| PR3 | `pr3-state-machine` | **in review** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | planned | Normalized exchange layer (ported from iranArb). |
 | PR5 | `pr5-redis-collector` | planned | Redis key schema + collector. |
 | PR6 | `pr6-config-system` | planned | DB-backed versioned config + cache. |

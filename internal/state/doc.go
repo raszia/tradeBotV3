@@ -1,13 +1,22 @@
-// Package state is the deterministic state machine for trading cycles and
-// orders. Cycle and order states change ONLY through transitions defined here;
-// no code mutates a state column directly.
+// Package state is the deterministic state machine for trading cycles and orders.
 //
-// It will define CycleState/OrderState enums, the valid-transition maps, a
-// Transition(from,to) validator, and ApplyCycleTransition/ApplyOrderTransition
-// helpers that — inside a caller-supplied *sql.Tx — update the row guarded by an
-// optimistic-concurrency version column AND insert a state-event row, so every
-// transition is persisted and double-applies are rejected. NEEDS_RECONCILE is
-// reachable from any non-terminal state and is exited only by an operator path.
+// Cycle and order states change ONLY through the validated transitions here; no
+// other package mutates the state column directly with ad-hoc SQL. This keeps the
+// lifecycle deterministic and every change auditable.
 //
-// Implemented in PR3. This file is a placeholder for the PR1 skeleton.
+// Contents:
+//   - CycleState / OrderState enums + the authoritative transition maps, plus
+//     RequestStatus constants (the queue vocabulary, for system-wide consistency).
+//   - ValidateCycleTransition / ValidateOrderTransition — pure legality checks.
+//   - ApplyCycleTransition / ApplyOrderTransition — within a caller-supplied
+//     *sql.Tx, perform an optimistic-concurrency (version-guarded) UPDATE and, in
+//     the SAME transaction, insert a state-event row. A zero-row update is
+//     disambiguated into replay (already in target → idempotent no-op), stale
+//     version, state mismatch, or missing row.
+//
+// Safety rules enforced: transitions are deterministic; the state update and its
+// event insert are atomic; replays do not double-write events; terminal states
+// have no outgoing transitions; NEEDS_RECONCILE is reachable from any non-terminal
+// state but has NO automatic exit (operator/reconciler resolution is a separate,
+// later path).
 package state
