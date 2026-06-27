@@ -41,6 +41,71 @@ The architecture treats these as **parameters and a flow**, never hardcoding the
 numbers — they come from versioned config (and may be influenced by market
 regime, configurably).
 
+## 2a. Owner-defined buy/queue flow rules (documented now; implemented PR8–PR17)
+
+These owner-defined rules are authoritative. They are documented here so every PR
+(including PR12) is built to be consistent with them; their full implementation is
+spread across later PRs (see "implementation placement" at the end).
+
+**One active pending buy-intent per (exchange-market / symbol / strategy scope).**
+Signal spam must not create competing buy requests. When a new signal arrives for
+a symbol that already has a pending buy:
+
+- if a **QUEUED** request already exists for that scope → **update** it to the
+  newest valid signal (do not enqueue a duplicate);
+- if the new signal **invalidates** the previous one → **remove/cancel the QUEUED
+  request before it is sent**;
+- if the existing request is already **CLAIMED / IN_FLIGHT** → do **not** mutate it
+  blindly;
+- if it was already **sent / status unknown** → use reconciliation/safe handling,
+  do not replace it.
+
+(Enforced in PR8/PR9 when the engine creates/updates queued buy requests; PR9
+cycle/order/request creation respects the one-active-intent rule.)
+
+**Simulated IOC buy (Iranian venues lack native IOC).** From the strategy's view
+the buy is IOC, but the system SIMULATES it via the flow rather than assuming a
+native capability:
+
+1. `PLACE_ORDER` the buy,
+2. wait a **DB-config-configurable** interval,
+3. `CANCEL_ORDER` the remaining open amount,
+4. `GET_ORDER` / status check for the final outcome,
+5. record the actually filled quantity + fees,
+6. continue the cycle **only** with the filled quantity.
+
+Rules: never assume native IOC unless the exchange capability explicitly says so;
+do not force native IOC in the abstraction (it stays a request field); the wait
+duration is DB config; the final filled amount is confirmed from exchange
+status/fills; **a missing open order is NEVER proof that nothing filled**.
+
+- **No-fill:** mark the order not-filled/cancelled/expired via the state machine;
+  do **not** proceed to sell; release the lock only when safe; a *fresh* valid
+  signal may later create/update a new queued buy — do not auto-retry the same
+  stale signal.
+- **Partial-fill:** persist the exact filled qty, compute avg price + fees, and
+  run the sell/reprice flow on the **filled** amount only; the unfilled remainder
+  is not inventory.
+- **Ambiguity:** if the cancel or final status check is ambiguous → mark the
+  order/cycle `NEEDS_RECONCILE`.
+
+**PR12 (reconciler) must respect this:** a `PLACE_ORDER` followed by an intended
+`CANCEL_ORDER`/`GET_ORDER` may be part of this simulated-IOC flow. If the system
+crashes mid-flow, the reconciler must **not resend the buy blindly**: unclear
+status → `NEEDS_RECONCILE`; cancel-done-but-fill-unknown → `NEEDS_RECONCILE`;
+no-open-order is not proof of zero fill; proven zero-fill may safely close/expire
+the attempt; proven partial/full fill must preserve the filled amount and keep the
+cycle safe for later sell management.
+
+**Implementation placement:** no-duplicate-queued-signal + update/remove-before-send
+→ PR8/PR9; one-active-pending-intent → PR9; fill/status recording → PR10;
+sell/reprice on filled qty → PR11; reconciler crash/ambiguity handling → PR12;
+dashboard exposes the simulated-IOC wait interval + related settings → PR17. Each
+of those PRs adds the corresponding tests (duplicate-signal-updates-not-inserts,
+invalid-signal-removes-pending, claimed/in-flight-not-mutated, zero-fill-abandons,
+partial-fill-continues-with-filled-amount, ambiguous→NEEDS_RECONCILE,
+no-open-order-not-proof-of-zero-fill).
+
 ## 3. Binaries and responsibilities
 
 The system is **multi-binary and decoupled**. Restarting any one binary (notably
@@ -733,6 +798,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
 | PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
-| PR7 | `pr7-exchange-request-queue` | **in review** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
-| PR7 | `pr7-exchange-request-queue` | planned | Queue + order-executor foundation. |
+| PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | planned | Startup reconciler (closes the safety core). |
