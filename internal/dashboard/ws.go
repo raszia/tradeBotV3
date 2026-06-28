@@ -8,10 +8,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	// The dashboard is read-only; allow any origin for local operator use. (Auth is a
-	// later concern — see the auth placeholder note in PROJECT_ARCHITECTURE.md.)
-	CheckOrigin: func(*http.Request) bool { return true },
+// originAllowed enforces the configured WebSocket origin allowlist. An empty allowlist
+// is permissive (safe only for local read-only use); the WS carries no commands either
+// way. A missing Origin header (non-browser client) is allowed.
+func (s *Server) originAllowed(r *http.Request) bool {
+	if len(s.cfg.AllowedWSOrigins) == 0 {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, o := range s.cfg.AllowedWSOrigins {
+		if o == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // ws upgrades to a WebSocket and pushes a SAFE periodic snapshot (open cycles, health,
@@ -19,6 +32,7 @@ var upgrader = websocket.Upgrader{
 // never receives commands that affect trading. The loop ends when the client
 // disconnects or the request context is cancelled (server shutdown).
 func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{CheckOrigin: s.originAllowed}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return // Upgrade already wrote the error

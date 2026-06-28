@@ -279,6 +279,13 @@ func RecordAudit(ctx context.Context, tx *sql.Tx, e AuditEntry) error {
 	return err
 }
 
+// ActivateVersionTx supersedes the current active version and inserts a new active
+// one within the caller's tx, returning its id. Exported so other config domains
+// (e.g. regime baskets) can mint a version atomically with their own update + audit.
+func ActivateVersionTx(ctx context.Context, tx *sql.Tx, createdBy, note string) (int64, error) {
+	return activateVersionTx(ctx, tx, createdBy, note)
+}
+
 // activateVersionTx supersedes the current active version and inserts a new
 // active one, returning its id. Runs inside tx.
 func activateVersionTx(ctx context.Context, tx *sql.Tx, createdBy, note string) (int64, error) {

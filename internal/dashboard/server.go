@@ -15,6 +15,9 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"v3TradeBot/internal/configstore"
+	"v3TradeBot/internal/regime"
 )
 
 // Config tunes the dashboard.
@@ -23,6 +26,10 @@ type Config struct {
 	MaxLimit        int           // hard cap on ?limit= (default 500)
 	StaleBalanceAge time.Duration // a balance whose last_seen_at is older than this is flagged stale (default 5m)
 	WSInterval      time.Duration // live-update push cadence (default 2s)
+	// AllowedWSOrigins restricts the WebSocket Origin header. Empty = permissive (only
+	// safe for local read-only use); set it to an allowlist for any non-local deploy.
+	// The WS carries no commands either way, so it cannot affect trading.
+	AllowedWSOrigins []string
 }
 
 func (c *Config) withDefaults() {
@@ -40,12 +47,15 @@ func (c *Config) withDefaults() {
 	}
 }
 
-// Server is the read-only dashboard. It holds ONLY a database handle (+ config/log):
-// no exchange client and no queue, so it cannot trade by construction.
+// Server is the dashboard. It holds a database handle + the versioned config stores
+// (+ config/log): NO exchange client and NO queue, so it cannot trade by construction.
+// Read views are open; config-editing routes are authenticated + authorized (PR17).
 type Server struct {
-	db  *sql.DB
-	cfg Config
-	log *slog.Logger
+	db       *sql.DB
+	cfgStore *configstore.Store
+	regStore *regime.Store
+	cfg      Config
+	log      *slog.Logger
 }
 
 // New builds a Server.
@@ -54,7 +64,12 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{db: db, cfg: cfg, log: log}
+	s := &Server{db: db, cfg: cfg, log: log}
+	if db != nil {
+		s.cfgStore = configstore.New(db)
+		s.regStore = regime.NewStore(db)
+	}
+	return s
 }
 
 // Handler returns the read-only route mux. Patterns are method-scoped to GET, so any
@@ -79,8 +94,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs", s.appLogs)
 	mux.HandleFunc("GET /api/api-logs", s.apiLogs)
 	mux.HandleFunc("GET /api/config", s.config)
+	mux.HandleFunc("GET /api/audit", s.audit)
 	mux.HandleFunc("GET /ws", s.ws)
+
+	// Config-editing routes (PR17): authenticated + authorized (config_operator/admin).
+	// There is NO trading/cycle/order/queue/credential mutation route here.
+	mux.HandleFunc("POST /api/config/symbol/{id}", s.requireConfigOperator(s.editSymbolConfig))
+	mux.HandleFunc("POST /api/config/market/{id}/flags", s.requireConfigOperator(s.editMarketFlags))
+	mux.HandleFunc("POST /api/config/exchange/{id}", s.requireConfigOperator(s.editExchangeConfig))
+	mux.HandleFunc("POST /api/config/fee", s.requireConfigOperator(s.editFee))
+	mux.HandleFunc("POST /api/config/regime/basket/{id}", s.requireConfigOperator(s.editRegimeBasket))
+	mux.HandleFunc("POST /api/config/regime/basket/{id}/symbol", s.requireConfigOperator(s.editRegimeSymbol))
+	mux.HandleFunc("POST /api/config/regime/basket/{id}/timeframe", s.requireConfigOperator(s.editRegimeTimeframe))
 	return mux
+}
+
+func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
+	s.list(w, r, "SELECT id, config_version, entity_type, entity_id, field, old_value, new_value, changed_by, reason, activated_at, created_at FROM config_change_audit ORDER BY id DESC LIMIT ?", s.limit(r))
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
