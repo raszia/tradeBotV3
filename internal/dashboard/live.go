@@ -43,3 +43,15 @@ func (s *Server) live(w http.ResponseWriter, r *http.Request) {
 		"last_live_error":        lastError,
 	})
 }
+
+// credentialStatus serves credential STATUS ONLY (PR20a): exchange, label, status,
+// enabled, key_version, last_checked_at, and the non-secret last_auth_error note. It
+// NEVER selects encrypted_api_key/secret/passphrase (no key material, no blob, no
+// plaintext) — there is no decryption here.
+func (s *Server) credentialStatus(w http.ResponseWriter, r *http.Request) {
+	rows, _ := s.rows(r.Context(), `
+SELECT e.code AS exchange_code, ec.label, ec.status, ec.enabled, ec.key_version, ec.encryption_algorithm, ec.last_checked_at, ec.last_auth_error
+FROM exchange_credentials ec JOIN exchanges e ON e.id = ec.exchange_id
+ORDER BY ec.exchange_id, ec.key_version DESC`)
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": rows})
+}

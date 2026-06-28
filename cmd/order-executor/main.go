@@ -16,6 +16,7 @@ import (
 
 	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/config"
+	"v3TradeBot/internal/credentials"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/executor"
@@ -46,12 +47,29 @@ func main() {
 			allowLive = true
 			base.Log.Warn("order-executor in DRY-RUN: SIMULATED clients only; no real orders will be sent", "exchanges", len(clients))
 		case config.ExecutionLive:
-			// The limited-live safety guard is wired so it gates every real send once
-			// real clients exist. Real private clients require decrypted credentials (a
-			// later PR, PR20a); until then there are NO clients and AllowLiveExecution
-			// stays false, so nothing is sent.
+			// LIVE: the safety guard gates every real send; real private clients are
+			// built via the factory with DB-decrypted credentials (PR20a). A missing or
+			// invalid master key disables credential loading safely → no clients,
+			// AllowLiveExecution stays false, nothing is sent.
 			guard = live.NewGuard(store.DB(), clock.NewSystem(), base.Log)
-			base.Log.Warn("execution mode 'live': live guard active, but no real clients yet (credential decryption is a later PR); no orders will be sent")
+			provider, perr := credentials.NewProvider(store.DB(), base.Cfg.Security.MasterKey, clock.NewSystem(), base.Log)
+			if perr != nil {
+				base.Log.Warn("execution mode 'live': credential loading DISABLED (no/invalid master key); no live clients, nothing will be sent", "err", perr)
+				break
+			}
+			iolog := exchanges.NewIOLogger(exchanges.IOLogConfig{Enabled: true, Source: "order-executor"}, store.DB())
+			defer iolog.Close()
+			builder := credentials.NewBuilder(store.DB(), provider, iolog)
+			for _, code := range builder.LiveEnabledCodes(ctx) {
+				client, err := builder.BuildPrivate(ctx, code)
+				if err != nil {
+					base.Log.Warn("no live client for exchange (skipping; it cannot trade)", "exchange", code, "err", err)
+					continue
+				}
+				clients[code] = client
+			}
+			allowLive = true // the live guard gates EVERY send; clients exist only for live-enabled exchanges with an active credential
+			base.Log.Warn("order-executor in LIVE mode: real clients wired; the live guard gates every order", "exchanges", len(clients))
 		default:
 			base.Log.Info("order-executor ready (execution off; no clients; live execution disabled)")
 		}

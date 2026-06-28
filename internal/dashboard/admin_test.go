@@ -244,3 +244,49 @@ func TestLiveStatusEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialStatusEndpointShowsNoSecrets(t *testing.T) {
+	f := setupD(t)
+	_, exID := f.seedEditable(1, 0)
+	// Seed a credential with a recognizable "secret" blob; the endpoint must never echo it.
+	secretBlob := []byte("PLAINTEXT-SECRET-MARKER-bytes")
+	f.exec("INSERT INTO exchange_credentials (exchange_id, label, encrypted_api_key, encrypted_api_secret, encryption_algorithm, key_version, enabled, status, last_auth_error) VALUES (?, 'default', ?, ?, 'AES-256-GCM', 7, 1, 'active', NULL)", exID, secretBlob, secretBlob)
+
+	code, obj := f.getObj("/api/credentials")
+	if code != 200 {
+		t.Fatalf("/api/credentials = %d", code)
+	}
+	creds, _ := obj["credentials"].([]any)
+	// Locate OUR row (shared DB) by its unique key_version=7.
+	var row map[string]any
+	for _, c := range creds {
+		m, _ := c.(map[string]any)
+		if m["key_version"] == float64(7) {
+			row = m
+			break
+		}
+	}
+	if row == nil {
+		t.Fatal("seeded credential (key_version=7) not found in /api/credentials")
+	}
+	// Status fields ARE shown.
+	for _, want := range []string{"exchange_code", "label", "status", "enabled", "key_version"} {
+		if _, ok := row[want]; !ok {
+			t.Errorf("status field %q missing", want)
+		}
+	}
+	// Secret/key-material fields must NEVER appear on ANY row.
+	for _, c := range creds {
+		m, _ := c.(map[string]any)
+		for _, leak := range []string{"encrypted_api_key", "encrypted_api_secret", "encrypted_passphrase", "api_key", "api_secret", "passphrase", "token"} {
+			if _, bad := m[leak]; bad {
+				t.Errorf("/api/credentials leaked field %q", leak)
+			}
+		}
+	}
+	// And the raw secret bytes must not appear anywhere in the serialized response.
+	full := fmt.Sprintf("%v", obj)
+	if strings.Contains(full, "PLAINTEXT-SECRET-MARKER") {
+		t.Error("/api/credentials echoed the encrypted blob bytes")
+	}
+}

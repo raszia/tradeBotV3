@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR20 — Limited live execution (safety layer; real credentials deferred to PR20a).**
+Last updated: **PR20a — Credential decryption & real private-client wiring (gated by the PR20 live guard).**
 
 ---
 
@@ -1442,6 +1442,81 @@ unresolved-reconcile count, and the last live allow/deny from the audit.
 wiring (so live mode actually sends, gated by this same guard). Until PR20a, `live` mode
 is a fully-tested safety harness with no real client.
 
+## 16d. Credential decryption & real private-client wiring (PR20a — `internal/secrets`, `internal/credentials`)
+
+PR20a makes `live` mode actually able to send by loading the encrypted exchange
+credentials, decrypting them **only in memory**, and constructing real private clients
+through the existing factory — all still gated by the unchanged PR20 `live.Guard`. It
+weakens no PR20 guard.
+
+**Encryption format (`internal/secrets`).** AES-256-GCM, stored layout
+`nonce || ciphertext || tag` (12-byte GCM nonce prepended; 16-byte tag appended by
+`Seal`). The AES-256 key is `SHA-256(master_key_bytes)`, so the operator's master-key
+string need not be exactly 32 bytes. No second/incompatible format is introduced. The
+only supported `encryption_algorithm` is `AES-256-GCM` (empty = that default); any other
+value is treated as unusable. `Encrypt`/`Decrypt` are symmetric (Encrypt is used by tests
+and future provisioning tooling).
+
+**Master key handling.** The key comes from the bootstrap config file
+(`[security] master_key`) — never a runtime env var. An **empty** master key →
+`NewCipher`/`NewProvider` return `ErrNoMasterKey`, so every service disables credential
+loading safely (no clients, no live execution, no panic). An invalid key simply fails to
+decrypt → the credential is marked unusable. A decryption failure never panics a service.
+
+**Credential loading (`credentials.Provider`, an `exchanges.CredentialProvider`).** For an
+exchange code it selects the single clearly-chosen credential — `enabled=1 AND
+status='active'`, **highest `key_version`** (then newest id) — and decrypts api_key /
+api_secret / passphrase in memory. Disabled, non-active, and lower-version rows are
+ignored. On unsupported algorithm or decryption failure it best-effort marks the row
+`status='error'` with a **non-secret** note (`last_auth_error`) and returns an error that
+carries no plaintext. Plaintext is never written back, never logged, never returned by the
+dashboard, never placed in an error.
+
+**Real private-client construction (`credentials.Builder`).** `BuildPrivate(code)` builds
+through `exchanges.NewPrivateClient` (the factory) with the Provider injected as
+`Creds`, and the per-exchange symbol map loaded from `exchange_markets`. It builds **only**
+when an active credential exists; an unsupported exchange (no private adapter) yields no
+client. No exchange-specific construction is hardcoded in the executor. Construction does
+no network I/O (adapters connect lazily), so wiring at boot is safe.
+
+**Executor integration.** In `live` mode the order-executor builds real clients for
+live-enabled exchanges that have an active credential and sets `AllowLiveExecution=true`;
+the PR20 `live.Guard` still runs immediately before every PLACE/CANCEL (mode/
+AllowLiveExecution/live-flags/caps/credentials/kill-switch/not-dry-run/state). A missing/
+invalid master key → no clients, `AllowLiveExecution` stays false, nothing is sent.
+
+**Read-only services (narrowed interfaces).** `balance-sync`, the `health-monitor` private
+probe, and the `reconciler` build credentialed clients via the same `Builder` but hold
+them through **narrowed** interfaces — `balance.BalanceClient` (Name+GetBalances),
+`reconciler.ReadOnlyClient` (no Place/Cancel), `credentials.BalanceReader` (GetBalances
+only). `PlaceOrder`/`CancelOrder` are unreachable from these services by construction
+(compile-time + reflection guards).
+
+**Credential validation (`Provider.Validate`).** The ONLY validation is a read-only
+balance read via the `BalanceReader` interface — it can never place or cancel. Success
+stamps `status='active'` + `last_checked_at`; failure stamps `status='invalid'` with a
+non-secret note. The health private probe uses `Validate`, so private health reflects the
+credential state without any mutating call.
+
+**Dashboard.** `GET /api/credentials` (and the credential block in `GET /api/live`) expose
+**status only** — exchange, label, status, enabled, key_version, encryption_algorithm,
+last_checked_at, and the non-secret last_auth_error. They never select the encrypted blobs
+and never decrypt: no API key, secret, token, passphrase, plaintext, or ciphertext.
+
+**Failure behaviour.** A credential that fails to load/decrypt is marked unusable →
+the guard's `credentialsAvailable` (status='active') then denies live sends for that
+exchange; private health shows the failure; balance-sync/reconciler skip it. No cycle is
+corrupted and no order is blindly retried (the PR7/PR10 conservative paths are unchanged).
+
+**Rotation readiness.** `key_version` is stored and honoured (highest active selected).
+Rotation = insert a higher-version active credential, then disable the old one; disabled/
+old credentials are ignored. Exactly one active credential is selected deterministically.
+
+**What remains after PR20a.** A credential **provisioning/rotation UI + an encrypt-and-
+insert tool** (credentials are inserted out-of-band today; `secrets.Encrypt` is the
+building block). The first real live rollout is still gated tiny by the PR20 caps. The
+operator exit from `NEEDS_RECONCILE` remains a dedicated future PR.
+
 ## 17. Safety rules (the hard rules)
 
 1. **No real order before it is recorded.** create cycle/order/request in MySQL →
@@ -1480,17 +1555,15 @@ is a fully-tested safety harness with no real client.
 
 ## 18. Known limitations (current)
 
-- **Limited live (PR20) ships the safety machinery, not a working live sender.** Live
-  mode wires **no real private client** — real credential decryption + real-adapter
-  wiring is **PR20a** — so `AllowLiveExecution` stays false in the binary and `live` mode
-  currently sends nothing. The `live.Guard` (caps + kill switch + live flags + credential
-  availability + executor-side final gate + audit) and the dashboard `GET /api/live` view
-  are complete and fully tested with a fake (no-network) client. Once PR20a injects real
-  clients, the SAME guard gates them with no logic change. The `credentialsAvailable`
-  check currently means "an enabled, active `exchange_credentials` row exists"; PR20a adds
-  the actual decryption + key-version use behind it. The first live rollout scope (one
-  exchange / one symbol / tiny notional / one open cycle) is enforced purely by the
-  configured caps + the single `live_enabled` flag — it is operational config, not code.
+- **Live is wired but credentials are provisioned out-of-band.** PR20a builds real private
+  clients (factory + in-memory decryption) gated by the unchanged PR20 guard, but there is
+  **no provisioning/rotation UI or encrypt-and-insert CLI yet** — encrypted credential rows
+  are inserted out-of-band (an operator encrypts with `secrets.Encrypt` under the master
+  key and writes the `nonce||ciphertext||tag` blob + `key_version`). Real end-to-end live
+  sending is unverified against a real venue (rule #3: no live calls in tests); the first
+  rollout is kept tiny by the PR20 caps + a single `live_enabled` exchange/symbol. The
+  AES key is `SHA-256(master_key)`; a future hardware-KMS/HSM-backed key path is not yet
+  implemented.
 - **The safety core (PR1–PR7 + PR12) is complete; PR8 adds signal detection but
   still nothing trades.** The trade-engine now writes `comparison_events`/`signals`
   and keeps a pending buy intent fresh, but it does **not** create cycles/orders or
@@ -1528,17 +1601,17 @@ is a fully-tested safety harness with no real client.
   DB-configured (no UI until the dashboard PR); with no baskets configured the
   calculator does nothing. After a restart the rolling price series is empty, so the
   regime is `UNKNOWN` until it warms up to span the configured timeframes.
-- **`health-monitor` runs public probes only** (private/authenticated health needs
-  decrypted credentials — a later PR), so `private_status` stays `UNKNOWN` until then;
-  the Monitor/Recorder logic is complete and tested with fake probes. WebSocket health
-  is recorded if a WS probe is supplied but the binary wires none yet (WS is collector-
-  side and partial). The collector keeps its own pre-PR14 health recorder; migrating it
-  onto `health.Recorder` is a later cleanup.
-- **`balance-sync` wires no clients yet** (authenticated balance reads need decrypted
-  credentials — a later PR), so it boots and idles. The syncer logic is complete and
-  tested with fake read-only clients; once credentials land, real `BalanceClient`s
-  are injected with no logic change. Per-exchange timeout/concurrency are bounded; a
-  failed read never wipes balances and a missing asset is never zeroed.
+- **`health-monitor` private probe is now a read-only credentialed balance check**
+  (PR20a, via `credentials.Validate`); with no/invalid master key or no active credential
+  it stays public-only and `private_status` is `UNKNOWN`. WebSocket health is recorded if
+  a WS probe is supplied but the binary wires none yet (WS is collector-side and partial).
+  The collector keeps its own pre-PR14 health recorder; migrating it onto `health.Recorder`
+  is a later cleanup.
+- **`balance-sync` and `reconciler` now build credentialed read-only clients** (PR20a, via
+  the factory + in-memory decryption, held through narrowed non-mutating interfaces). With
+  no/invalid master key or no active credential they wire no clients and idle/inspect-only
+  safely. Per-exchange timeout/concurrency are bounded; a failed read never wipes balances
+  and a missing asset is never zeroed; the reconciler still never auto-sends/auto-cancels.
 - **Sell management is polling-based:** the engine reprices/polls on a periodic pass
   (default 2s) reading the Binance reference from Redis; there is no steady-state
   WebSocket order-update path yet. A cycle whose reference price is missing/stale is
@@ -1584,13 +1657,31 @@ review before anything can trade. Subsequent phases (one reviewed PR at a time):
 PR8 (engine signal loop), PR9 (cycle/lock/buy enqueue), PR10 (order-status/fill
 processing), PR11 (sell + repricing), PR13 (balance sync), PR14 (health),
 PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
-PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer). **Remaining: PR20a**
-— real credential decryption + real private-client wiring, so `live` mode actually sends,
-gated by the PR20 `live.Guard` (encrypted-credential loading, in-memory-only decryption,
-key-version use, masking, disabled/missing-credential handling). The operator exit from
-`NEEDS_RECONCILE` also remains a dedicated future PR.
+PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer), PR20a (credential
+decryption + real private-client wiring). **Remaining:** a credential provisioning/
+rotation UI + an encrypt-and-insert CLI (credentials are inserted out-of-band today), and
+the operator exit from `NEEDS_RECONCILE`.
 
 ## 19a. Decisions log
+
+- **PR20a — credentials decrypt in memory only, gated by the unchanged PR20 guard**:
+  `internal/secrets` (AES-256-GCM, `nonce||ciphertext||tag`, key=SHA-256(master key)) +
+  `internal/credentials.Provider` (an `exchanges.CredentialProvider`). Plaintext is never
+  written back/logged/returned/in-errors; failures mark the row unusable and never panic.
+- **PR20a — master key is config-file only**; empty/invalid key disables credential
+  loading + live execution safely (no clients, nothing sent). No runtime env var.
+- **PR20a — real clients are built through the factory**, never hardcoded per-exchange in
+  the executor; the Provider is injected as `Creds`; unsupported exchange ⇒ no client. The
+  selection is the single `enabled && active`, highest-`key_version` credential (rotation-
+  ready); disabled/old/non-active rows are ignored.
+- **PR20a — read-only services hold narrowed interfaces**: balance-sync
+  (`balance.BalanceClient`), health private probe (`credentials.BalanceReader` via
+  `Validate`), reconciler (`reconciler.ReadOnlyClient`) — Place/Cancel unreachable
+  (compile-time + reflection guards). Credential validation is a read-only balance read
+  only (never places/cancels).
+- **PR20a — dashboard shows credential STATUS only** (`GET /api/credentials`): exists/
+  enabled/status/key_version/algorithm/last_checked/non-secret-note — never key material
+  or the encrypted blob.
 
 - **PR20 — limited live is a safety PR with the final gate in the executor**: the
   `live.Guard` is the load-bearing check immediately before each real PLACE/CANCEL (mode/
@@ -1938,4 +2029,5 @@ key-version use, masking, disabled/missing-credential handling). The operator ex
 | PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
 | PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
 | PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
-| PR20 | `pr20-limited-live` | **in review** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
+| PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
+| PR20a | `pr20a-credential-decryption` | **in review** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |

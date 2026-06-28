@@ -3,9 +3,10 @@
 // timeout classification recorded into exchange_health_current + exchange_health_samples.
 //
 // It calls ONLY read-only APIs (no PlaceOrder/CancelOrder), makes no trading
-// decisions, and creates no cycles/orders. Private (authenticated) health needs
-// decrypted credentials — a later PR — so until then private health stays UNKNOWN
-// and the binary runs public probes only (never panicking on missing credentials).
+// decisions, and creates no cycles/orders. PR20a: the private (authenticated) probe is
+// a READ-ONLY balance check via credentials.Validate (never places/cancels) which also
+// stamps the credential status; a missing/invalid master key or absent credential keeps
+// private health UNKNOWN and never panics.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"os"
 
 	"v3TradeBot/internal/clock"
+	"v3TradeBot/internal/credentials"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/health"
@@ -27,6 +29,17 @@ func main() {
 		iolog := exchanges.NewIOLogger(exchanges.IOLogConfig{Enabled: true, Source: "health-monitor"}, store.DB())
 		defer iolog.Close()
 
+		// Optional credential provider for the read-only private probe (no/invalid
+		// master key → no private probes, public-only).
+		var builder *credentials.Builder
+		var provider *credentials.Provider
+		if p, perr := credentials.NewProvider(store.DB(), base.Cfg.Security.MasterKey, clock.NewSystem(), base.Log); perr != nil {
+			base.Log.Warn("health-monitor: private probes disabled (no/invalid master key); public-only", "err", perr)
+		} else {
+			provider = p
+			builder = credentials.NewBuilder(store.DB(), provider, iolog)
+		}
+
 		var targets []health.Target
 		for _, code := range loadEnabledExchanges(ctx, store.DB()) {
 			client, err := exchanges.NewPublicClient(exchanges.ClientConfig{Code: code}, iolog)
@@ -35,11 +48,21 @@ func main() {
 				continue
 			}
 			c := client
-			targets = append(targets, health.Target{
+			t := health.Target{
 				ExchangeCode: code,
 				Public:       func(ctx context.Context) error { _, e := c.GetMarkets(ctx); return e },
-				Private:      nil, // no credentials yet -> private health stays UNKNOWN
-			})
+				Private:      nil, // stays UNKNOWN unless a credentialed read-only client is built
+			}
+			// Private probe = a READ-ONLY balance check that also validates + stamps the
+			// credential (no place/cancel is reachable through credentials.Validate).
+			if builder != nil {
+				if pc, perr := builder.BuildPrivate(ctx, code); perr == nil {
+					ec, pv := code, provider
+					rc := pc
+					t.Private = func(ctx context.Context) error { return pv.Validate(ctx, ec, rc) }
+				}
+			}
+			targets = append(targets, t)
 		}
 
 		rec := health.NewRecorder(store.DB())

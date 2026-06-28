@@ -3,8 +3,9 @@
 // runs as its own binary, holds only a *sql.DB (no exchange client, no queue), and
 // exposes ONLY GET routes (any mutating method is 405). It never places/cancels
 // orders, creates cycles/orders, mutates the queue, or edits config (config editing
-// is PR17). Secrets are never shown: it never reads the credentials table, and the
-// api-call-log view is masked (defence-in-depth on already-masked storage).
+// is PR17). Secrets are never shown: the credentials view exposes STATUS ONLY (exists/
+// enabled/status/key_version/last_checked — never key material or the encrypted blob),
+// and the api-call-log view is masked (defence-in-depth on already-masked storage).
 package dashboard
 
 import (
@@ -99,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/config", s.config)
 	mux.HandleFunc("GET /api/audit", s.audit)
 	mux.HandleFunc("GET /api/live", s.live)
+	mux.HandleFunc("GET /api/credentials", s.credentialStatus)
 	mux.HandleFunc("GET /ws", s.ws)
 
 	// Config-editing routes (PR17): authenticated + authorized (config_operator/admin).
