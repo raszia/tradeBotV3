@@ -2,8 +2,12 @@ package regime
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -92,26 +96,31 @@ func (s *Store) LoadBaskets(ctx context.Context) ([]Basket, error) {
 }
 
 // WriteResult upserts the basket's current regime and appends a history row ONLY when
-// the regime CHANGED (direction or level differs from the stored current) — so a
-// steady regime does not spam history (repeated identical calculations are idempotent
-// for the current row and add no history). Config version is stamped on both.
+// the regime CHANGED — where "changed" is a content hash over ALL important output
+// fields (direction, level, confidence, score, per-timeframe scores, per-symbol
+// contributions, stale_reason, config_version), NOT just the direction/level label.
+// So BULLISH/STRONG @0.35 → @0.90 records a new history row, and an UNKNOWN whose
+// stale_reason changes records one too — the dashboard sees the full evolution. A
+// genuinely identical regime is idempotent (current upserted, no history). An UNKNOWN
+// result is written to current with its stale_reason (never a fabricated regime).
 func (s *Store) WriteResult(ctx context.Context, b Basket, r Result, computedAt time.Time) error {
 	tfJSON, _ := json.Marshal(decimalMap(r.TimeframeScores))
 	symJSON, _ := json.Marshal(decimalMap(r.SymbolContributions))
+	hash := regimeStateHash(r, string(tfJSON), string(symJSON), b.ConfigVersion)
 
-	var prevDir, prevLvl sql.NullString
-	_ = s.db.QueryRowContext(ctx, "SELECT direction, level FROM market_regime_current WHERE basket_id=?", b.ID).Scan(&prevDir, &prevLvl)
-	changed := !prevDir.Valid || prevDir.String != r.Direction || prevLvl.String != r.Level
+	var prevHash sql.NullString
+	_ = s.db.QueryRowContext(ctx, "SELECT state_hash FROM market_regime_current WHERE basket_id=?", b.ID).Scan(&prevHash)
+	changed := !prevHash.Valid || prevHash.String != hash
 
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO market_regime_current
-  (basket_id, direction, level, confidence, score_bps, timeframe_scores, symbol_contributions, stale_reason, config_version, computed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  (basket_id, direction, level, confidence, score_bps, timeframe_scores, symbol_contributions, stale_reason, state_hash, config_version, computed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE direction=VALUES(direction), level=VALUES(level), confidence=VALUES(confidence),
   score_bps=VALUES(score_bps), timeframe_scores=VALUES(timeframe_scores), symbol_contributions=VALUES(symbol_contributions),
-  stale_reason=VALUES(stale_reason), config_version=VALUES(config_version), computed_at=VALUES(computed_at)`,
+  stale_reason=VALUES(stale_reason), state_hash=VALUES(state_hash), config_version=VALUES(config_version), computed_at=VALUES(computed_at)`,
 		b.ID, r.Direction, r.Level, r.Confidence.String(), decimalOrNull(r.ScoreBps), string(tfJSON), string(symJSON),
-		nullStr(r.StaleReason), b.ConfigVersion, computedAt.UTC()); err != nil {
+		nullStr(r.StaleReason), hash, b.ConfigVersion, computedAt.UTC()); err != nil {
 		return err
 	}
 
@@ -125,6 +134,17 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		}
 	}
 	return nil
+}
+
+// regimeStateHash is the full-field content hash used for history change detection.
+// json.Marshal of a Go map emits keys in sorted order, so the timeframe/symbol JSON is
+// deterministic and equal regimes hash equally.
+func regimeStateHash(r Result, tfJSON, symJSON string, configVersion int64) string {
+	h := sha256.Sum256([]byte(strings.Join([]string{
+		r.Direction, r.Level, r.Confidence.String(), r.ScoreBps.String(),
+		tfJSON, symJSON, r.StaleReason, strconv.FormatInt(configVersion, 10),
+	}, "|")))
+	return hex.EncodeToString(h[:])
 }
 
 func decimalMap(m map[string]decimal.Decimal) map[string]string {

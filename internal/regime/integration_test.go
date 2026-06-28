@@ -159,6 +159,46 @@ func TestWriteResultUpsertAndHistoryOnChange(t *testing.T) {
 	}
 }
 
+func TestHistoryCapturesFullEvolution(t *testing.T) {
+	f := setupR(t)
+	id := f.seedBasket(1, 2, "BTC/USDT")
+	b := Basket{ID: id, ConfigVersion: 7}
+	now := time.Now().UTC()
+	mk := func(dir, lvl, conf, score string) Result {
+		return Result{Direction: dir, Level: lvl, Confidence: dec(conf), ScoreBps: dec(score),
+			TimeframeScores: map[string]decimal.Decimal{"tf": dec(score)}, SymbolContributions: map[string]decimal.Decimal{"BTC/USDT": dec(score)}}
+	}
+	// Same label, but confidence changes 0.35 -> 0.90 -> a NEW history row each time.
+	if err := f.st.WriteResult(f.ctx, b, mk(DirBullish, LvlStrong, "0.35", "150"), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.WriteResult(f.ctx, b, mk(DirBullish, LvlStrong, "0.35", "150"), now); err != nil { // identical -> no dup
+		t.Fatal(err)
+	}
+	if h := f.count("market_regime_history", id); h != 1 {
+		t.Fatalf("identical regime history = %d, want 1", h)
+	}
+	if err := f.st.WriteResult(f.ctx, b, mk(DirBullish, LvlStrong, "0.90", "150"), now); err != nil { // confidence change
+		t.Fatal(err)
+	}
+	if h := f.count("market_regime_history", id); h != 2 {
+		t.Errorf("history after confidence change = %d, want 2 (full-field hash)", h)
+	}
+
+	// UNKNOWN whose stale_reason changes also records a new history row.
+	u1 := Result{Direction: DirUnknown, Level: LvlUnknown, Confidence: dec("0"), StaleReason: "1/2 symbols stale"}
+	u2 := Result{Direction: DirUnknown, Level: LvlUnknown, Confidence: dec("0"), StaleReason: "no fresh data"}
+	if err := f.st.WriteResult(f.ctx, b, u1, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.WriteResult(f.ctx, b, u2, now); err != nil {
+		t.Fatal(err)
+	}
+	if h := f.count("market_regime_history", id); h != 4 {
+		t.Errorf("history after two distinct UNKNOWN reasons = %d, want 4", h)
+	}
+}
+
 // fakeSource returns a settable price stamped at the manual clock's current time.
 type fakeSource struct {
 	clk   *clock.Manual

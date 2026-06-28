@@ -1113,9 +1113,14 @@ degrades to `UNKNOWN`. After a restart the in-memory series is empty, so the reg
 `UNKNOWN` until it warms up to span the timeframes.
 
 **Current + history.** `market_regime_current` is upserted per basket (idempotent for a
-steady regime); `market_regime_history` gets a row **only when the regime changes**
-(direction or level) — deduped, so a stable regime doesn't spam history; both are
-config-version-stamped. History is high-volume, timestamp-indexed, no FK on the write
+genuinely identical regime); `market_regime_history` gets a row whenever the regime
+**changes**, where "changed" is a **full-field content hash** (`state_hash`, migration
+016) over direction, level, confidence, score, per-timeframe scores, per-symbol
+contributions, stale_reason, and config_version — **not** just the direction/level
+label. So `BULLISH/STRONG @ confidence 0.35 → 0.90` records a new history row, and an
+`UNKNOWN` whose `stale_reason` changes records one too (the dashboard sees the full
+evolution, and a stale-data `UNKNOWN` is never shown as a still-valid regime). Both are
+config-version-stamped; history is high-volume, timestamp-indexed, no FK on the write
 path (retention friendly).
 
 **Wiring.** The trade-engine hosts the calculator on its own cadence (it already has
@@ -1304,9 +1309,13 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
   (lower confidence); a timeframe the series can't span is skipped; no fresh data → the
   regime is `UNKNOWN` with a `stale_reason`. A Redis miss records nothing (no crash); a
   restart warms up from empty (UNKNOWN until the series spans the timeframes).
-- **PR15 — current upserted, history written only on change** (direction/level), so a
-  steady regime is idempotent and doesn't spam history; both config-version-stamped.
-  History is FK-light + timestamp-indexed for retention. Migration 015 added the tables.
+- **PR15 — current upserted; history written on change by a FULL-FIELD hash**
+  (`state_hash`, migration 016): direction, level, confidence, score, per-timeframe
+  scores, per-symbol contributions, stale_reason, config_version — so confidence/score
+  evolution (same label) and `UNKNOWN`-with-changed-reason are captured, while a
+  genuinely identical regime is idempotent. A stale-data `UNKNOWN` is written to current
+  (with reason), never a fabricated regime. History is FK-light + timestamp-indexed.
+  (Clarification 1+2; see `regime.TestHistoryCapturesFullEvolution`.)
 - **PR15 — hosted in the trade-engine** (it already has the Redis client); the engine
   provides the `PriceSource` (Binance mid/bid from `price:` keys with the venue time).
   Engine consumption of the regime is deferred.
