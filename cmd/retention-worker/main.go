@@ -3,11 +3,12 @@
 // wallet_balance_history, market_regime_history) in bounded batches, driven entirely
 // by DB config (retention_settings). It NEVER deletes permanent trading records, makes
 // no exchange calls, and uses no Redis. Only one worker runs at a time (DB advisory
-// lock). Set V3_RETENTION_DRY_RUN=1 to report what WOULD be deleted without deleting.
+// lock). Pass -dry-run to report what WOULD be deleted without deleting anything.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -19,8 +20,13 @@ import (
 )
 
 func main() {
+	// Dry-run is an execution MODE of the worker (not a trading parameter), selected by
+	// a command-line flag — never a runtime environment variable. Registered before
+	// ConfigFlag() so the shared flag.Parse() picks it up.
+	dryRunFlag := flag.Bool("dry-run", false, "report what retention WOULD delete, without deleting anything")
+
 	err := service.RunWithDB("retention-worker", service.ConfigFlag(), func(ctx context.Context, base service.Base, store *db.Store) error {
-		dryRun := os.Getenv("V3_RETENTION_DRY_RUN") == "1"
+		dryRun := *dryRunFlag
 		w := retention.New(store.DB(), clock.NewSystem(), base.Log, retention.Config{})
 		base.Log.Info("retention-worker starting", "dry_run", dryRun)
 
