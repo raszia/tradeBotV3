@@ -204,3 +204,43 @@ func TestNoTradingOrCredentialMutationRoutes(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveStatusEndpoint(t *testing.T) {
+	f := setupD(t)
+	_, exID := f.seedEditable(1, 0)
+	// Configure live controls + enable live + a credential, then read the status.
+	f.exec("UPDATE exchanges SET live_enabled=1 WHERE id=?", exID)
+	f.exec("DELETE FROM live_controls")
+	f.exec("INSERT INTO live_controls (id, kill_switch, max_open_cycles, max_daily_orders, max_order_notional) VALUES (1, 1, 1, 10, '100')")
+	f.exec("INSERT INTO exchange_credentials (exchange_id, label, enabled, status) VALUES (?, 'd', 1, 'active')", exID)
+	f.exec("INSERT INTO live_audit (exchange_id, action, decision, reason, execution_mode) VALUES (?, 'place_buy', 'deny', 'kill switch engaged', 'live')", exID)
+
+	// The dashboard server here was built with no ExecutionMode (defaults empty); the
+	// status still reflects the DB kill switch + controls + credentials.
+	code, obj := f.getObj("/api/live")
+	if code != 200 {
+		t.Fatalf("/api/live = %d", code)
+	}
+	if obj["kill_switch"] != true {
+		t.Errorf("kill_switch = %v, want true", obj["kill_switch"])
+	}
+	if obj["controls"] == nil {
+		t.Error("controls should be shown")
+	}
+	if obj["last_live_error"] == nil {
+		t.Error("last live error (deny audit) should be shown")
+	}
+	// Credentials are shown as status only — never any key material.
+	creds, _ := obj["credentials"].([]any)
+	if len(creds) == 0 {
+		t.Error("credential status should be listed")
+	}
+	for _, c := range creds {
+		m, _ := c.(map[string]any)
+		for _, secret := range []string{"encrypted_api_key", "encrypted_api_secret", "api_key", "api_secret"} {
+			if _, leaked := m[secret]; leaked {
+				t.Errorf("/api/live leaked credential field %q", secret)
+			}
+		}
+	}
+}

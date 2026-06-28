@@ -30,6 +30,9 @@ type Config struct {
 	// safe for local read-only use); set it to an allowlist for any non-local deploy.
 	// The WS carries no commands either way, so it cannot affect trading.
 	AllowedWSOrigins []string
+	// ExecutionMode is the system's execution mode ("off"|"dry_run"|"live"), shown on
+	// the /api/live status so operators can see LIVE/DRY_RUN clearly (read-only).
+	ExecutionMode string
 }
 
 func (c *Config) withDefaults() {
@@ -95,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/api-logs", s.apiLogs)
 	mux.HandleFunc("GET /api/config", s.config)
 	mux.HandleFunc("GET /api/audit", s.audit)
+	mux.HandleFunc("GET /api/live", s.live)
 	mux.HandleFunc("GET /ws", s.ws)
 
 	// Config-editing routes (PR17): authenticated + authorized (config_operator/admin).

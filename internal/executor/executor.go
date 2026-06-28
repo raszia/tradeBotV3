@@ -22,9 +22,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/execution"
+	"v3TradeBot/internal/live"
 	"v3TradeBot/internal/orders"
 	"v3TradeBot/internal/queue"
 )
@@ -47,6 +50,12 @@ type Config struct {
 	// FinalStatusDelay is the grace before the simulated-IOC final GET_ORDER status
 	// check is claimable after a successful cancel (default 500ms).
 	FinalStatusDelay time.Duration
+	// ExecutionMode is "off" | "dry_run" | "live". The live Guard is consulted ONLY in
+	// "live" mode (dry-run uses simexec clients with no real exposure).
+	ExecutionMode string
+	// Guard is the limited-live safety gate (PR20). In live mode it is the FINAL check
+	// before any real mutating send; nil disables the gate (non-live modes).
+	Guard *live.Guard
 }
 
 // Executor claims and processes exchange requests for a set of private clients.
@@ -240,6 +249,12 @@ func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, cl
 		e.failTx(ctx, c.ID, "PLACE_ORDER missing order/cycle context")
 		return
 	}
+	// FINAL live gate (PR20): before any real buy send, the guard must allow it.
+	price := decimalOrZero(intent.IntendedPrice)
+	qty := decimalOrZero(intent.IntendedQuantity)
+	if !e.liveGatePlace(ctx, c, "buy", price.Mul(qty), qty) {
+		return // denied + audited + request failed by the gate
+	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
 		if e.log != nil {
 			e.log.Warn("mark in-flight failed; not sending", "id", c.ID, "err", err)
@@ -293,6 +308,9 @@ func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, c
 	var fp orders.FollowupPayload
 	if err := json.Unmarshal(c.Payload, &fp); err != nil {
 		e.failTx(ctx, c.ID, "bad CANCEL_ORDER payload: "+err.Error())
+		return
+	}
+	if !e.liveGateCancel(ctx, c) {
 		return
 	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
@@ -361,6 +379,11 @@ func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed
 		e.failTx(ctx, c.ID, "sell PLACE_ORDER missing order/cycle context")
 		return
 	}
+	price := decimalOrZero(intent.Price)
+	qty := decimalOrZero(intent.Quantity)
+	if !e.liveGatePlace(ctx, c, "sell", price.Mul(qty), qty) {
+		return // denied + audited + request failed by the gate
+	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
 		return
 	}
@@ -392,6 +415,9 @@ func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed
 func (e *Executor) handleSellCancel(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
 	if c.OrderID == nil || c.CycleID == nil {
 		e.failTx(ctx, c.ID, "sell CANCEL_ORDER missing order/cycle context")
+		return
+	}
+	if !e.liveGateCancel(ctx, c) {
 		return
 	}
 	if err := e.q.MarkInFlight(ctx, c.ID); err != nil {
@@ -490,6 +516,76 @@ func isDefiniteRejection(err error) bool {
 		}
 	}
 	return false
+}
+
+// liveGatePlace is the FINAL live safety gate before a real PLACE send. In non-live
+// modes (off/dry_run) it is a no-op (returns true). In live mode it consults the Guard
+// (caps/kill-switch/live-flags/credentials/dry-run/state); a denial fails the request
+// (audited) and returns false so the send is skipped.
+func (e *Executor) liveGatePlace(ctx context.Context, c queue.Claimed, side string, notional, baseQty decimal.Decimal) bool {
+	if e.cfg.ExecutionMode != "live" || e.cfg.Guard == nil {
+		return true
+	}
+	d := e.cfg.Guard.CheckPlace(ctx, live.PlaceCheck{
+		ExchangeID: c.ExchangeID, ExchangeMarketID: e.orderMarket(ctx, c.OrderID), ExchangeCode: c.ExchangeCode,
+		Symbol: c.Symbol, CycleID: derefID(c.CycleID), OrderID: derefID(c.OrderID), RequestID: c.ID,
+		Side: side, Notional: notional, BaseQty: baseQty, DryRun: e.cycleDryRun(ctx, c.CycleID),
+	})
+	if !d.Allow {
+		e.failTx(ctx, c.ID, "live guard denied: "+d.Reason)
+		return false
+	}
+	return true
+}
+
+// liveGateCancel gates a real CANCEL send (cancels reduce risk; permitted under the
+// kill switch but still requires live mode + credentials + not dry-run).
+func (e *Executor) liveGateCancel(ctx context.Context, c queue.Claimed) bool {
+	if e.cfg.ExecutionMode != "live" || e.cfg.Guard == nil {
+		return true
+	}
+	d := e.cfg.Guard.CheckCancel(ctx, live.PlaceCheck{
+		ExchangeID: c.ExchangeID, CycleID: derefID(c.CycleID), OrderID: derefID(c.OrderID), RequestID: c.ID,
+		DryRun: e.cycleDryRun(ctx, c.CycleID),
+	})
+	if !d.Allow {
+		e.failTx(ctx, c.ID, "live guard denied cancel: "+d.Reason)
+		return false
+	}
+	return true
+}
+
+func (e *Executor) orderMarket(ctx context.Context, orderID *int64) int64 {
+	if orderID == nil {
+		return 0
+	}
+	var em int64
+	e.store.DB().QueryRowContext(ctx, "SELECT exchange_market_id FROM orders WHERE id=?", *orderID).Scan(&em)
+	return em
+}
+
+func (e *Executor) cycleDryRun(ctx context.Context, cycleID *int64) bool {
+	if cycleID == nil {
+		return false
+	}
+	var dry int
+	e.store.DB().QueryRowContext(ctx, "SELECT dry_run FROM cycles WHERE id=?", *cycleID).Scan(&dry)
+	return dry != 0
+}
+
+func derefID(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func decimalOrZero(s string) decimal.Decimal {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		return decimal.Zero
+	}
+	return d
 }
 
 func mustJSON(v any) json.RawMessage {

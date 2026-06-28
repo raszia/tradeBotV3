@@ -15,6 +15,7 @@ import (
 	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/engine"
+	"v3TradeBot/internal/live"
 	redisx "v3TradeBot/internal/redis"
 	"v3TradeBot/internal/service"
 )
@@ -36,11 +37,17 @@ func main() {
 		})
 
 		// In dry-run mode the engine stamps created cycles as dry-run so the dashboard/
-		// reconciler can identify them (the executor wires the simulated client).
+		// reconciler can identify them (the executor wires the simulated client). In
+		// LIVE mode the live guard gates new buy-cycle creation (kill switch + caps).
+		var liveGuard *live.Guard
+		if base.Cfg.Execution.IsLive() {
+			liveGuard = live.NewGuard(store.DB(), clock.NewSystem(), base.Log)
+		}
 		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
-			DryRun: base.Cfg.Execution.IsDryRun(),
+			DryRun:    base.Cfg.Execution.IsDryRun(),
+			LiveGuard: liveGuard,
 		})
-		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "dry_run", base.Cfg.Execution.IsDryRun())
+		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
 		return eng.Run(ctx) // blocks until shutdown
 	})
 	if err != nil {

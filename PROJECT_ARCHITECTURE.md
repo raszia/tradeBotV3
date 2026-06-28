@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR19 — Dry-run trading mode.**
+Last updated: **PR20 — Limited live execution (safety layer; real credentials deferred to PR20a).**
 
 ---
 
@@ -1377,6 +1377,71 @@ it via a join to the cycle, so the dashboard clearly shows `DRY_RUN`.
 with a real exchange order; dry-run cycles are only ever verified against the simulated
 client (or skipped when no client is wired).
 
+## 16c. Limited live execution (implemented in PR20 — `internal/live`)
+
+PR20 is a **safety PR**, not a wiring PR: it enables real live orders **only** under
+strict, explicit caps + a global kill switch + per-exchange/per-symbol live flags +
+credential availability + an audit trail, with the final gate **inside the
+order-executor** (never relying on the engine alone). Safe by default at every layer.
+
+**Split.** The real **credential decryption + real-adapter wiring is deferred to PR20a**
+(a dedicated credential PR — encrypted-credential loading, in-memory decryption, key
+versioning, masking). Until then live mode wires **no real client** and
+`AllowLiveExecution` stays false, so nothing is sent. PR20 delivers and fully tests the
+live **safety machinery** with a fake (no-network) client.
+
+**Activation rules.** Bootstrap `[execution] mode` must be **explicitly** `live` (default
+`off` is safe; `dry_run` keeps using `simexec`). No default live behaviour, no runtime
+env var. Beyond the mode, live trading does **not start** unless the DB controls are
+configured (see caps) and the kill switch is disengaged.
+
+**Cap model (`live_controls` singleton + per-scope flags; migration 020).** The
+`live_controls` row holds the global caps; **every cap is required** — if any is missing
+(`Configured()` false) live is denied. Caps: `max_open_cycles`, `max_daily_orders`,
+`max_daily_quote`, `max_order_notional`, `max_base_qty`, `max_consecutive_failures`,
+`max_unresolved_reconcile`. Scope is opt-in via `exchanges.live_enabled` and
+`exchange_markets.live_enabled` (both default 0). The kill switch (`live_controls.
+kill_switch`) **defaults engaged (1)**.
+
+**Kill switch.** When engaged: no new buy cycle may start (engine `AllowNewBuyCycle`
+denies) and no new **buy** PLACE may be sent (executor gate denies). Risk-reducing paths
+continue: **sell** PLACE (exiting existing inventory), CANCEL, and GET_ORDER/status are
+still allowed so open cycles are safely managed.
+
+**Executor-side live guard (the load-bearing gate).** The final live check is in
+`order-executor`, immediately before each mutating send (`liveGatePlace` /
+`liveGateCancel`). Before a real PLACE/CANCEL the `live.Guard` verifies: mode is `live`,
+`AllowLiveExecution` true, request **not** dry-run, exchange + symbol live-enabled, caps
+pass (notional/qty/open-cycles/daily-orders/daily-quote/consecutive-failures/
+unresolved-reconcile), active credentials exist, kill switch off (for buys), and the
+order/cycle state is still valid. A denial **fails the request without sending** and is
+audited. The engine performs a first `AllowNewBuyCycle` check; the executor re-checks —
+belt and suspenders.
+
+**No blind resend (unchanged).** All prior safety holds in live: `MarkInFlight` commits
+before the send; an ambiguous mutating result → order/cycle `NEEDS_RECONCILE`, request
+`DEAD` (never re-sent); a missing order is not proof of zero fill; an `IN_FLIGHT`
+mutating timeout is never blindly retried.
+
+**First live phase is tiny.** The intended first rollout is one exchange, one symbol,
+very small `max_order_notional`/`max_base_qty`, `max_open_cycles=1` — enforced purely by
+the configured caps + the single `live_enabled` exchange/symbol; the dashboard keeps the
+dry-run comparison and a live warning visible. Broad multi-exchange live is **not**
+enabled here.
+
+**Audit (`live_audit`; migration 020).** Every live mutating decision (allow or deny) is
+persisted: exchange, symbol/market, cycle, order, request id, action/side, notional,
+decision, reason, execution mode, config version, timestamp. No secrets.
+
+**Dashboard live visibility (`GET /api/live`).** Read-only: execution mode (`LIVE`),
+kill-switch state, the caps, live-enabled exchanges + symbols, today's order count + open
+cycles (remaining allowance), credential **status only** (never key material),
+unresolved-reconcile count, and the last live allow/deny from the audit.
+
+**What remains after PR20.** PR20a — real credential decryption + real private-client
+wiring (so live mode actually sends, gated by this same guard). Until PR20a, `live` mode
+is a fully-tested safety harness with no real client.
+
 ## 17. Safety rules (the hard rules)
 
 1. **No real order before it is recorded.** create cycle/order/request in MySQL →
@@ -1415,6 +1480,17 @@ client (or skipped when no client is wired).
 
 ## 18. Known limitations (current)
 
+- **Limited live (PR20) ships the safety machinery, not a working live sender.** Live
+  mode wires **no real private client** — real credential decryption + real-adapter
+  wiring is **PR20a** — so `AllowLiveExecution` stays false in the binary and `live` mode
+  currently sends nothing. The `live.Guard` (caps + kill switch + live flags + credential
+  availability + executor-side final gate + audit) and the dashboard `GET /api/live` view
+  are complete and fully tested with a fake (no-network) client. Once PR20a injects real
+  clients, the SAME guard gates them with no logic change. The `credentialsAvailable`
+  check currently means "an enabled, active `exchange_credentials` row exists"; PR20a adds
+  the actual decryption + key-version use behind it. The first live rollout scope (one
+  exchange / one symbol / tiny notional / one open cycle) is enforced purely by the
+  configured caps + the single `live_enabled` flag — it is operational config, not code.
 - **The safety core (PR1–PR7 + PR12) is complete; PR8 adds signal detection but
   still nothing trades.** The trade-engine now writes `comparison_events`/`signals`
   and keeps a pending buy intent fresh, but it does **not** create cycles/orders or
@@ -1508,9 +1584,33 @@ review before anything can trade. Subsequent phases (one reviewed PR at a time):
 PR8 (engine signal loop), PR9 (cycle/lock/buy enqueue), PR10 (order-status/fill
 processing), PR11 (sell + repricing), PR13 (balance sync), PR14 (health),
 PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
-PR18 (retention), PR19 (dry-run), PR20 (limited live).
+PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer). **Remaining: PR20a**
+— real credential decryption + real private-client wiring, so `live` mode actually sends,
+gated by the PR20 `live.Guard` (encrypted-credential loading, in-memory-only decryption,
+key-version use, masking, disabled/missing-credential handling). The operator exit from
+`NEEDS_RECONCILE` also remains a dedicated future PR.
 
 ## 19a. Decisions log
+
+- **PR20 — limited live is a safety PR with the final gate in the executor**: the
+  `live.Guard` is the load-bearing check immediately before each real PLACE/CANCEL (mode/
+  AllowLiveExecution/not-dry-run/exchange+symbol live-enabled/caps/credentials/kill-switch/
+  state); the engine's `AllowNewBuyCycle` is a first check, not the only one. A denial
+  fails the request without sending and is audited (`live_audit`).
+- **PR20 — safe by default at every layer**: mode must be explicitly `live`; the kill
+  switch defaults engaged (1); every cap in `live_controls` is required (any missing →
+  denied); `exchanges.live_enabled` + `exchange_markets.live_enabled` default 0. Caps:
+  open-cycles, daily-orders, daily-quote, order-notional, base-qty, consecutive-failures,
+  unresolved-reconcile (migration 020).
+- **PR20 — kill switch is asymmetric**: it blocks new buy cycles + new buy PLACEs (new
+  exposure) but allows sell PLACEs (inventory exit), cancels, and status polls so open
+  cycles stay safely managed.
+- **PR20 — real credentials are deferred to PR20a**: live mode wires no real client and
+  `AllowLiveExecution` stays false until credential decryption lands, so `live` is a
+  fully-tested safety harness that sends nothing yet; the safety machinery is exercised
+  with a fake (no-network) client and `live_audit` proves allow/deny decisions.
+- **PR20 — no-blind-resend preserved in live**: ambiguous live PLACE → order/cycle
+  `NEEDS_RECONCILE`, request `DEAD`; tested end-to-end with the `place_timeout` scenario.
 
 - **PR19 — dry-run is config-driven + safe by default**: bootstrap `[execution] mode`
   (off|dry_run|live), default off → no client + AllowLiveExecution=false (no order can
@@ -1837,4 +1937,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR16 | `pr16-dashboard` | **accepted** | `internal/dashboard` + `cmd/dashboard`: READ-ONLY operator views. Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any mutating method (incl. config edit) is 405; no place/cancel/cycle/order/queue/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Cycle detail composes orders/fills/requests/state-events/locks/logs + maker-taker fields + fee_note. Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). Health public/private/api-key/ws + counters. Regime direction/level/confidence/score/contributions/stale. api-logs re-masked (defence in depth; credentials never read). WebSocket pushes safe periodic snapshot (open cycles/health/regime/balances), takes no commands. Separate binary (restart isolates). Tests: offline (no-order-client guard, mutating-method-405, step_kind, mask-secrets) + gated (all endpoints missing-data 200, seeded cycle detail + maker/taker + 404, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). Config editing + auth deferred to PR17. |
 | PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
 | PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
-| PR19 | `pr19-dry-run` | **in review** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
+| PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
+| PR20 | `pr20-limited-live` | **in review** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |

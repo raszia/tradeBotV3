@@ -14,6 +14,7 @@ import (
 	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/events"
+	"v3TradeBot/internal/live"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/redis"
 	"v3TradeBot/internal/regime"
@@ -40,6 +41,10 @@ type Config struct {
 	// simulated client — it only marks cycles so the dashboard/reconciler can identify
 	// them.
 	DryRun bool
+	// LiveGuard, when set (LIVE mode), gates NEW buy-cycle creation against the live
+	// caps + kill switch (PR20). It is the first check; the executor re-checks before
+	// the actual send.
+	LiveGuard *live.Guard
 }
 
 func (c *Config) withDefaults() {
@@ -352,6 +357,13 @@ func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask
 		BuyFeeBps:      roundToInt(feeFractionToBps(fee.TakerFee)),
 		SellFeeBps:     roundToInt(feeFractionToBps(fee.MakerFee)),
 		DryRun:         e.cfg.DryRun,
+	}
+	// LIVE mode: the live guard gates new buy-cycle creation (kill switch + caps).
+	if e.cfg.LiveGuard != nil {
+		if d := e.cfg.LiveGuard.AllowNewBuyCycle(ctx, m.ExchangeID, m.ExchangeMarketID); !d.Allow {
+			e.log.Info("live guard blocked new buy cycle", "symbol", m.CanonicalSymbol, "reason", d.Reason)
+			return nil
+		}
 	}
 	_, err := buyflow.CreateBuyCycle(ctx, e.store, e.q, m, ask, sig, e.cfg.LockLeaseSeconds)
 	if err == nil {

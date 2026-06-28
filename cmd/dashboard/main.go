@@ -20,7 +20,7 @@ func main() {
 	err := service.RunWithDB("dashboard", service.ConfigFlag(), func(ctx context.Context, base service.Base, store *db.Store) error {
 		srv := &http.Server{
 			Addr:              base.Cfg.Dashboard.ListenAddr,
-			Handler:           dashboard.New(store.DB(), base.Log, dashboard.Config{}).Handler(),
+			Handler:           dashboard.New(store.DB(), base.Log, dashboard.Config{ExecutionMode: base.Cfg.Execution.Mode}).Handler(),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 

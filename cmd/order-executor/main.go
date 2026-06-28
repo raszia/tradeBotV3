@@ -19,6 +19,7 @@ import (
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/executor"
+	"v3TradeBot/internal/live"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/service"
 	"v3TradeBot/internal/simexec"
@@ -36,6 +37,7 @@ func main() {
 		//         until then this falls back to safe 'off' with a warning).
 		clients := map[string]exchanges.PrivateClient{}
 		allowLive := false
+		var guard *live.Guard
 		switch base.Cfg.Execution.Mode {
 		case config.ExecutionDryRun:
 			for _, code := range loadEnabledExchanges(ctx, store) {
@@ -44,7 +46,12 @@ func main() {
 			allowLive = true
 			base.Log.Warn("order-executor in DRY-RUN: SIMULATED clients only; no real orders will be sent", "exchanges", len(clients))
 		case config.ExecutionLive:
-			base.Log.Warn("execution mode 'live' requested but real credentials are not available yet; running safe (no clients)")
+			// The limited-live safety guard is wired so it gates every real send once
+			// real clients exist. Real private clients require decrypted credentials (a
+			// later PR, PR20a); until then there are NO clients and AllowLiveExecution
+			// stays false, so nothing is sent.
+			guard = live.NewGuard(store.DB(), clock.NewSystem(), base.Log)
+			base.Log.Warn("execution mode 'live': live guard active, but no real clients yet (credential decryption is a later PR); no orders will be sent")
 		default:
 			base.Log.Info("order-executor ready (execution off; no clients; live execution disabled)")
 		}
@@ -52,6 +59,8 @@ func main() {
 		exec := executor.New(store, q, clients, base.Log, executor.Config{
 			Name:               "order-executor",
 			AllowLiveExecution: allowLive,
+			ExecutionMode:      base.Cfg.Execution.Mode,
+			Guard:              guard,
 		})
 		return exec.Run(ctx) // blocks until shutdown
 	})
