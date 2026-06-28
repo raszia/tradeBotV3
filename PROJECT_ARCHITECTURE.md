@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR13 — Balance sync.**
+Last updated: **PR14 — Exchange health monitor.**
 
 ---
 
@@ -891,6 +891,56 @@ API logs still pass the secret masker.
 anything — it only records balances so PR12's reconciler and the dashboard can
 compare expected vs actual inventory later.
 
+## 11b. Exchange health monitor (implemented in PR14 — `internal/health`)
+
+The `health-monitor` binary tracks per-exchange health with **read-only** probes and
+records it in `exchange_health_current` (upserted) + `exchange_health_samples`
+(append-only, high-volume, timestamp-indexed, no FK on the write path → retention
+friendly). It makes **no** trading calls (no `PlaceOrder`/`CancelOrder` is reachable),
+no decisions, and no cycle/order/queue writes — the Monitor only ever invokes
+caller-supplied read-only `ProbeFunc`s (a reflection test asserts nothing it holds can
+place/cancel).
+
+**Public ≠ private health (tracked separately).** A healthy public API does not prove
+the authenticated private API is healthy, so public REST (`public_status`) and private
+REST/auth (`private_status` + `api_key_status`) are recorded independently; `ws_status`
+covers WebSocket. The public probe is a read-only `GetMarkets`; the private probe (when
+a credentialed client exists) is a read-only balance call.
+
+**Normalized vocabularies (no adapter-invented names).**
+- **Status:** `HEALTHY` · `DEGRADED` (reachable but erroring) · `UNAVAILABLE` (timeout/
+  network/5xx) · `AUTH_FAILED` · `RATE_LIMITED` · `UNKNOWN` (no probe / undetermined).
+- **Error category:** `timeout` · `network` · `exchange_5xx` · `exchange_4xx` · `auth` ·
+  `rate_limit` · `unsupported` · `invalid_response` · `unknown`.
+
+`health.Classify(err)` maps probe errors to `(Status, Category)` from the execution
+sentinels (`ErrAuthFailed`/`ErrRateLimited`/timeout), `exchanges.NormalizedAPIError`
+categories, `exchanges.ErrUnsupported`, and JSON decode errors → `invalid_response`.
+`context.Canceled` (our shutdown) is **not** recorded as a health verdict.
+
+**Failure tracking (migration 014 added `public_status`/`private_status`/
+`consecutive_failures`/`last_error_category`/`last_error_message`).** Each probe
+updates the status column for its kind plus the shared `latency_ms`,
+`last_success_at`/`last_failure_at`, `consecutive_failures` (incremented on failure,
+**reset to 0 on success**), `error_count`, and the category counters
+(`timeout_count`/`rate_limit_error_count`/`auth_error_count`). A private auth error is
+the only thing that flips `api_key_status` to `invalid`.
+
+**Never wipe on a transient failure.** A failed probe records the failure and
+increments counters but **preserves** `last_success_at` and prior context — it is never
+erased. Each exchange is probed under a per-probe timeout, bounded by a concurrency
+limit; one exchange's failure is isolated from the others.
+
+**Missing credentials / secrets / startup.** Private health needs decrypted credentials
+(a later PR); until then the binary wires only public probes and `private_status` stays
+`UNKNOWN` (never marked unhealthy on absence; no panic; no live creds in tests). API
+keys/secrets are never logged or stored; adapter errors are pre-masked and the stored
+`last_error_message`/sample `error` are truncated.
+
+**Reusable recorder.** `health.Recorder` is the canonical health-reporting helper; the
+collector/executor/balance-sync/reconciler can adopt it to report health consistently
+(PR14 does not rewrite those — the collector keeps its existing recorder for now).
+
 ## 12. Exchange abstraction layer (implemented in PR4)
 
 The required interface surface is split into two interfaces so the collector/
@@ -1138,6 +1188,12 @@ start.
   (via order-update streams / WebSocket) are a later refinement, as is fee conversion
   across non-quote assets for `realized_quote`. The operator exit from
   `NEEDS_RECONCILE` is still a later PR.
+- **`health-monitor` runs public probes only** (private/authenticated health needs
+  decrypted credentials — a later PR), so `private_status` stays `UNKNOWN` until then;
+  the Monitor/Recorder logic is complete and tested with fake probes. WebSocket health
+  is recorded if a WS probe is supplied but the binary wires none yet (WS is collector-
+  side and partial). The collector keeps its own pre-PR14 health recorder; migrating it
+  onto `health.Recorder` is a later cleanup.
 - **`balance-sync` wires no clients yet** (authenticated balance reads need decrypted
   credentials — a later PR), so it boots and idles. The syncer logic is complete and
   tested with fake read-only clients; once credentials land, real `BalanceClient`s
@@ -1191,6 +1247,26 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR14 — read-only health by construction**: the Monitor only invokes caller-supplied
+  `ProbeFunc`s and holds no order client; a reflection test asserts nothing it holds can
+  place/cancel. Probes are public `GetMarkets` (and a read-only balance call for private
+  when creds exist).
+- **PR14 — public and private health are separate** (`public_status` vs
+  `private_status`/`api_key_status`): a healthy public API never implies private health.
+- **PR14 — fixed normalized vocabularies** for status (HEALTHY/DEGRADED/UNAVAILABLE/
+  AUTH_FAILED/RATE_LIMITED/UNKNOWN) and error category (timeout/network/exchange_5xx/
+  exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown); `health.Classify`
+  maps errors; `context.Canceled` (shutdown) is not a health verdict.
+- **PR14 — a transient failure never wipes** `last_success_at`/context; it increments
+  `consecutive_failures` (reset to 0 on success) + counters. One exchange's failure is
+  isolated (bounded concurrency + per-probe timeout).
+- **PR14 — missing credentials → `private_status` UNKNOWN** (never unhealthy on absence);
+  the binary runs public probes only and never panics; no secrets logged/stored
+  (messages truncated; adapter errors pre-masked). Migration 014 added the normalized
+  status + failure-tracking columns.
+- **PR14 — `health.Recorder` is the canonical reusable recorder** for other components
+  to adopt later; PR14 doesn't rewrite the collector's existing recorder.
 
 - **PR13 — `balance-sync` is read-only by construction**: a narrow `BalanceClient`
   (only `Name`+`GetBalances`) is held, so no order-mutating call is reachable. It
@@ -1401,4 +1477,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR9 | `pr9-cycle-creation-buy-enqueue` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
 | PR10 | `pr10-order-fill-processing` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
 | PR11 | `pr11-sell-management` | **accepted** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
-| PR13 | `pr13-balance-sync` | **in review** | `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
+| PR13 | `pr13-balance-sync` | **accepted** | `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
+| PR14 | `pr14-health-monitor` | **in review** | `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read when creds exist) — no place/cancel reachable (reflection guard); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols). Binary runs public probes only (private UNKNOWN until creds); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
