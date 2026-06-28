@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR17 — Dashboard config editing.**
+Last updated: **PR18 — Retention worker.**
 
 ---
 
@@ -1282,9 +1282,8 @@ snapshot at signal time are deferred — PR15 only computes and stores the regim
 - **Async batched writes** for high-volume data (raw API logs, comparison events,
   app logs, health samples, regime history); **synchronous transactional writes**
   for critical state (cycle/lock/order/queue/transition/fill).
-- **Retention** (PR18) for high-volume tables, configurable by days (and, where
-  partitioned, by retained-partition count ≈ volume), using batched/partition-
-  aware deletes. Trades/orders/fills/cycles kept permanently by default.
+- **Retention** (implemented in PR18 — `internal/retention` + `cmd/retention-worker`):
+  see §16a.
 - **Partitioning decision (PR2, MariaDB):** a partitioned InnoDB table requires
   every unique/primary key to include the partition column, which complicates the
   `AUTO_INCREMENT` PKs here. **PR2 therefore creates all high-volume tables
@@ -1292,6 +1291,52 @@ snapshot at signal time are deferred — PR15 only computes and stores the regim
   retention is a simple batched `DELETE ... WHERE created_at < ? LIMIT N`.
   Partitioning may be introduced later if volume demands it; because the
   `created_at` index already exists, that change is additive, not breaking.
+
+## 16a. Retention worker (implemented in PR18 — `internal/retention`)
+
+The `retention-worker` deletes OLD rows from high-volume OPERATIONAL tables only, in
+bounded batches, driven entirely by DB config. It makes no exchange calls and uses no
+Redis (holds only a DB handle).
+
+**Never deletes permanent trading records.** Retention can only target a fixed
+**whitelist** of high-volume tables, each mapped to its timestamp column:
+`api_call_logs`, `comparison_events`, `exchange_health_samples`, `app_logs`,
+`wallet_balance_history`, `market_regime_history` (all `created_at`). PERMANENT tables —
+`cycles`, `orders`, `fills`, `signals`, `symbol_locks`, `exchange_requests` — are
+**absent from the whitelist**, so they can **never** be deleted by retention even if a
+`retention_settings` row names them (the worker iterates the whitelist, not the config).
+A table is only eligible if its timestamp column is whitelisted (no time column → never
+targeted), and these tables have no FKs (cheap deletes).
+
+**Config-driven (nothing hardcoded).** Per-table `retention_settings`: `enabled`,
+`retention_days`, plus `batch_size` / `max_batches_per_run` / `pause_ms` (migration
+018). A missing row, or `retention_days <= 0`, means **not configured → do nothing**
+(a deletion window is never guessed); `enabled=0` → skip.
+
+**Batched deletes (never one huge delete).** Per table: `cutoff = now − retention_days`;
+then `DELETE … WHERE <ts> < cutoff LIMIT batch_size` repeated up to
+`max_batches_per_run`, stopping early on a short batch (no more old rows), with an
+optional `pause_ms` between batches — avoiding long locks / replication pain.
+
+**Dry-run.** A dry-run (`V3_RETENTION_DRY_RUN=1`) reports per table the cutoff,
+configured batch size, and **estimated rows** (`COUNT(*) WHERE <ts> < cutoff`) and
+deletes **nothing**.
+
+**Single-run advisory lock.** The whole run holds `GET_LOCK('v3tradebot_retention')` on
+a pinned connection; if it can't be acquired (another worker is active) the run exits
+cleanly (`LockAcquired=false`) and deletes nothing.
+
+**Failure behaviour.** One table's error is recorded in its result and the run
+continues to the others (or stops if `StopOnError`); batches are bounded (no infinite
+retry), and a cancelled context stops the loop cleanly between batches/tables.
+
+**Observability.** Every run writes a summary to `app_logs`
+(`source_binary='retention-worker'`, no secrets): start/finish, duration, dry-run flag,
+lock-acquired, and per-table {cutoff, configured/enabled, deleted count, batches,
+estimated (dry-run), skipped reason, error}.
+
+**Cadence.** The binary runs once on startup then every 6h; `RunOnce` self-guards with
+the advisory lock so overlapping schedules across processes are safe.
 
 ## 17. Safety rules (the hard rules)
 
@@ -1427,6 +1472,21 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR18 — retention can only touch a fixed whitelist** of high-volume tables (each with
+  a whitelisted timestamp column); permanent trading tables are absent and thus never
+  deletable even if a retention_settings row names them (the worker iterates the
+  whitelist, not the config). No Redis, no exchange calls.
+- **PR18 — config-driven, never guessed**: missing config or retention_days ≤ 0 →
+  do-nothing; disabled → skip. Batch params (batch_size/max_batches_per_run/pause_ms)
+  added in migration 018.
+- **PR18 — batched deletes** (`DELETE … WHERE ts < cutoff LIMIT batch_size`, bounded by
+  max_batches, short-batch early-exit, optional pause) — never one huge delete.
+- **PR18 — dry-run reports cutoff + estimated rows and deletes nothing**; a single-run
+  `GET_LOCK` advisory lock prevents concurrent workers (can't acquire → clean exit).
+- **PR18 — failure isolated + observable**: one table's error is recorded and the run
+  continues (or stops if configured); each run writes a summary to app_logs (no
+  secrets); a cancelled context stops cleanly.
 
 - **PR17 — auth before any mutation**: mutating routes require a bearer token whose
   SHA-256 hash matches an enabled `dashboard_tokens` row (migration 017; plaintext never
@@ -1722,4 +1782,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR14 | `pr14-health-monitor` | **accepted** | `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read when creds exist) — no place/cancel reachable (reflection guard); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols). Binary runs public probes only (private UNKNOWN until creds); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
 | PR15 | `pr15-market-regime` | **accepted** | `internal/regime` + migration 015/016 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` written only on direction/level change (deduped); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix (bullish/strong, threshold mapping, weighted symbol + timeframe, missing→confidence, stale-excluded, no-data-UNKNOWN, insufficient-history, empty-basket) + no-order-client guard; gated (load config, current-upsert + history-on-change + config-version, calculator samples+persists, redis-miss no-crash/no-fabricate). Clarification: history dedupes on a FULL-FIELD state_hash (migration 016) so confidence/score evolution + UNKNOWN-reason changes are captured (TestHistoryCapturesFullEvolution). |
 | PR16 | `pr16-dashboard` | **accepted** | `internal/dashboard` + `cmd/dashboard`: READ-ONLY operator views. Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any mutating method (incl. config edit) is 405; no place/cancel/cycle/order/queue/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Cycle detail composes orders/fills/requests/state-events/locks/logs + maker-taker fields + fee_note. Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). Health public/private/api-key/ws + counters. Regime direction/level/confidence/score/contributions/stale. api-logs re-masked (defence in depth; credentials never read). WebSocket pushes safe periodic snapshot (open cycles/health/regime/balances), takes no commands. Separate binary (restart isolates). Tests: offline (no-order-client guard, mutating-method-405, step_kind, mask-secrets) + gated (all endpoints missing-data 200, seeded cycle detail + maker/taker + 404, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). Config editing + auth deferred to PR17. |
-| PR17 | `pr17-config-editing` | **in review** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
+| PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
+| PR18 | `pr18-retention-worker` | **in review** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; V3_RETENTION_DRY_RUN=1 for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
