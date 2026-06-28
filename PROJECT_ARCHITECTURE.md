@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR15 — Market regime.**
+Last updated: **PR16 — Dashboard read-only views.**
 
 ---
 
@@ -1064,16 +1064,73 @@ The dashboard EDIT forms (creating versions/audit via this layer) are PR17; the
 trade-engine consuming the cache is PR8. Each cycle stores the `config_version`
 (and regime config version) used when its signal was created.
 
-## 14. Dashboard responsibilities (PR16/PR17)
+## 14. Dashboard (read-only views implemented in PR16 — `internal/dashboard`; config editing is PR17)
 
-Initial load over HTTP; live updates over WebSocket. Shows full trade detail
-(signal time, Binance/Iranian price at signal, spread, fee-adjusted spread, buy/
-sell results, market regime + level, config version, order states, fills, fees,
-raw API logs, exchange health) plus balances, signals, comparison events, and
-regime. Edits config (creating new versions / audit records) and per-exchange
-concurrency limits. **It never places, cancels, or reprices orders directly** —
-trading stays in the engine/executor/reconciler flow. Separate binary, so
-restarting it never affects trading.
+The `dashboard` binary serves the operator views: an HTTP read API for the initial
+load plus a WebSocket for live updates. **PR16 is strictly read-only.** It runs as its
+own binary (restarting it never affects collector/trade-engine/order-executor/
+reconciler/balance-sync/health-monitor/regime), and it **cannot trade by
+construction**: the `Server` holds **only** a `*sql.DB` (no exchange client, no queue;
+a reflection test asserts this), and **every route is GET-only** — any POST/PUT/DELETE/
+PATCH (e.g. an attempt to edit config) is `405`, because there is no mutating route at
+all. It never places/cancels orders, creates cycles/orders, mutates the queue, or
+edits config.
+
+**Endpoints (all GET, read-only SELECTs, JSON):** `/api/cycles/open`,
+`/api/cycles/closed`, `/api/cycles/{id}` (detail), `/api/orders`, `/api/fills`,
+`/api/requests`, `/api/signals`, `/api/comparisons`, `/api/balances`, `/api/health`,
+`/api/regime`, `/api/logs` (app_logs / reconciler decisions), `/api/api-logs` (masked),
+`/api/config` (read-only snapshot), `/ws` (live), `/` (index), `/healthz`. List
+endpoints take `?limit=` (defaulted + hard-capped). Missing data returns an empty
+array (never a panic).
+
+**WebSocket live updates.** `/ws` pushes a SAFE periodic snapshot (open cycles, health,
+regime, balances) every `WSInterval`; it only SELECTs and sends — it takes **no**
+commands from the socket (live updates never control trading). The loop ends on client
+disconnect or server shutdown.
+
+**No secrets.** The dashboard never reads the credentials table. The `api-logs` view
+re-masks (defence in depth) the already-masked-at-storage headers/bodies/url — the
+values of sensitive keys (authorization/api-key/secret/signature/token/…) are redacted
+so no secret reaches the browser.
+
+**Cycle detail (`/api/cycles/{id}`)** composes the cycle row + its orders, fills,
+exchange requests, cycle/order state events, symbol locks, and related app_logs — so it
+shows signal context (time, prices, spread, fee-adjusted spread, config version), the
+buy/sell orders + fills + fees + realized quote + lock status, and the queue requests.
+
+**Maker/taker visibility.** The order rows carry `intended_execution_mode` /
+`actual_execution_mode` / `maker_attempt_number` / `maker_offset_bps` / `fill_result`,
+and the requests show the simulated-IOC place→cancel→status path (request types +
+purposes).
+
+**Queue display rule.** The `requests` view adds a computed `step_kind` that
+disambiguates `RETRY_SCHEDULED`: `retry_count == 0` → `scheduled_next_step` (a planned
+simulated-IOC/reprice step), `retry_count > 0` → `retry` (an actual retry) — so a
+planned step is never shown as a failed retry.
+
+**Fee display.** Cycle detail includes a `fee_note` stating that `realized_quote`
+includes quote-denominated fees only; fees paid in another asset are shown raw and not
+netted.
+
+**Health display.** `/api/health` shows `public_status` / `private_status` /
+`api_key_status` / `ws_status`, last success/failure, `consecutive_failures`, latency,
+`last_error_category`, and the safe `last_error_message`.
+
+**Balance display.** `/api/balances` shows available/locked/total, `last_seen_at`, and
+a computed `stale` flag (last_seen_at older than the configured age) — a missing asset
+keeps its last value and is simply flagged stale, never shown as zero.
+
+**Regime display.** `/api/regime` shows direction, level, confidence, basket score,
+per-timeframe scores, per-symbol contributions, stale_reason, and config version
+(history via `/api/...` history queries later).
+
+**Auth.** An auth layer is a documented placeholder (the WS upgrader currently accepts
+any origin for local operator use); real auth lands with the config-editing PR.
+
+**What remains for PR17.** Config EDITING — creating new versions, editing
+symbol/exchange configs, fees, regime baskets, enable flags (with audit) — plus any
+operator auth. PR16 only displays config; it changes nothing.
 
 ## 15. Market regime (implemented in PR15 — `internal/regime`)
 
@@ -1229,6 +1286,10 @@ snapshot at signal time are deferred — PR15 only computes and stores the regim
   (via order-update streams / WebSocket) are a later refinement, as is fee conversion
   across non-quote assets for `realized_quote`. The operator exit from
   `NEEDS_RECONCILE` is still a later PR.
+- **Dashboard is read-only (PR16); config editing is PR17.** The dashboard displays
+  config but changes nothing; there is no mutating route and no operator auth yet (the
+  WS upgrader accepts any origin for local use — a documented placeholder). The HTML
+  index is minimal (a JSON API + WS); a rich frontend is a later enhancement.
 - **Regime is computed but not yet consumed.** PR15 calculates + stores the market
   regime; the trade-engine does not yet read it to adjust accept/reject/size/spread/
   reprice, and there is no per-cycle regime snapshot at signal time yet. Baskets are
@@ -1294,6 +1355,21 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR16 — dashboard is read-only by construction**: the `Server` holds only a
+  `*sql.DB` (no exchange client/queue — reflection guard) and registers GET-only routes,
+  so any mutating method is 405 and there is no config-editing path (that's PR17).
+- **PR16 — generic `jsonRows`** turns read-only SELECTs into JSON (decimals/JSON/text →
+  strings, ints → numbers, NULL → null), so endpoints are thin SELECTs; lists take a
+  defaulted + hard-capped `?limit=`; missing data → empty array (no panic).
+- **PR16 — secrets never reach the browser**: credentials table never read; the
+  `api-logs` view re-masks (defence in depth) the already-masked headers/bodies/url.
+- **PR16 — queue display uses `step_kind`** (RETRY_SCHEDULED + retry_count 0 →
+  scheduled_next_step, >0 → retry) so a planned simulated-IOC/reprice step isn't shown
+  as a failed retry; balances expose a clean `stale` boolean (value never zeroed on
+  absence); cycle detail carries a `fee_note` (realized_quote nets quote fees only).
+- **PR16 — WebSocket is push-only**: it sends a safe periodic snapshot and takes no
+  commands from the socket (live updates never control trading).
 
 - **PR15 — regime reads Binance ONLY from Redis** (never a direct Binance call); a
   structural test asserts the Calculator holds no order client. It reads basket config
@@ -1551,4 +1627,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR11 | `pr11-sell-management` | **accepted** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
 | PR13 | `pr13-balance-sync` | **accepted** | `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
 | PR14 | `pr14-health-monitor` | **accepted** | `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read when creds exist) — no place/cancel reachable (reflection guard); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols). Binary runs public probes only (private UNKNOWN until creds); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
-| PR15 | `pr15-market-regime` | **in review** | `internal/regime` + migration 015 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` written only on direction/level change (deduped); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix (bullish/strong, threshold mapping, weighted symbol + timeframe, missing→confidence, stale-excluded, no-data-UNKNOWN, insufficient-history, empty-basket) + no-order-client guard; gated (load config, current-upsert + history-on-change + config-version, calculator samples+persists, redis-miss no-crash/no-fabricate). |
+| PR15 | `pr15-market-regime` | **accepted** | `internal/regime` + migration 015/016 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` written only on direction/level change (deduped); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix (bullish/strong, threshold mapping, weighted symbol + timeframe, missing→confidence, stale-excluded, no-data-UNKNOWN, insufficient-history, empty-basket) + no-order-client guard; gated (load config, current-upsert + history-on-change + config-version, calculator samples+persists, redis-miss no-crash/no-fabricate). Clarification: history dedupes on a FULL-FIELD state_hash (migration 016) so confidence/score evolution + UNKNOWN-reason changes are captured (TestHistoryCapturesFullEvolution). |
+| PR16 | `pr16-dashboard` | **in review** | `internal/dashboard` + `cmd/dashboard`: READ-ONLY operator views. Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any mutating method (incl. config edit) is 405; no place/cancel/cycle/order/queue/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Cycle detail composes orders/fills/requests/state-events/locks/logs + maker-taker fields + fee_note. Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). Health public/private/api-key/ws + counters. Regime direction/level/confidence/score/contributions/stale. api-logs re-masked (defence in depth; credentials never read). WebSocket pushes safe periodic snapshot (open cycles/health/regime/balances), takes no commands. Separate binary (restart isolates). Tests: offline (no-order-client guard, mutating-method-405, step_kind, mask-secrets) + gated (all endpoints missing-data 200, seeded cycle detail + maker/taker + 404, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). Config editing + auth deferred to PR17. |

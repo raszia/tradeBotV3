@@ -1,7 +1,7 @@
-// Command dashboard serves the operator UI (HTTP initial load + WebSocket live
-// updates) and config editing. It runs as its own binary so restarting it never
-// affects the trading engine, and it never controls trading directly. In the PR1
-// skeleton it serves only a /healthz endpoint; real views land in PR16/PR17.
+// Command dashboard serves the READ-ONLY operator views (PR16): HTTP initial load +
+// WebSocket live updates. It runs as its own binary so restarting it never affects the
+// trading services, and it never controls trading — it holds only a database handle
+// (no exchange client, no queue) and exposes only GET routes. Config EDITING is PR17.
 package main
 
 import (
@@ -11,21 +11,16 @@ import (
 	"os"
 	"time"
 
+	"v3TradeBot/internal/dashboard"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/service"
 )
 
 func main() {
 	err := service.RunWithDB("dashboard", service.ConfigFlag(), func(ctx context.Context, base service.Base, store *db.Store) error {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("ok"))
-		})
-
 		srv := &http.Server{
 			Addr:              base.Cfg.Dashboard.ListenAddr,
-			Handler:           mux,
+			Handler:           dashboard.New(store.DB(), base.Log, dashboard.Config{}).Handler(),
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 
