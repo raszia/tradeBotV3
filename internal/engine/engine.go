@@ -16,6 +16,7 @@ import (
 	"v3TradeBot/internal/events"
 	"v3TradeBot/internal/queue"
 	"v3TradeBot/internal/redis"
+	"v3TradeBot/internal/regime"
 	"v3TradeBot/internal/sellflow"
 )
 
@@ -61,14 +62,15 @@ func (c *Config) withDefaults() {
 // PLACE_ORDER request, one transaction). It NEVER calls an exchange and NEVER sends
 // an order — the order-executor does that later (PR10+).
 type Engine struct {
-	store   *db.Store
-	rc      *redis.Client
-	cache   *configstore.Cache
-	q       *queue.Queue
-	sellMgr *sellflow.Manager
-	clk     clock.Clock
-	log     *slog.Logger
-	cfg     Config
+	store      *db.Store
+	rc         *redis.Client
+	cache      *configstore.Cache
+	q          *queue.Queue
+	sellMgr    *sellflow.Manager
+	regimeCalc *regime.Calculator
+	clk        clock.Clock
+	log        *slog.Logger
+	cfg        Config
 }
 
 // New builds an Engine. cfg is copied and defaulted.
@@ -89,8 +91,28 @@ func New(store *db.Store, rc *redis.Client, cache *configstore.Cache, clk clock.
 		// Sell-side manager (PR11): drives exit-sell creation/poll/reprice using the
 		// engine's Binance reference price. It writes DB rows + queue requests only.
 		e.sellMgr = sellflow.NewManager(store, q, cache, e.sellRefPrice, clk, log)
+		// Market-regime calculator (PR15): samples Binance prices from Redis and writes
+		// regime current/history. Read-only toward Redis; no exchange calls, no trading.
+		e.regimeCalc = regime.NewCalculator(regime.NewStore(store.DB()), e, clk, log, regime.Config{})
 	}
 	return e
+}
+
+// Price implements regime.PriceSource: the current Binance price for a symbol read
+// from the Redis market-data cache (mid when both sides are present, else best bid).
+func (e *Engine) Price(ctx context.Context, symbol string) (decimal.Decimal, time.Time, bool) {
+	ps, err := e.rc.LoadPrice(ctx, e.cfg.ReferenceExchange, symbol)
+	if err != nil {
+		return decimal.Zero, time.Time{}, false
+	}
+	price := ps.BestBid
+	if ps.BestBid.IsPositive() && ps.BestAsk.IsPositive() {
+		price = ps.BestBid.Add(ps.BestAsk).Div(decimal.NewFromInt(2))
+	}
+	if !price.IsPositive() || ps.ExchangeTime.IsZero() {
+		return decimal.Zero, time.Time{}, false
+	}
+	return price, ps.ExchangeTime, true
 }
 
 // sellRefPrice is the sellflow.RefPrice provider: the Binance reference for a market,
@@ -138,6 +160,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	// sells for filled cycles) alongside the market-event signal loop.
 	if e.sellMgr != nil {
 		go e.runSellManagement(ctx)
+	}
+	if e.regimeCalc != nil {
+		go func() {
+			if err := e.regimeCalc.Run(ctx); err != nil {
+				e.log.Warn("regime calculator stopped", "err", err)
+			}
+		}()
 	}
 
 	for {

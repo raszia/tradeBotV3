@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR14 — Exchange health monitor.**
+Last updated: **PR15 — Market regime.**
 
 ---
 
@@ -1075,21 +1075,57 @@ concurrency limits. **It never places, cancels, or reprices orders directly** �
 trading stays in the engine/executor/reconciler flow. Separate binary, so
 restarting it never affects trading.
 
-## 15. Market regime design (PR15)
+## 15. Market regime (implemented in PR15 — `internal/regime`)
 
-Configurable **baskets** of Binance symbols define overall market condition.
-A basket config has: name, enabled flag, symbol list, timeframe windows (e.g.
-1m/3m/5m/15m), optional per-symbol weights, regime-level thresholds, update
-interval, and config version. The regime module reads Binance data from **Redis**
-(it must **not** call Binance directly) and produces a normalized result:
-direction, level, confidence, basket score, per-timeframe score, per-symbol
-contribution, timestamp, config version — stored as both **current** state and
-**history**. The module is decoupled from the trade-engine, which reads the
-latest regime from cache/DB. Each cycle stores a **regime snapshot** at signal
-time. Regime may influence configurable parameters (accept/reject, signal score,
-buy size, min spread, sell offset, repricing) — never hardcoded. The exact
-formula may start as a placeholder; the data model and flow are correct from the
-start.
+The regime calculator scores **DB-configurable baskets** of Binance symbols into a
+normalized market regime. It reads Binance prices **only from the Redis market-data
+cache** (it never calls Binance — no REST/WS, no clients), reads basket config from
+MariaDB, and writes regime current/history to MariaDB. It makes **no** trading
+decisions and never touches cycles/orders/queue/locks/trading-config (a later
+trade-engine PR may consume the regime; PR15 only computes + stores it). Migration 015
+added the basket/symbol/timeframe/current/history tables.
+
+**Config model (nothing hardcoded).** `market_regime_baskets` (name, enabled,
+`update_interval_seconds`, `neutral_band_bps`/`moderate_threshold_bps`/
+`strong_threshold_bps`, `config_version`) + `market_regime_basket_symbols`
+(binance_symbol, weight, enabled) + `market_regime_timeframes` (label, seconds,
+weight). Baskets are configured via DB (dashboard later); the calculator computes
+nothing until a basket is configured.
+
+**Calculation (multi-timeframe momentum; `regime.Calculate`, pure + unit-tested).**
+The calculator samples each basket symbol's current Binance price from Redis into a
+rolling per-symbol **time series** (deduped by the venue observation time). For each
+timeframe T it finds the observation ~T ago and computes the symbol's bps change
+`(current − refT)/refT × 10000`; these are weighted across symbols (per symbol weight)
+→ per-timeframe score, then across timeframes (per timeframe weight) → the basket
+**score (bps)**. `direction` ∈ `BULLISH/BEARISH/NEUTRAL/UNKNOWN` (NEUTRAL inside the
+neutral band); `level` ∈ `STRONG/MODERATE/WEAK/FLAT/UNKNOWN` by |score| vs thresholds;
+`confidence` = (fresh symbols / total) × (timeframes with data / total), 0..1. Output
+also carries per-timeframe scores + per-symbol contributions + config version.
+
+**Stale-data policy (never fabricate).** Redis is input only. A symbol whose freshest
+sample is older than `MaxAge` (or missing) is **excluded** (lowering confidence); a
+timeframe the series can't yet span is skipped. If **no** symbol has fresh data, or no
+timeframe can be computed, the regime is **`UNKNOWN`** with a `stale_reason` — stale
+data is never treated as valid. On a Redis miss/error the calculator records nothing
+that tick (no crash, no fabricated momentum); the series ages out and the regime
+degrades to `UNKNOWN`. After a restart the in-memory series is empty, so the regime is
+`UNKNOWN` until it warms up to span the timeframes.
+
+**Current + history.** `market_regime_current` is upserted per basket (idempotent for a
+steady regime); `market_regime_history` gets a row **only when the regime changes**
+(direction or level) — deduped, so a stable regime doesn't spam history; both are
+config-version-stamped. History is high-volume, timestamp-indexed, no FK on the write
+path (retention friendly).
+
+**Wiring.** The trade-engine hosts the calculator on its own cadence (it already has
+the Redis client); the engine implements `regime.PriceSource` by reading
+`price:{binance}:{symbol}` (mid when both sides present, else best bid) with the venue
+observation time. Per-basket `update_interval_seconds` gates recomputation.
+
+**Later (not PR15).** The trade-engine consuming the regime to influence configurable
+parameters (accept/reject, size, spread, sell offset, repricing) and a per-cycle regime
+snapshot at signal time are deferred — PR15 only computes and stores the regime.
 
 ## 16. Logging and retention rules
 
@@ -1188,6 +1224,12 @@ start.
   (via order-update streams / WebSocket) are a later refinement, as is fee conversion
   across non-quote assets for `realized_quote`. The operator exit from
   `NEEDS_RECONCILE` is still a later PR.
+- **Regime is computed but not yet consumed.** PR15 calculates + stores the market
+  regime; the trade-engine does not yet read it to adjust accept/reject/size/spread/
+  reprice, and there is no per-cycle regime snapshot at signal time yet. Baskets are
+  DB-configured (no UI until the dashboard PR); with no baskets configured the
+  calculator does nothing. After a restart the rolling price series is empty, so the
+  regime is `UNKNOWN` until it warms up to span the configured timeframes.
 - **`health-monitor` runs public probes only** (private/authenticated health needs
   decrypted credentials — a later PR), so `private_status` stays `UNKNOWN` until then;
   the Monitor/Recorder logic is complete and tested with fake probes. WebSocket health
@@ -1247,6 +1289,27 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR15 — regime reads Binance ONLY from Redis** (never a direct Binance call); a
+  structural test asserts the Calculator holds no order client. It reads basket config
+  from MariaDB and writes regime current/history to MariaDB; no trading/cycle/queue
+  writes.
+- **PR15 — scoring is multi-timeframe momentum** from a rolling per-symbol price series
+  sampled out of Redis: per-symbol bps change vs a ~T-ago reference, weighted across
+  symbols then timeframes → basket score; direction/level from configured thresholds;
+  confidence = fresh-symbol-fraction × timeframe-coverage-fraction. The formula is in
+  `regime.Calculate` (pure, unit-tested); nothing is hardcoded (baskets/weights/
+  thresholds/timeframes are DB config).
+- **PR15 — stale data is never fabricated**: a stale/missing symbol is excluded
+  (lower confidence); a timeframe the series can't span is skipped; no fresh data → the
+  regime is `UNKNOWN` with a `stale_reason`. A Redis miss records nothing (no crash); a
+  restart warms up from empty (UNKNOWN until the series spans the timeframes).
+- **PR15 — current upserted, history written only on change** (direction/level), so a
+  steady regime is idempotent and doesn't spam history; both config-version-stamped.
+  History is FK-light + timestamp-indexed for retention. Migration 015 added the tables.
+- **PR15 — hosted in the trade-engine** (it already has the Redis client); the engine
+  provides the `PriceSource` (Binance mid/bid from `price:` keys with the venue time).
+  Engine consumption of the regime is deferred.
 
 - **PR14 — read-only health by construction**: the Monitor only invokes caller-supplied
   `ProbeFunc`s and holds no order client; a reflection test asserts nothing it holds can
@@ -1478,4 +1541,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR10 | `pr10-order-fill-processing` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
 | PR11 | `pr11-sell-management` | **accepted** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
 | PR13 | `pr13-balance-sync` | **accepted** | `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
-| PR14 | `pr14-health-monitor` | **in review** | `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read when creds exist) — no place/cancel reachable (reflection guard); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols). Binary runs public probes only (private UNKNOWN until creds); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
+| PR14 | `pr14-health-monitor` | **accepted** | `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read when creds exist) — no place/cancel reachable (reflection guard); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols). Binary runs public probes only (private UNKNOWN until creds); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
+| PR15 | `pr15-market-regime` | **in review** | `internal/regime` + migration 015 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` written only on direction/level change (deduped); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix (bullish/strong, threshold mapping, weighted symbol + timeframe, missing→confidence, stale-excluded, no-data-UNKNOWN, insufficient-history, empty-basket) + no-order-client guard; gated (load config, current-upsert + history-on-change + config-version, calculator samples+persists, redis-miss no-crash/no-fabricate). |
