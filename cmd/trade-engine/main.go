@@ -35,8 +35,12 @@ func main() {
 			base.Log.Warn("config reload failed (keeping previous snapshot)", "err", e)
 		})
 
-		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{})
-		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr)
+		// In dry-run mode the engine stamps created cycles as dry-run so the dashboard/
+		// reconciler can identify them (the executor wires the simulated client).
+		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
+			DryRun: base.Cfg.Execution.IsDryRun(),
+		})
+		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "dry_run", base.Cfg.Execution.IsDryRun())
 		return eng.Run(ctx) // blocks until shutdown
 	})
 	if err != nil {

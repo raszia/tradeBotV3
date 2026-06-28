@@ -50,7 +50,29 @@ type Config struct {
 	Redis     RedisConfig     `toml:"redis"`
 	Dashboard DashboardConfig `toml:"dashboard"`
 	Security  SecurityConfig  `toml:"security"`
+	Execution ExecutionConfig `toml:"execution"`
 }
+
+// ExecutionConfig selects the trade-execution mode (config-driven, NEVER a runtime
+// environment variable). Default (empty / "off") is the SAFE default: no real and no
+// simulated orders. "dry_run" runs the full lifecycle against a simulated exchange (no
+// real orders). "live" sends real orders (requires real credentials — a later PR).
+type ExecutionConfig struct {
+	Mode string `toml:"mode"` // "off" (default) | "dry_run" | "live"
+}
+
+// Execution modes.
+const (
+	ExecutionOff    = "off"
+	ExecutionDryRun = "dry_run"
+	ExecutionLive   = "live"
+)
+
+// IsDryRun reports whether dry-run mode is selected.
+func (e ExecutionConfig) IsDryRun() bool { return e.Mode == ExecutionDryRun }
+
+// IsLive reports whether live (real-order) mode is selected.
+func (e ExecutionConfig) IsLive() bool { return e.Mode == ExecutionLive }
 
 // AppConfig holds process-wide settings.
 type AppConfig struct {

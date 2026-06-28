@@ -348,3 +348,20 @@ func TestApplyOrderOutcomeRollsBackOnStaleVersion(t *testing.T) {
 		t.Errorf("order should be unchanged (SUBMITTED) after rollback, got %s", ordSt(t, f.db, ord))
 	}
 }
+
+func TestDryRunCycleIdentifiedInReconcile(t *testing.T) {
+	f := setupR(t)
+	cyc, _ := f.seedCycleOrder(t, state.CycleBuySubmitted, state.OrderSubmitted, "EXD")
+	f.db.Exec("UPDATE cycles SET dry_run=1 WHERE id=?", cyc)
+
+	if _, err := f.rec.ReconcileStartup(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The reconciler emits a 'dry_run_cycle' decision so a simulated cycle is never
+	// confused with a real exchange order.
+	var n int
+	f.db.QueryRow("SELECT COUNT(*) FROM app_logs WHERE source_binary='reconciler' AND fields LIKE '%dry_run_cycle%'").Scan(&n)
+	if n == 0 {
+		t.Error("expected a dry_run_cycle identification log for the dry-run cycle")
+	}
+}

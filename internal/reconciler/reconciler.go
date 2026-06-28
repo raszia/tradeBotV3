@@ -121,6 +121,8 @@ type cycleRow struct {
 	State           state.CycleState
 	Version         int64
 	CanonicalSymbol string
+	DryRun          bool // PR19: a simulated (dry-run) cycle, identified so it is never
+	// confused with a real exchange order.
 }
 
 type orderRow struct {
@@ -136,7 +138,7 @@ type orderRow struct {
 
 func (r *Reconciler) loadOpenCycles(ctx context.Context) ([]cycleRow, error) {
 	rows, err := r.store.DB().QueryContext(ctx,
-		"SELECT id, state, version, canonical_symbol FROM cycles WHERE state NOT IN ('CLOSED','CANCELLED','FAILED')")
+		"SELECT id, state, version, canonical_symbol, dry_run FROM cycles WHERE state NOT IN ('CLOSED','CANCELLED','FAILED')")
 	if err != nil {
 		return nil, err
 	}
@@ -145,10 +147,12 @@ func (r *Reconciler) loadOpenCycles(ctx context.Context) ([]cycleRow, error) {
 	for rows.Next() {
 		var c cycleRow
 		var st string
-		if err := rows.Scan(&c.ID, &st, &c.Version, &c.CanonicalSymbol); err != nil {
+		var dry int
+		if err := rows.Scan(&c.ID, &st, &c.Version, &c.CanonicalSymbol, &dry); err != nil {
 			return nil, err
 		}
 		c.State = state.CycleState(st)
+		c.DryRun = dry != 0
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -183,6 +187,12 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 	if c.State == state.CycleNeedsReconcile {
 		// Operator-owned; leave it (idempotent no-op, no re-log).
 		return
+	}
+	if c.DryRun {
+		// Identify simulated (dry-run) cycles so they are never confused with real
+		// exchange orders; they are still reconciled, but only ever against the
+		// simulated client (or skipped when no client is wired).
+		r.logDecision(ctx, "dry_run_cycle", "identified", c.ID, 0, "simulated dry-run cycle", nil)
 	}
 	orders, err := r.loadOrders(ctx, c.ID)
 	if err != nil {

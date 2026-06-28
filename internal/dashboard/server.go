@@ -136,17 +136,17 @@ func (s *Server) closedCycles(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) orders(w http.ResponseWriter, r *http.Request) {
 	if c := r.URL.Query().Get("cycle_id"); c != "" {
-		s.list(w, r, "SELECT * FROM orders WHERE cycle_id=? ORDER BY id", c)
+		s.list(w, r, "SELECT o.*, c.dry_run FROM orders o LEFT JOIN cycles c ON c.id=o.cycle_id WHERE o.cycle_id=? ORDER BY o.id", c)
 		return
 	}
-	s.list(w, r, "SELECT * FROM orders ORDER BY id DESC LIMIT ?", s.limit(r))
+	s.list(w, r, "SELECT o.*, c.dry_run FROM orders o LEFT JOIN cycles c ON c.id=o.cycle_id ORDER BY o.id DESC LIMIT ?", s.limit(r))
 }
 func (s *Server) fills(w http.ResponseWriter, r *http.Request) {
 	if c := r.URL.Query().Get("cycle_id"); c != "" {
-		s.list(w, r, "SELECT * FROM fills WHERE cycle_id=? ORDER BY id", c)
+		s.list(w, r, "SELECT f.*, c.dry_run FROM fills f LEFT JOIN cycles c ON c.id=f.cycle_id WHERE f.cycle_id=? ORDER BY f.id", c)
 		return
 	}
-	s.list(w, r, "SELECT * FROM fills ORDER BY id DESC LIMIT ?", s.limit(r))
+	s.list(w, r, "SELECT f.*, c.dry_run FROM fills f LEFT JOIN cycles c ON c.id=f.cycle_id ORDER BY f.id DESC LIMIT ?", s.limit(r))
 }
 func (s *Server) signals(w http.ResponseWriter, r *http.Request) {
 	s.list(w, r, "SELECT * FROM signals ORDER BY id DESC LIMIT ?", s.limit(r))
@@ -168,7 +168,7 @@ func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
 // retry (RETRY_SCHEDULED with retry_count==0 is a planned simulated-IOC/reprice step;
 // retry_count>0 is an actual retry).
 func (s *Server) requests(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), "SELECT * FROM exchange_requests ORDER BY id DESC LIMIT ?", s.limit(r))
+	rows, err := s.db.QueryContext(r.Context(), "SELECT er.*, c.dry_run FROM exchange_requests er LEFT JOIN cycles c ON c.id=er.cycle_id ORDER BY er.id DESC LIMIT ?", s.limit(r))
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -416,6 +416,8 @@ func truthy(v any) bool {
 	case bool:
 		return n
 	case int64:
+		return n != 0
+	case float64:
 		return n != 0
 	case string:
 		return n == "1" || n == "true"

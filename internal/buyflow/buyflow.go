@@ -38,6 +38,7 @@ type SignalContext struct {
 	ReferenceRate  *decimal.Decimal // nil for USDT-quoted markets
 	BuyFeeBps      int
 	SellFeeBps     int
+	DryRun         bool // PR19: stamp the cycle as a dry-run (simulated) cycle
 }
 
 // CreateResult reports the rows created by CreateBuyCycle.
@@ -262,17 +263,24 @@ func insertCycle(ctx context.Context, tx *sql.Tx, m configstore.MarketConfig, si
 	// windowStart is NULL for the first attempt -> anchor the window at NOW(6).
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO cycles
-  (exchange_market_id, buy_exchange_id, canonical_symbol, state, config_version,
+  (exchange_market_id, buy_exchange_id, canonical_symbol, state, dry_run, config_version,
    signal_time, binance_price_at_signal, iranian_price_at_signal, spread_bps, fee_adjusted_spread_bps, buy_size,
    intended_execution_mode, maker_attempt_number, opportunity_window_started_at)
-VALUES (?, ?, ?, 'NEW', ?, NOW(6), ?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW(6)))`,
-		m.ExchangeMarketID, m.ExchangeID, m.CanonicalSymbol, nullID(sig.ConfigVersion),
+VALUES (?, ?, ?, 'NEW', ?, ?, NOW(6), ?, ?, ?, ?, ?, ?, ?, COALESCE(?, NOW(6)))`,
+		m.ExchangeMarketID, m.ExchangeID, m.CanonicalSymbol, b2iCycle(sig.DryRun), nullID(sig.ConfigVersion),
 		sig.BinancePrice.String(), sig.IranianPrice.String(), sig.SpreadBps, sig.FeeAdjustedBps, qty.String(),
 		string(dec.Mode), dec.AttemptNumber, windowStart)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+func b2iCycle(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func insertOrder(ctx context.Context, tx *sql.Tx, m configstore.MarketConfig, cycleID int64, dec Decision, qty, ask decimal.Decimal, localCOID string) (int64, error) {

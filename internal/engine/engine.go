@@ -35,6 +35,11 @@ type Config struct {
 	LockLeaseSeconds int
 	// SellManageInterval is how often the sell-management pass runs (default 2s).
 	SellManageInterval time.Duration
+	// DryRun stamps created cycles as dry-run (PR19); set from the bootstrap execution
+	// mode. It does not by itself simulate execution — that is the executor wiring the
+	// simulated client — it only marks cycles so the dashboard/reconciler can identify
+	// them.
+	DryRun bool
 }
 
 func (c *Config) withDefaults() {
@@ -346,6 +351,7 @@ func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask
 		ReferenceRate:  refRate,
 		BuyFeeBps:      roundToInt(feeFractionToBps(fee.TakerFee)),
 		SellFeeBps:     roundToInt(feeFractionToBps(fee.MakerFee)),
+		DryRun:         e.cfg.DryRun,
 	}
 	_, err := buyflow.CreateBuyCycle(ctx, e.store, e.q, m, ask, sig, e.cfg.LockLeaseSeconds)
 	if err == nil {

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -315,4 +316,39 @@ func TestWebSocketLiveSnapshot(t *testing.T) {
 			t.Errorf("ws snapshot missing %q", k)
 		}
 	}
+}
+
+func TestDryRunLabelShownOnCyclesAndOrders(t *testing.T) {
+	f := setupD(t)
+	cyc, _ := f.seedCycle()
+	f.exec("UPDATE cycles SET dry_run=1 WHERE id=?", cyc)
+
+	_, cycles := f.get("/api/cycles/open")
+	var labelled bool
+	for _, m := range cycles {
+		if asFloatID(m["id"]) == cyc {
+			if !truthy(m["dry_run"]) {
+				t.Errorf("cycle %d dry_run not shown: %v", cyc, m["dry_run"])
+			}
+			labelled = true
+		}
+	}
+	if !labelled {
+		t.Fatal("dry-run cycle not returned by /api/cycles/open")
+	}
+	// Orders carry the dry_run label via the cycle join.
+	_, ords := f.get("/api/orders?cycle_id=" + itoaTest(cyc))
+	if len(ords) == 0 || !truthy(ords[0]["dry_run"]) {
+		t.Errorf("order dry_run not shown: %v", ords)
+	}
+}
+
+func asFloatID(v any) int64 {
+	if f, ok := v.(float64); ok {
+		return int64(f)
+	}
+	return 0
+}
+func itoaTest(n int64) string {
+	return strconv.FormatInt(n, 10)
 }

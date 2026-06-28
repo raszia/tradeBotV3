@@ -144,3 +144,21 @@ func TestRedactDSNEdgeCases(t *testing.T) {
 		}
 	}
 }
+
+// TestExecutionModeDefaultIsSafe: the zero value (no [execution] section) is "off" —
+// dry-run/live must be EXPLICIT so a live or simulated order can never run by default.
+func TestExecutionModeDefaultIsSafe(t *testing.T) {
+	var e ExecutionConfig // zero value, as when the TOML omits [execution]
+	if e.IsDryRun() {
+		t.Error("default execution mode must NOT be dry-run")
+	}
+	if e.IsLive() {
+		t.Error("default execution mode must NOT be live")
+	}
+	if dry := (ExecutionConfig{Mode: ExecutionDryRun}); !dry.IsDryRun() {
+		t.Error("explicit dry_run should report IsDryRun")
+	}
+	if live := (ExecutionConfig{Mode: ExecutionLive}); !live.IsLive() {
+		t.Error("explicit live should report IsLive")
+	}
+}

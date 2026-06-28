@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR18 — Retention worker.**
+Last updated: **PR19 — Dry-run trading mode.**
 
 ---
 
@@ -1340,6 +1340,43 @@ the advisory lock so overlapping schedules across processes are safe. Dry-run is
 `-dry-run` flag (no runtime environment variables are used for service behaviour
 anywhere in the system).
 
+## 16b. Dry-run trading mode (implemented in PR19 — `internal/simexec`)
+
+Dry-run runs the **full** trading lifecycle — signal → cycle → symbol lock → buy order
+→ queue enqueue → executor claim → simulated buy fill → sell creation → simulated sell
+status → cycle close → reconcile — through the **real** queue/executor/order-processing/
+sellflow boundaries, but against a **simulated exchange client** so **no real
+`PlaceOrder`/`CancelOrder` ever reaches an exchange** and there is zero real exposure.
+
+**Activation (config-driven, safe by default — never a runtime env var).** The
+bootstrap `[execution] mode` selects `off` (default) | `dry_run` | `live`:
+- **`off` (default)**: the order-executor wires **no** clients and `AllowLiveExecution=
+  false` → no order, real or simulated, can be sent. Dry-run/live must be **explicit**.
+- **`dry_run`**: the order-executor wires `simexec` clients for the enabled exchanges and
+  `AllowLiveExecution=true`; the trade-engine stamps created cycles `dry_run=1`.
+- **`live`**: real private clients (needs decrypted credentials — a later PR; until then
+  it falls back to safe `off` with a warning).
+
+**Simulated client (`simexec`, no I/O).** It implements `exchanges.PrivateClient` with
+**no network code at all**, recording each placed order so `GetOrder` returns a
+consistent status per a configurable **scenario**: `full_fill`, `partial_fill` (half,
+remainder cancelled), `zero_fill`, `ambiguous` (GetOrder unknown → NEEDS_RECONCILE),
+`rejected` (definite place rejection), `place_timeout` (ambiguous ack), `cancel_race`
+(cancel raced a full fill). The dry-run binary default is `full_fill`.
+
+**Does not bypass the architecture.** Dry-run does **not** mark cycles closed from the
+engine — every transition goes through the same queue → executor → `internal/orders`
+boundaries (the simulated-IOC place→cancel→status flow for the buy, and the resting
+sell place→poll for the sell). The engine only sets the `dry_run` marker.
+
+**Dashboard labelling.** Cycles carry `dry_run`; the orders/requests/fills views surface
+it via a join to the cycle, so the dashboard clearly shows `DRY_RUN`.
+
+**Reconciler safety.** The reconciler loads `cycles.dry_run` (migration 019) and emits a
+`dry_run_cycle` identification decision, so a simulated dry-run order is never confused
+with a real exchange order; dry-run cycles are only ever verified against the simulated
+client (or skipped when no client is wired).
+
 ## 17. Safety rules (the hard rules)
 
 1. **No real order before it is recorded.** create cycle/order/request in MySQL →
@@ -1474,6 +1511,20 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited live).
 
 ## 19a. Decisions log
+
+- **PR19 — dry-run is config-driven + safe by default**: bootstrap `[execution] mode`
+  (off|dry_run|live), default off → no client + AllowLiveExecution=false (no order can
+  be sent). Dry-run/live are explicit; no runtime env var anywhere.
+- **PR19 — simulated client (`simexec`) has no network code** and satisfies
+  `exchanges.PrivateClient`; the executor wires it (not real adapters) in dry-run, so no
+  real PlaceOrder/CancelOrder is reachable. Configurable scenarios (full/partial/zero/
+  ambiguous/rejected/timeout/cancel-race).
+- **PR19 — the full lifecycle goes through the real boundaries** (queue → executor →
+  internal/orders → sellflow); the engine only stamps `cycles.dry_run` (migration 019),
+  never closes a cycle directly.
+- **PR19 — dry-run is identifiable**: dashboard surfaces `dry_run` on cycles/orders/
+  requests/fills; the reconciler logs a `dry_run_cycle` decision so a simulated order is
+  never confused with a real one.
 
 - **PR18 — retention can only touch a fixed whitelist** of high-volume tables (each with
   a whitelisted timestamp column); permanent trading tables are absent and thus never
@@ -1785,4 +1836,5 @@ PR18 (retention), PR19 (dry-run), PR20 (limited live).
 | PR15 | `pr15-market-regime` | **accepted** | `internal/regime` + migration 015/016 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` written only on direction/level change (deduped); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix (bullish/strong, threshold mapping, weighted symbol + timeframe, missing→confidence, stale-excluded, no-data-UNKNOWN, insufficient-history, empty-basket) + no-order-client guard; gated (load config, current-upsert + history-on-change + config-version, calculator samples+persists, redis-miss no-crash/no-fabricate). Clarification: history dedupes on a FULL-FIELD state_hash (migration 016) so confidence/score evolution + UNKNOWN-reason changes are captured (TestHistoryCapturesFullEvolution). |
 | PR16 | `pr16-dashboard` | **accepted** | `internal/dashboard` + `cmd/dashboard`: READ-ONLY operator views. Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any mutating method (incl. config edit) is 405; no place/cancel/cycle/order/queue/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Cycle detail composes orders/fills/requests/state-events/locks/logs + maker-taker fields + fee_note. Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). Health public/private/api-key/ws + counters. Regime direction/level/confidence/score/contributions/stale. api-logs re-masked (defence in depth; credentials never read). WebSocket pushes safe periodic snapshot (open cycles/health/regime/balances), takes no commands. Separate binary (restart isolates). Tests: offline (no-order-client guard, mutating-method-405, step_kind, mask-secrets) + gated (all endpoints missing-data 200, seeded cycle detail + maker/taker + 404, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). Config editing + auth deferred to PR17. |
 | PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
-| PR18 | `pr18-retention-worker` | **in review** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
+| PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
+| PR19 | `pr19-dry-run` | **in review** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
