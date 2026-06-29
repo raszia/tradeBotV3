@@ -1,0 +1,93 @@
+# v3TradeBot local/staging deployment (PR27). Brings up MariaDB + Redis, applies the
+# schema once (migrate), then starts every service. SAFE BY DEFAULT: services read the
+# mounted config.toml whose [execution] mode is "off"/"dry_run" — NO real orders, NO API
+# keys required, kill switch starts engaged (live_controls column default).
+#
+# Usage:
+#   cp configs/production.example.toml configs/config.toml   # then edit (mariadb/redis hosts already set)
+#   docker compose up -d --build
+#   # dashboard -> http://localhost:8080 ; for a dry-run set [execution] mode = "dry_run"
+#
+# configs/config.toml is gitignored and mounted read-only; no secret is baked into images.
+
+x-svc: &svc
+  build: .
+  image: v3tradebot:local
+  restart: unless-stopped
+  volumes:
+    - ./configs/config.toml:/etc/v3tradebot/config.toml:ro
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  mariadb:
+    image: mariadb:10.6
+    environment:
+      MARIADB_ROOT_PASSWORD: rootpw
+      MARIADB_DATABASE: v3tradebot
+      MARIADB_USER: trader
+      MARIADB_PASSWORD: CHANGE_ME
+    command: ["--character-set-server=utf8mb4"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - mariadb-data:/var/lib/mysql
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot schema applier. Every service fails fast if the schema is behind the code,
+  # so this MUST complete before they start (depends_on: service_completed_successfully).
+  migrate:
+    build: .
+    image: v3tradebot:local
+    entrypoint: ["/usr/local/bin/migrate"]
+    command: ["-config", "/etc/v3tradebot/config.toml"]
+    restart: "no"
+    volumes:
+      - ./configs/config.toml:/etc/v3tradebot/config.toml:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  collector:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/collector"]
+  trade-engine:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/trade-engine"]
+  order-executor:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/order-executor"]
+  reconciler:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/reconciler"]
+  balance-sync:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/balance-sync"]
+  health-monitor:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/health-monitor"]
+  retention-worker:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/retention-worker"]
+  dashboard:
+    <<: *svc
+    entrypoint: ["/usr/local/bin/dashboard"]
+    ports:
+      - "8080:8080"
+
+volumes:
+  mariadb-data:

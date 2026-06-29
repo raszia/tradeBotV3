@@ -1,0 +1,59 @@
+# v3TradeBot PRODUCTION/STAGING bootstrap configuration (EXAMPLE — placeholders only).
+#
+# Copy to configs/config.toml and edit the placeholders:
+#   cp configs/production.example.toml configs/config.toml
+#   ./bin/migrate -config configs/config.toml      # apply schema first
+#   ./bin/dashboard -config configs/config.toml     # then start services
+# (configs/config.toml is gitignored — never commit a real DSN / master key.)
+#
+# This project reads configuration from this FILE ONLY — NO environment variables for
+# service behaviour. ONLY bootstrap/infra secrets live here (the DB password inside the
+# DSN, the Redis password, the encryption master key). All TRADING config (exchanges,
+# symbols, spreads, sizes, fees, retention, regime, live caps) AND all exchange API
+# keys/secrets live in the DATABASE (API keys encrypted at rest) and are edited via the
+# dashboard — NEVER in this file. This example contains NO API keys and NO plaintext
+# credentials, by design.
+
+[app]
+environment = "staging"            # development | staging | production
+
+[log]
+level  = "info"                    # debug | info | warn | error
+format = "json"                    # json | text
+
+[mysql]
+# REQUIRED. MariaDB 10.6+ DSN (embeds the DB password). For docker-compose use host
+# "mariadb"; for bare-metal use the real host. Replace CHANGE_ME with the real password.
+dsn = "trader:CHANGE_ME@tcp(mariadb:3306)/v3tradebot?parseTime=true&loc=UTC"
+max_open_conns = 0                 # 0 = built-in defaults (25 / 10 / 30m / 5m)
+max_idle_conns = 0
+conn_max_lifetime_sec = 0
+conn_max_idle_time_sec = 0
+
+[redis]
+# Live market data ONLY — losing Redis must never lose trading state.
+addr     = "redis:6379"            # docker-compose host "redis"; bare-metal: real host
+password = ""                      # set if your Redis requires auth
+db       = 0
+pool_size = 0                      # 0 = default 30
+
+[dashboard]
+# Bind to localhost (or an internal interface behind a reverse proxy / VPN). Operator
+# auth is via DB-stored bearer tokens (SHA-256 hashes); do NOT expose this publicly.
+listen_addr = "0.0.0.0:8080"
+
+[security]
+# Encryption master key for at-rest exchange credentials + API-log masking support.
+# LEAVE EMPTY for a credential-free dry-run (credential loading + live execution are then
+# safe-disabled). Set a STRONG value ONLY when provisioning real credentials for live.
+master_key = ""
+
+[execution]
+# SAFE DEFAULT. Trade-execution mode (config-driven, NEVER a runtime env var):
+#   off     = no clients, nothing sent (default — safest)
+#   dry_run = SIMULATED clients only (full lifecycle, ZERO real exposure)
+#   live    = real orders, gated by the PR20-PR25 stack (kill switch, caps, credential,
+#             preflight, acknowledgement, active canary session). Do NOT set this until the
+#             full RUNBOOK.md checklist is satisfied.
+# Local/staging readiness uses "off" or "dry_run" ONLY.
+mode = "off"
