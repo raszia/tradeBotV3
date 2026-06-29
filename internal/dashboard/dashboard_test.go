@@ -113,7 +113,7 @@ func setupD(t *testing.T) *dfix {
 	if _, err := migrate.Run(ctx, db, migrate.FS); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour})
+	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour, MasterKey: "dashboard-test-master-key"})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close(); db.Close() })
 	return &dfix{t: t, db: db, ts: ts, ctx: ctx}

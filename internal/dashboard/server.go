@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"v3TradeBot/internal/configstore"
+	"v3TradeBot/internal/credentials"
 	"v3TradeBot/internal/opreconcile"
 	"v3TradeBot/internal/regime"
 )
@@ -35,6 +36,10 @@ type Config struct {
 	// ExecutionMode is the system's execution mode ("off"|"dry_run"|"live"), shown on
 	// the /api/live status so operators can see LIVE/DRY_RUN clearly (read-only).
 	ExecutionMode string
+	// MasterKey is the bootstrap encryption key, used ONLY to build the credential
+	// Provisioner (PR22) for create/rotate/disable. It is never logged or exposed; an
+	// empty key disables credential-editing endpoints safely.
+	MasterKey string
 }
 
 func (c *Config) withDefaults() {
@@ -56,12 +61,13 @@ func (c *Config) withDefaults() {
 // (+ config/log): NO exchange client and NO queue, so it cannot trade by construction.
 // Read views are open; config-editing routes are authenticated + authorized (PR17).
 type Server struct {
-	db       *sql.DB
-	cfgStore *configstore.Store
-	regStore *regime.Store
-	resolver *opreconcile.Resolver
-	cfg      Config
-	log      *slog.Logger
+	db          *sql.DB
+	cfgStore    *configstore.Store
+	regStore    *regime.Store
+	resolver    *opreconcile.Resolver
+	provisioner *credentials.Provisioner
+	cfg         Config
+	log         *slog.Logger
 }
 
 // New builds a Server.
@@ -75,6 +81,15 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 		s.cfgStore = configstore.New(db)
 		s.regStore = regime.NewStore(db)
 		s.resolver = opreconcile.New(db, nil, log)
+		// Credential provisioning (PR22) needs the master key; an empty key leaves the
+		// provisioner nil and the create/rotate/disable endpoints respond safe-disabled.
+		if cfg.MasterKey != "" {
+			if pv, err := credentials.NewProvisioner(db, cfg.MasterKey, nil, log); err == nil {
+				s.provisioner = pv
+			} else {
+				log.Warn("dashboard: credential provisioning disabled", "err", err)
+			}
+		}
 	}
 	return s
 }
@@ -124,6 +139,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/reconcile/{id}", s.reconcileDetail)
 	mux.HandleFunc("POST /api/reconcile/{id}/preview", s.requireReconcileOperator(s.reconcilePreview))
 	mux.HandleFunc("POST /api/reconcile/{id}/apply", s.requireReconcileOperator(s.reconcileApply))
+
+	// Credential provisioning (PR22): create/rotate/disable require credential_operator/
+	// admin. The audit + the existing GET /api/credentials (status only) are read-only.
+	// No endpoint ever returns key material or the encrypted blob.
+	mux.HandleFunc("GET /api/credentials/audit", s.credentialAudit)
+	mux.HandleFunc("POST /api/credentials", s.requireCredentialOperator(s.createCredential))
+	mux.HandleFunc("POST /api/credentials/rotate", s.requireCredentialOperator(s.rotateCredential))
+	mux.HandleFunc("POST /api/credentials/{id}/disable", s.requireCredentialOperator(s.disableCredential))
 	return mux
 }
 

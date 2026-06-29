@@ -193,7 +193,8 @@ func TestAuditEndpointShowsChanges(t *testing.T) {
 func TestNoTradingOrCredentialMutationRoutes(t *testing.T) {
 	f := setupD(t)
 	tok := f.token(RoleAdmin)
-	// No credential-editing route exists in PR17.
+	// Credential editing is NOT under /api/config (it lives under /api/credentials in PR22,
+	// gated by credential_operator/admin); this old path never existed.
 	if code, _ := f.post("/api/config/credential", tok, `{}`); code != http.StatusNotFound && code != http.StatusMethodNotAllowed {
 		t.Errorf("credential route = %d, want 404/405 (no such route)", code)
 	}

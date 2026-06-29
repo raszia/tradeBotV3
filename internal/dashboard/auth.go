@@ -96,6 +96,31 @@ func (s *Server) requireReconcileOperator(h func(http.ResponseWriter, *http.Requ
 	}
 }
 
+// canEditCredentials reports whether a role may create/rotate/disable credentials. Only a
+// credential_operator or an admin — viewer / config_operator / reconcile_operator cannot
+// touch credentials (separation of duties).
+func canEditCredentials(role string) bool {
+	return role == RoleCredentialOperator || role == RoleAdmin
+}
+
+// requireCredentialOperator wraps a credential-editing handler with authentication +
+// authorization: 401 no/invalid token, 403 insufficient role. The authenticated operator
+// is passed through so the credential audit records who acted.
+func (s *Server) requireCredentialOperator(h func(http.ResponseWriter, *http.Request, operator)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		op, ok := s.authenticate(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+			return
+		}
+		if !canEditCredentials(op.role) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient role for credential editing"})
+			return
+		}
+		h(w, r, op)
+	}
+}
+
 func bearerToken(header string) string {
 	const p = "Bearer "
 	if strings.HasPrefix(header, p) {
