@@ -99,10 +99,13 @@ func (c *exirPublic) GetMarkets(ctx context.Context) ([]NormalizedMarket, error)
 
 // --- GetOrderBook (REST) ---
 
+// Prices/quantities are decoded as json.Number (the literal digits the venue sent), NOT
+// float64 — so they convert to decimal EXACTLY (NewFromString), never via lossy
+// NewFromFloat. (PR26 precision hardening: no float for price/quantity.)
 type exirOrderBook struct {
-	Bids      [][]float64 `json:"bids"`
-	Asks      [][]float64 `json:"asks"`
-	Timestamp time.Time   `json:"timestamp"`
+	Bids      [][]json.Number `json:"bids"`
+	Asks      [][]json.Number `json:"asks"`
+	Timestamp time.Time       `json:"timestamp"`
 }
 
 // exirNativeSymbol resolves the venue-native symbol for a canonical symbol:
@@ -176,16 +179,19 @@ func (c *exirPublic) SubscribeOrderBook(ctx context.Context, symbols []string) (
 
 // --- helpers ---
 
-func exirFloatPairsToLevels(pairs [][]float64) []domain.Level {
+func exirFloatPairsToLevels(pairs [][]json.Number) []domain.Level {
 	levels := make([]domain.Level, 0, len(pairs))
 	for _, p := range pairs {
 		if len(p) < 2 {
 			continue
 		}
-		levels = append(levels, domain.Level{
-			Price:    decimal.NewFromFloat(p[0]),
-			Quantity: decimal.NewFromFloat(p[1]),
-		})
+		// Exact decimal parse from the venue's literal digits (no float round-trip).
+		price, perr := decimal.NewFromString(string(p[0]))
+		qty, qerr := decimal.NewFromString(string(p[1]))
+		if perr != nil || qerr != nil {
+			continue // skip a malformed level rather than fabricate a price
+		}
+		levels = append(levels, domain.Level{Price: price, Quantity: qty})
 	}
 	return levels
 }

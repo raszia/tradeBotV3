@@ -104,3 +104,24 @@ func values(m map[string]string) []string {
 	}
 	return out
 }
+
+// TestMaskCoversAdapterSecretFieldNames (PR26 audit) asserts every secret field name an
+// adapter actually places in a request body/header/query is recognized as sensitive — a
+// gap would leak the secret into api_call_logs. Includes bitpin's "secret_key" body field.
+func TestMaskCoversAdapterSecretFieldNames(t *testing.T) {
+	for _, name := range []string{
+		"api_key", "apikey", "apiKey", "API-KEY", "api-key",
+		"secret", "secret_key", "api_secret", "apiSecret", "apisecret",
+		"passphrase", "password", "token", "signature", "sign",
+		"authorization", "x-api-key", "x-mbx-apikey",
+	} {
+		if !IsSensitiveKey(name) {
+			t.Errorf("IsSensitiveKey(%q) = false — this adapter secret field would leak", name)
+		}
+	}
+	// The bitpin auth body uses BOTH "api_key" AND "secret_key"; both must be masked.
+	body := MaskBody(`{"api_key":"AK-LEAK-123","secret_key":"SK-LEAK-456"}`)
+	if strings.Contains(body, "AK-LEAK-123") || strings.Contains(body, "SK-LEAK-456") {
+		t.Errorf("MaskBody leaked a bitpin auth secret: %s", body)
+	}
+}

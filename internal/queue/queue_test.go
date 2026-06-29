@@ -112,10 +112,11 @@ func TestScheduleRetryIncrementsThenDead(t *testing.T) {
 	ctx := context.Background()
 	_ = mockDB
 
-	// retry_count 0, max 5 -> RETRY_SCHEDULED with retry_count 1.
-	mock.ExpectQuery("SELECT retry_count, max_retries FROM exchange_requests").
+	// A READ-ONLY request (GET_BALANCE): retry_count 0, max 5 -> RETRY_SCHEDULED.
+	cols := []string{"retry_count", "max_retries", "request_type", "order_id"}
+	mock.ExpectQuery("SELECT retry_count, max_retries, request_type, order_id FROM exchange_requests").
 		WithArgs(int64(1)).
-		WillReturnRows(sqlmock.NewRows([]string{"retry_count", "max_retries"}).AddRow(0, 5))
+		WillReturnRows(sqlmock.NewRows(cols).AddRow(0, 5, "GET_BALANCE", nil))
 	mock.ExpectExec("UPDATE exchange_requests SET status='RETRY_SCHEDULED'").
 		WithArgs(1, sqlmock.AnyArg(), "boom", int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -125,9 +126,9 @@ func TestScheduleRetryIncrementsThenDead(t *testing.T) {
 	}
 
 	// retry_count 5, max 5 -> exhausted -> DEAD.
-	mock.ExpectQuery("SELECT retry_count, max_retries FROM exchange_requests").
+	mock.ExpectQuery("SELECT retry_count, max_retries, request_type, order_id FROM exchange_requests").
 		WithArgs(int64(2)).
-		WillReturnRows(sqlmock.NewRows([]string{"retry_count", "max_retries"}).AddRow(5, 5))
+		WillReturnRows(sqlmock.NewRows(cols).AddRow(5, 5, "GET_BALANCE", nil))
 	mock.ExpectExec("UPDATE exchange_requests SET status='DEAD'").
 		WithArgs(6, "boom", int64(2)).
 		WillReturnResult(sqlmock.NewResult(0, 1))

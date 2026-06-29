@@ -266,6 +266,30 @@ func seedOrderInState(t *testing.T, db *sql.DB, exID int64, st string) int64 {
 	return ordID
 }
 
+// TestScheduleRetryRefusesMutating verifies the PR26 defense-in-depth guard: even if a
+// future caller passes a MUTATING request to ScheduleRetry, it is dead-lettered (never
+// rescheduled/blindly re-sent) and its owning order is pushed to NEEDS_RECONCILE.
+func TestScheduleRetryRefusesMutating(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	ord := seedOrderInState(t, db, exID, "SUBMITTED")
+	reqID := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "IN_FLIGHT", orderID: &ord, inflightAt: ptr(time.Now())})
+
+	st, err := q.ScheduleRetry(ctx, reqID, "buggy caller tried to retry a place")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != string(StatusDead) {
+		t.Errorf("ScheduleRetry(mutating) status = %s, want DEAD", st)
+	}
+	if got := statusOf(t, db, reqID); got != "DEAD" {
+		t.Errorf("mutating request = %s, want DEAD (never rescheduled)", got)
+	}
+	if got := orderStateOf(t, db, ord); got != "NEEDS_RECONCILE" {
+		t.Errorf("owning order = %s, want NEEDS_RECONCILE", got)
+	}
+}
+
 // TestScheduledStepVsRetryConvention documents+verifies the RETRY_SCHEDULED
 // overloading: a scheduled next step (EnqueueScheduled) has retry_count 0; an actual
 // retry (ScheduleRetry) has retry_count > 0. Reporting uses retry_count to tell a

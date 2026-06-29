@@ -276,9 +276,21 @@ func (q *Queue) MarkDead(ctx context.Context, tx *sql.Tx, id int64, cause string
 // resulting status. Backoff is exponential, capped.
 func (q *Queue) ScheduleRetry(ctx context.Context, id int64, cause string) (string, error) {
 	var retryCount, maxRetries int
+	var reqType string
+	var orderID sql.NullInt64
 	if err := q.db.QueryRowContext(ctx,
-		"SELECT retry_count, max_retries FROM exchange_requests WHERE id=?", id).Scan(&retryCount, &maxRetries); err != nil {
+		"SELECT retry_count, max_retries, request_type, order_id FROM exchange_requests WHERE id=?", id).Scan(&retryCount, &maxRetries, &reqType, &orderID); err != nil {
 		return "", err
+	}
+	// DEFENSE-IN-DEPTH (PR26): a MUTATING request must NEVER be blindly retried — once it
+	// has been claimed we cannot prove it was not sent. Dead-letter it + push its order to
+	// NEEDS_RECONCILE instead. No current caller passes a mutating request here (all four
+	// call sites are read-only/GET_*); this guards a future caller mistake from re-sending.
+	if RequestType(reqType).IsMutating() {
+		if err := q.deadMutatingStuck(ctx, id, orderID); err != nil {
+			return "", err
+		}
+		return string(StatusDead), nil
 	}
 	next := retryCount + 1
 	if next > maxRetries {
