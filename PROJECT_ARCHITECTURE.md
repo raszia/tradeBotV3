@@ -287,7 +287,10 @@ NNN_name.sql` files applied by the `migrate` binary. **No external/manual SQL.**
   statements in a run execute on that same pinned connection.
 - **Tracking & checksums:** `schema_migrations` records each applied version with
   the file's SHA-256 checksum. **Editing an applied migration changes its
-  checksum and is a HARD STOP** — add a new `NNN` file instead.
+  checksum and is a HARD STOP** — add a new `NNN` file instead. The checksum check
+  is enforced at BOTH `migrate.Run` (before applying) AND at service startup via
+  `migrate.EnsureCurrent`/`Status` (PR1 correction), so an edited applied migration
+  fails fast even though services never call `Run`.
 - **DDL vs DML (MariaDB DDL auto-commits, so DDL is NOT truly transactional):**
   each file declares its kind via a leading comment directive:
   - `-- migrate:dml` → statements **and** the `schema_migrations` row run inside
@@ -299,8 +302,14 @@ NNN_name.sql` files applied by the `migrate` binary. **No external/manual SQL.**
   - **Never mix dangerous DDL and data changes in the same file.**
 - **Statement splitting** handles quotes/backticks/line+block comments/escapes;
   stored programs / `DELIMITER` are unsupported in migrations.
-- **Fail-fast:** service binaries call `migrate.EnsureCurrent` on startup and
-  refuse to run if any migration is pending. Services never self-migrate.
+- **Fail-fast (PR1 + correction):** service binaries call `migrate.EnsureCurrent`
+  on startup and refuse to run if **(a)** any migration is pending, **(b)** an
+  already-applied migration's checksum differs from the embedded file
+  (`ChecksumMismatchError` — schema tampered/edited), or **(c)** the DB has an
+  applied version the binary does not know (`UnknownAppliedVersionError` — schema
+  NEWER than the code, e.g. an old binary against a migrated DB). `Status` performs
+  the same integrity verification and surfaces those errors; services never
+  self-migrate.
 
 ## 7. Redis key structure (implemented in PR5)
 
@@ -2114,6 +2123,15 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR1 (correction) — startup migration safety hardened**: `migrate.EnsureCurrent`/`Status`
+  now verify the integrity of the APPLIED set, not just version presence — an edited
+  already-applied migration (`ChecksumMismatchError`) or an applied version the binary does
+  not recognize (`UnknownAppliedVersionError`, schema newer than code) makes service startup
+  refuse to run. Previously only `migrate.Run` checked checksums, and services call only
+  `EnsureCurrent`. Pure `checkAppliedIntegrity` core is unit-tested + gated EnsureCurrent/
+  Status tests. Also fixed the Makefile comment that wrongly mentioned config via env vars
+  (config is file-only via `-config`); no runtime `V3_*` env introduced.
 
 - **PR27 — deploy packaging is safe-by-default, credential-free, no live trading**: a
   distroless image with all binaries (no secret baked in) + a compose stack (DB/Redis/

@@ -1,7 +1,8 @@
 # v3TradeBot build/test helpers.
 #
-# Binaries are built into ./bin. Each service reads bootstrap config from
-# $CONFIG_PATH (V3_CONFIG_PATH) or environment variables. See configs/config.example.toml.
+# Binaries are built into ./bin. Each service reads bootstrap config only from the
+# -config flag / config file. No runtime environment variable is used for runtime config.
+# See configs/config.example.toml.
 
 GO        ?= go
 BIN_DIR   ?= bin

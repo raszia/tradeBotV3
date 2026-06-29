@@ -88,6 +88,20 @@ func (e *ChecksumMismatchError) Error() string {
 		e.Version, e.Name, e.Applied, e.File)
 }
 
+// UnknownAppliedVersionError is returned when the database has an applied migration
+// version that this binary's embedded migrations do not contain — i.e. the schema is
+// NEWER than the code (an old binary running against a newer schema). This is a hard stop.
+type UnknownAppliedVersionError struct {
+	Version  int
+	MaxKnown int
+}
+
+func (e *UnknownAppliedVersionError) Error() string {
+	return fmt.Sprintf(
+		"migrate: applied migration version %d is not recognized by this binary (it knows migrations up to %03d) — the database schema is NEWER than the code; deploy the matching/newer binary before starting this service",
+		e.Version, e.MaxKnown)
+}
+
 // Run applies all pending migrations in version order under the advisory lock.
 // It is idempotent: a second concurrent caller blocks on the lock then finds
 // nothing pending.
@@ -138,6 +152,12 @@ func Run(ctx context.Context, db *sql.DB, fsys fs.FS) (Result, error) {
 // brand-new database (no schema_migrations table yet) every migration is
 // reported pending — it does not create the table, keeping read-only callers
 // (services) side-effect free.
+//
+// Status also VERIFIES the integrity of the applied set: it returns a
+// ChecksumMismatchError if an already-applied migration's file was edited (its
+// checksum changed), or an UnknownAppliedVersionError if the database has an
+// applied version this binary does not know (the schema is newer than the code).
+// So a caller that propagates the error (EnsureCurrent) fails hard on either.
 func Status(ctx context.Context, db *sql.DB, fsys fs.FS) (appliedList, pending []Migration, err error) {
 	migs, err := parse(fsys)
 	if err != nil {
@@ -160,6 +180,11 @@ func Status(ctx context.Context, db *sql.DB, fsys fs.FS) (appliedList, pending [
 		if err != nil {
 			return nil, nil, err
 		}
+		// Integrity: every applied version must be a known migration with a
+		// matching checksum. A mismatch / unknown version is a HARD STOP.
+		if ierr := checkAppliedIntegrity(migs, applied); ierr != nil {
+			return nil, nil, ierr
+		}
 	}
 
 	for _, m := range migs {
@@ -172,14 +197,50 @@ func Status(ctx context.Context, db *sql.DB, fsys fs.FS) (appliedList, pending [
 	return appliedList, pending, nil
 }
 
-// EnsureCurrent returns an error if any migration is pending. Service binaries
-// call this on startup and refuse to run against a schema that is behind the
-// code, so a freshly deployed binary can never operate on an old schema (and
-// services never silently mutate the schema themselves).
+// checkAppliedIntegrity verifies the applied set against the embedded migrations: an
+// applied version absent from the embedded set is an UnknownAppliedVersionError (schema
+// newer than code); an applied version whose checksum differs from the embedded file is a
+// ChecksumMismatchError (an applied migration was edited). It is pure (no DB I/O) so it is
+// exhaustively unit-testable. Versions are checked in ascending order for stable errors.
+func checkAppliedIntegrity(migs []Migration, applied map[int]string) error {
+	known := make(map[int]string, len(migs))
+	names := make(map[int]string, len(migs))
+	maxKnown := 0
+	for _, m := range migs {
+		known[m.Version] = m.Checksum
+		names[m.Version] = m.Name
+		if m.Version > maxKnown {
+			maxKnown = m.Version
+		}
+	}
+	versions := make([]int, 0, len(applied))
+	for v := range applied {
+		versions = append(versions, v)
+	}
+	sort.Ints(versions)
+	for _, v := range versions {
+		embeddedCS, ok := known[v]
+		if !ok {
+			return &UnknownAppliedVersionError{Version: v, MaxKnown: maxKnown}
+		}
+		if applied[v] != embeddedCS {
+			return &ChecksumMismatchError{Version: v, Name: names[v], Applied: applied[v], File: embeddedCS}
+		}
+	}
+	return nil
+}
+
+// EnsureCurrent returns an error if any migration is pending OR if the applied set fails
+// integrity (a checksum mismatch on an already-applied migration, or an applied version
+// the binary does not recognize). Service binaries call this on startup and refuse to run
+// against a schema that is behind the code, that was tampered with, or that is newer than
+// the code — and services never silently mutate the schema themselves.
 func EnsureCurrent(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	// Status performs the integrity verification (checksum / unknown-version) and returns
+	// those as descriptive errors; we propagate them unchanged so callers can errors.As them.
 	_, pending, err := Status(ctx, db, fsys)
 	if err != nil {
-		return fmt.Errorf("migrate: status check: %w", err)
+		return err
 	}
 	if len(pending) > 0 {
 		names := make([]string, len(pending))
