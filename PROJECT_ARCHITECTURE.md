@@ -550,10 +550,18 @@ Rules enforced:
   or both roll back. `UNIQUE(parent_id, version)` additionally blocks duplicate
   events.
 - **Zero-row disambiguation:** when the guarded update affects 0 rows the row is
-  re-read and the outcome is classified as **replay** (already in target →
-  idempotent no-op, `Result.Replayed=true`, no second event), **stale version**
+  re-read and the outcome is classified as **replay**, **stale version**
   (`ErrStaleVersion`), **state mismatch** (`ErrStateMismatch`), or **missing row**
   (`ErrUnknownRow`). This is how crash/duplicate-event replays stay safe.
+- **Strict replay (PR3 correction):** a no-op **replay** is accepted **only for the
+  exact already-applied transition** — the row must be in the target state **at
+  version `expected_version + 1`**, and (stronger guard) the recorded event at that
+  version must be this same `from→to`. A transition that merely happens to share the
+  target state at a **higher** version is a *stale* caller acting on old knowledge and
+  is rejected with `ErrStaleVersion` — e.g. `SELL_REPRICE_PENDING→SELL_SUBMITTED` with
+  `expected_version=10` against a row already at `SELL_SUBMITTED` version 20 fails, it
+  is **not** treated as a replay. `Result.Replayed=true` is returned only in the exact
+  case (and no second event is written).
 
 ## 10. Symbol-lock design (acquire in PR9, release/reclaim in PR12)
 
@@ -709,7 +717,8 @@ the queue status update, order/cycle transitions, fill upsert, and lock release 
 commit together or roll back together — a request is never marked SUCCEEDED if the
 state/fill work failed (it stays for the sweeper). Repeated processing of the same
 final status does not duplicate fills (unique key) or state events (the state machine
-replays a same-state transition as a no-op). A transient (retryable) status-fetch
+treats the exact already-applied transition — target state at `expected_version + 1`
+— as a replay no-op; see §9 strict replay). A transient (retryable) status-fetch
 error simply reschedules the read instead of finalizing.
 
 **What PR10 does NOT do (→ PR11):** the sell side — enqueueing/managing the exit
@@ -2135,6 +2144,17 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR3 (correction) — strict replay disambiguation**: `applyTransition`'s zero-row branch now
+  accepts a replay no-op **only** when the row is in the target state at exactly
+  `expected_version + 1` AND the recorded event at that version is the same `from→to`
+  (`replayEventMatches`). Previously any row already in the target state was treated as a
+  replay regardless of version, so a stale caller (e.g. `SELL_REPRICE_PENDING→SELL_SUBMITTED`
+  with `expected_version=10` against a row already at `SELL_SUBMITTED` version 20) was wrongly
+  accepted; it now returns `ErrStaleVersion`. No new state-mutating SQL was added — only the
+  CAS UPDATE (unchanged) and a read-only event-existence SELECT — so there is no direct
+  state-update bypass. `resolve.go` shares `applyTransition`, so operator resolutions inherit
+  the same strict rule. Branch cut from `pr2-schema-corrections` (carries the PR1+PR2 fixes).
 
 - **PR2 (correction) — schema hardening as a forward migration**: the missing FKs
   (`signals.exchange_id`, `signals.config_version`), operational indexes

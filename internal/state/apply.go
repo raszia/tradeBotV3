@@ -13,9 +13,11 @@ type Result struct {
 	// NewVersion is the row's version after the transition (or the current
 	// version if the transition was a replay no-op).
 	NewVersion int64
-	// Replayed is true when the row was already in the target state, so the
-	// transition was a safe no-op and NO duplicate event row was written. This is
-	// how crash/duplicate-event replay is handled idempotently.
+	// Replayed is true only when this EXACT transition was already applied — the row
+	// is in the target state at version expected+1 and the recorded event at that
+	// version is this same from->to. The call is then a safe idempotent no-op and NO
+	// duplicate event row is written. A row that merely happens to share the target
+	// state at a DIFFERENT (higher) version is a stale transition, not a replay.
 	Replayed bool
 }
 
@@ -145,18 +147,49 @@ func applyTransition(ctx context.Context, tx *sql.Tx, s transitionSpec) (Result,
 	switch {
 	case !found:
 		return Result{}, ErrUnknownRow
-	case curState == s.to:
-		// Already in the target state: treat as an idempotent replay no-op. We do
-		// NOT write another event (that would duplicate the version'd history).
+	case curState == s.to && curVersion == s.version+1:
+		// EXACT already-applied transition: the row is in the target state AND its
+		// version is precisely expected+1, i.e. this transition (and only this one)
+		// advanced the row off the version the caller observed. As a stronger guard,
+		// confirm the recorded event at that version is THIS from->to — not a
+		// coincidental same-target reached by a different path. Only then is it a true
+		// idempotent replay no-op (we do NOT write a second event for the same version).
+		matched, err := replayEventMatches(ctx, tx, s, curVersion)
+		if err != nil {
+			return Result{}, err
+		}
+		if !matched {
+			return Result{}, ErrStaleVersion
+		}
 		return Result{NewVersion: curVersion, Replayed: true}, nil
 	case curVersion != s.version:
-		// Someone else advanced the row.
+		// The row has moved on from the version the caller observed. This INCLUDES a
+		// row already in the target state but at a version higher than expected+1: that
+		// is a STALE transition (a late/duplicate caller acting on old knowledge), NOT a
+		// replay, and is rejected — e.g. SELL_REPRICE_PENDING->SELL_SUBMITTED with
+		// expected_version=10 against a row already at SELL_SUBMITTED version 20.
 		return Result{}, ErrStaleVersion
 	default:
-		// Version matches but the state is neither `from` nor `to`: the caller's
-		// expected `from` is wrong / inconsistent.
+		// curVersion == s.version but the state is not `from` (and not the exact
+		// replay): the caller's expected `from` is wrong / inconsistent.
 		return Result{}, ErrStateMismatch
 	}
+}
+
+// replayEventMatches confirms the state-event recorded at the given version is exactly the
+// transition being replayed (same parent, version, from_state, to_state). It is the optional
+// stronger replay guard: a row that merely happens to be in the target state at version
+// expected+1 is only a TRUE replay if the event history shows THIS from->to produced that
+// version. Returns false when the event at that version recorded a different transition.
+func replayEventMatches(ctx context.Context, tx *sql.Tx, s transitionSpec, version int64) (bool, error) {
+	q := fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s WHERE %s = ? AND version = ? AND from_state = ? AND to_state = ?",
+		s.eventTable, s.eventParentCol)
+	var n int
+	if err := tx.QueryRowContext(ctx, q, s.id, version, s.from, s.to).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func insertEvent(ctx context.Context, tx *sql.Tx, s transitionSpec, version int64) error {
