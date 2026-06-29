@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS reconcile_resolutions (
   before_json      JSON NULL,                            -- snapshot before applying
   after_json       JSON NULL,                            -- snapshot after applying
   lock_released    TINYINT(1) NOT NULL DEFAULT 0,        -- whether the symbol lock was released
+  -- mark_failed safety (correction): when exposure was open/unknown, FAILED is only
+  -- allowed if the operator EXPLICITLY confirms the exposure was handled outside the
+  -- system. This flag records that confirmation; the external reason is folded into reason.
+  external_resolution_confirmed TINYINT(1) NOT NULL DEFAULT 0,
   created_at       TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   KEY idx_reconcile_res_cycle (cycle_id),
   KEY idx_reconcile_res_order (order_id),

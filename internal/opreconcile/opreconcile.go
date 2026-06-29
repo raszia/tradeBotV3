@@ -59,7 +59,12 @@ type Request struct {
 	ExchangeOrderID string    `json:"exchange_order_id"` // for attach_exchange_order_id
 	Fill            *FillData `json:"fill"`
 	Reason          string    `json:"reason"`
-	Operator        string    `json:"-"` // set from the authenticated session, never the body
+	// mark_failed with open/unknown exposure is REFUSED (kept in NEEDS_RECONCILE) unless
+	// the operator explicitly confirms the exposure was handled outside the system. These
+	// two fields are that explicit override + its mandatory strong reason.
+	ExternalResolutionConfirmed bool   `json:"external_resolution_confirmed"`
+	ExternalResolutionReason    string `json:"external_resolution_reason"`
+	Operator                    string `json:"-"` // set from the authenticated session, never the body
 }
 
 // Plan is the previewed/applied effect of a resolution (the exact proposed changes).
@@ -76,6 +81,12 @@ type Plan struct {
 	LockReleased   bool     `json:"lock_released"`      // whether applying releases the symbol lock
 	Warnings       []string `json:"warnings,omitempty"` // advisory (e.g. balance cross-check) — never blocks
 	RequiresReason bool     `json:"requires_reason"`    // a reason is mandatory for every apply
+	// mark_failed safety: ExposureUnresolved is true when exposure is open/unknown;
+	// Downgraded is true when mark_failed was REFUSED and the cycle is kept in
+	// NEEDS_RECONCILE; ExternalConfirmed records an explicit forced-FAILED override.
+	ExposureUnresolved bool `json:"exposure_unresolved,omitempty"`
+	Downgraded         bool `json:"downgraded,omitempty"`
+	ExternalConfirmed  bool `json:"external_resolution_confirmed,omitempty"`
 }
 
 // Result is the outcome of Apply.
@@ -309,14 +320,19 @@ func (r *Resolver) writeAudit(ctx context.Context, tx *sql.Tx, c cycleCtx, req R
 	if plan.OrderID != 0 {
 		orderID = plan.OrderID
 	}
+	// Fold the external-handling reason into the audited reason so it is never lost.
+	reason := req.Reason
+	if plan.ExternalConfirmed && strings.TrimSpace(req.ExternalResolutionReason) != "" {
+		reason = reason + " | external_resolution_confirmed: " + strings.TrimSpace(req.ExternalResolutionReason)
+	}
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO reconcile_resolutions
   (cycle_id, order_id, operator, action, old_cycle_state, new_cycle_state, old_order_state, new_order_state,
-   reason, fill_json, before_json, after_json, lock_released)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+   reason, fill_json, before_json, after_json, lock_released, external_resolution_confirmed)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.cycleID, orderID, req.Operator, string(req.Action),
 		plan.OldCycleState, plan.NewCycleState, nullIfEmpty(plan.OldOrderState), nullIfEmpty(plan.NewOrderState),
-		req.Reason, fillJSON, []byte(before), []byte(after), b2i(plan.LockReleased))
+		reason, fillJSON, []byte(before), []byte(after), b2i(plan.LockReleased), b2i(plan.ExternalConfirmed))
 	if err != nil {
 		return 0, err
 	}

@@ -132,10 +132,35 @@ func (r *Resolver) buildPlan(ctx context.Context, q queryer, c cycleCtx, req Req
 		// cycle stays NEEDS_RECONCILE; lock held (operator chooses a cycle action next).
 
 	case ActionMarkFailed:
-		p.NewCycleState = string(state.CycleFailed)
-		p.LockReleased = !net.IsPositive()
-		if net.IsPositive() {
-			p.Warnings = append(p.Warnings, fmt.Sprintf("marking FAILED with open exposure of %s %s — the symbol lock is KEPT (inventory not exited)", net, c.baseAsset))
+		// FAILED is terminal: a FAILED cycle with unresolved exposure can hide risk from
+		// automated management, so moving OUT of NEEDS_RECONCILE is gated on exposure.
+		switch {
+		case net.IsZero():
+			// Proven zero exposure: allowed, but prefer cancel_zero_exposure (clearer).
+			p.NewCycleState = string(state.CycleFailed)
+			p.LockReleased = true
+			p.Warnings = append(p.Warnings, "clean zero exposure — prefer cancel_zero_exposure (FAILED is terminal and can hide risk)")
+		case !req.ExternalResolutionConfirmed:
+			// Open/unknown exposure, no explicit confirmation: REFUSE to fail. Keep the
+			// cycle in NEEDS_RECONCILE with the lock held (a warning is not enough).
+			p.NewCycleState = string(c.cycleState) // unchanged: NEEDS_RECONCILE
+			p.LockReleased = false
+			p.ExposureUnresolved = true
+			p.Downgraded = true
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"open/unknown exposure of %s %s — NOT marking FAILED; kept in NEEDS_RECONCILE with the lock held. To force, set external_resolution_confirmed=true with an external_resolution_reason confirming the exposure was handled outside the system.",
+				net, c.baseAsset))
+		default:
+			// Open/unknown exposure + explicit external confirmation: force FAILED.
+			if strings.TrimSpace(req.ExternalResolutionReason) == "" {
+				return Plan{}, validationf("external_resolution_reason is required to force mark_failed with open/unknown exposure")
+			}
+			p.NewCycleState = string(state.CycleFailed)
+			p.LockReleased = true // operator confirmed the exposure was handled externally
+			p.ExposureUnresolved = true
+			p.ExternalConfirmed = true
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"FAILED forced with externally-handled exposure of %s %s (operator confirmed) — lock released", net, c.baseAsset))
 		}
 
 	default:
@@ -217,18 +242,28 @@ func (r *Resolver) execute(ctx context.Context, tx *sql.Tx, c cycleCtx, req Requ
 		return false, r.resolveOrder(ctx, tx, *ord, state.OrderCancelled, req.Reason)
 
 	case ActionMarkFailed:
-		if err := r.resolveCycle(ctx, tx, c, state.CycleFailed, req.Reason); err != nil {
+		// Refused (open/unknown exposure, no external confirmation): keep NEEDS_RECONCILE,
+		// lock held, audit only — never moved to the terminal FAILED state.
+		if plan.Downgraded {
+			return false, nil
+		}
+		failReason := req.Reason
+		if plan.ExternalConfirmed {
+			failReason = failReason + " (external resolution confirmed)"
+		}
+		if err := r.resolveCycle(ctx, tx, c, state.CycleFailed, failReason); err != nil {
 			return false, err
 		}
 		for _, o := range c.allOrders() {
 			if !state.IsTerminalOrder(o.state) {
-				if err := r.resolveOrder(ctx, tx, o, state.OrderFailed, req.Reason); err != nil {
+				if err := r.resolveOrder(ctx, tx, o, state.OrderFailed, failReason); err != nil {
 					return false, err
 				}
 			}
 		}
-		// Lock released only when no exposure remains; never on the button alone.
-		if !c.netExposure().IsPositive() {
+		// Lock released only when the plan proved it safe (zero exposure or operator-
+		// confirmed external handling); never on the button alone.
+		if plan.LockReleased {
 			return r.releaseLock(ctx, tx, c.cycleID)
 		}
 		return false, nil

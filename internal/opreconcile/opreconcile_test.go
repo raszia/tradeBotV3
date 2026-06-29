@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -289,22 +290,92 @@ func TestKeepNeedsReconcileLockNotReleased(t *testing.T) {
 	}
 }
 
-func TestMarkFailedWithExposureKeepsLock(t *testing.T) {
+func TestMarkFailedWithOpenExposureRefusedKeptInReconcile(t *testing.T) {
 	f := setupR(t)
 	f.seed("1", "1", false, "", "") // exposure of 1, never sold
 	res, err := f.r.Apply(f.ctx, Request{CycleID: f.cycID, Action: ActionMarkFailed, Reason: "unrecoverable", Operator: "op1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if f.cycleState() != "FAILED" {
-		t.Errorf("cycle = %s, want FAILED", f.cycleState())
+	// CORRECTION: open/unknown exposure + no external confirmation must NOT move to the
+	// terminal FAILED state — the cycle stays in NEEDS_RECONCILE with the lock held.
+	if f.cycleState() != "NEEDS_RECONCILE" {
+		t.Errorf("cycle = %s, want NEEDS_RECONCILE (mark_failed refused with open exposure)", f.cycleState())
 	}
-	// Exposure remains -> the lock must NOT be released on a button alone.
 	if f.lockState() != "ACTIVE" || res.LockReleased {
-		t.Error("FAILED with open exposure must KEEP the lock")
+		t.Error("refused mark_failed must KEEP the lock")
+	}
+	if !res.Downgraded || !res.ExposureUnresolved {
+		t.Errorf("plan should record Downgraded + ExposureUnresolved, got %+v", res.Plan)
 	}
 	if len(res.Warnings) == 0 {
-		t.Error("expected a warning about stranded exposure")
+		t.Error("expected a warning explaining the refusal")
+	}
+	// It must still be audited, recording that exposure was open and it was NOT forced.
+	var confirmed int
+	f.db.QueryRow("SELECT external_resolution_confirmed FROM reconcile_resolutions WHERE cycle_id=? ORDER BY id DESC LIMIT 1", f.cycID).Scan(&confirmed)
+	if confirmed != 0 || f.auditCount() != 1 {
+		t.Errorf("refusal must be audited with external_resolution_confirmed=0 (got confirmed=%d, audits=%d)", confirmed, f.auditCount())
+	}
+}
+
+func TestMarkFailedForcedWithExternalConfirmation(t *testing.T) {
+	f := setupR(t)
+	f.seed("1", "1", false, "", "") // open exposure of 1
+	res, err := f.r.Apply(f.ctx, Request{
+		CycleID: f.cycID, Action: ActionMarkFailed, Reason: "give up",
+		ExternalResolutionConfirmed: true, ExternalResolutionReason: "sold the 1 BTC manually on the venue UI",
+		Operator: "op1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.cycleState() != "FAILED" || f.orderState(f.buyID) != "FAILED" {
+		t.Errorf("states = cyc:%s buy:%s, want FAILED/FAILED (forced)", f.cycleState(), f.orderState(f.buyID))
+	}
+	// Operator confirmed external handling -> lock released so the symbol is not blocked forever.
+	if f.lockState() != "RELEASED" || !res.LockReleased {
+		t.Errorf("forced FAILED with external confirmation should release the lock; got %s", f.lockState())
+	}
+	var confirmed int
+	var reason string
+	f.db.QueryRow("SELECT external_resolution_confirmed, reason FROM reconcile_resolutions WHERE cycle_id=? ORDER BY id DESC LIMIT 1", f.cycID).Scan(&confirmed, &reason)
+	if confirmed != 1 {
+		t.Error("audit must record external_resolution_confirmed=1")
+	}
+	if !strings.Contains(reason, "external_resolution_confirmed") {
+		t.Errorf("audit reason must record the external resolution, got %q", reason)
+	}
+}
+
+func TestMarkFailedForcedRequiresExternalReason(t *testing.T) {
+	f := setupR(t)
+	f.seed("1", "1", false, "", "")
+	_, err := f.r.Apply(f.ctx, Request{
+		CycleID: f.cycID, Action: ActionMarkFailed, Reason: "give up",
+		ExternalResolutionConfirmed: true, // but no ExternalResolutionReason
+		Operator:                    "op1",
+	})
+	if !IsValidation(err) {
+		t.Fatalf("err = %v, want ValidationError (external_resolution_reason required)", err)
+	}
+	if f.cycleState() != "NEEDS_RECONCILE" {
+		t.Error("a rejected forced-failed must not mutate state")
+	}
+}
+
+func TestMarkFailedZeroExposureAllowedWithWarning(t *testing.T) {
+	f := setupR(t)
+	f.seed("1", "0", false, "", "") // proven zero exposure
+	res, err := f.r.Apply(f.ctx, Request{CycleID: f.cycID, Action: ActionMarkFailed, Reason: "abandon", Operator: "op1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.cycleState() != "FAILED" || f.lockState() != "RELEASED" {
+		t.Errorf("zero-exposure FAILED should close + release lock; cyc:%s lock:%s", f.cycleState(), f.lockState())
+	}
+	if len(res.Warnings) == 0 {
+		t.Error("expected a warning preferring cancel_zero_exposure")
 	}
 }
 

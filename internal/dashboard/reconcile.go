@@ -143,6 +143,6 @@ func reconcileActions() []map[string]any {
 		{"action": opreconcile.ActionMarkSellPartiallyFilled, "needs_fill": true, "description": "record a partial sell → SELL_PARTIALLY_FILLED (lock held)"},
 		{"action": opreconcile.ActionMarkOrderCancelledZeroFill, "needs_fill": false, "description": "cancel one order with zero fill (cycle stays NEEDS_RECONCILE)"},
 		{"action": opreconcile.ActionKeepNeedsReconcile, "needs_fill": false, "description": "keep in NEEDS_RECONCILE (record an audit note only)"},
-		{"action": opreconcile.ActionMarkFailed, "needs_fill": false, "description": "mark unrecoverable FAILED (lock released only if no exposure)"},
+		{"action": opreconcile.ActionMarkFailed, "needs_fill": false, "description": "mark unrecoverable FAILED — REFUSED with open/unknown exposure unless external_resolution_confirmed=true + external_resolution_reason; lock released only when exposure is zero or externally confirmed"},
 	}
 }
