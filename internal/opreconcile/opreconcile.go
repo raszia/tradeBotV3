@@ -118,6 +118,11 @@ type Resolver struct {
 	db  *sql.DB
 	clk clock.Clock
 	log *slog.Logger
+	// faultBeforeCommit is a TEST-ONLY fault-injection hook (PR26). When non-nil it is
+	// invoked just before the apply transaction commits; returning an error forces a full
+	// rollback, proving an apply can never leave state/audit partially written. NEVER set in
+	// production (unexported — only same-package tests set it).
+	faultBeforeCommit func() error
 }
 
 // New builds a Resolver.
@@ -178,6 +183,11 @@ func (r *Resolver) Apply(ctx context.Context, req Request) (Result, error) {
 	auditID, err := r.writeAudit(ctx, tx, c, req, plan, before, after.snapshot())
 	if err != nil {
 		return Result{}, err
+	}
+	if r.faultBeforeCommit != nil {
+		if ferr := r.faultBeforeCommit(); ferr != nil {
+			return Result{}, ferr // deferred tx.Rollback() undoes EVERYTHING (state + audit)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Result{}, err

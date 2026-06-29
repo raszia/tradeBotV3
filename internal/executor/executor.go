@@ -56,6 +56,13 @@ type Config struct {
 	// Guard is the limited-live safety gate (PR20). In live mode it is the FINAL check
 	// before any real mutating send; nil disables the gate (non-live modes).
 	Guard *live.Guard
+	// faultAfterSend is a TEST-ONLY fault-injection hook (PR26). When non-nil it is invoked
+	// at the START of every post-send completion transaction; returning an error forces that
+	// transaction to roll back AFTER the exchange send has already happened — exercising the
+	// crash/rollback recovery paths (request stays IN_FLIGHT → sweeper → DEAD + reconcile,
+	// never re-sent). It is NEVER set in production (the field is unexported, so only
+	// same-package tests can set it).
+	faultAfterSend func() error
 }
 
 // Executor claims and processes exchange requests for a set of private clients.
@@ -285,10 +292,22 @@ func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, cl
 	e.deadReconcile(ctx, c, "place ambiguous outcome: "+err.Error())
 }
 
+// completionFault returns the test-only post-send fault (nil in production). Placed at the
+// start of every post-send completion tx so a forced error rolls the tx back AFTER the send.
+func (e *Executor) completionFault() error {
+	if e.cfg.faultAfterSend != nil {
+		return e.cfg.faultAfterSend()
+	}
+	return nil
+}
+
 // completePlaceSuccess records the PLACE result and schedules the cancel of the
 // remainder (simulated IOC) in ONE transaction (rule #9), via orders.OnPlaceAck.
 func (e *Executor) completePlaceSuccess(ctx context.Context, c queue.Claimed, ack execution.OrderAck, intent orders.BuyIntentPayload) {
 	err := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		if ferr := e.completionFault(); ferr != nil {
+			return ferr
+		}
 		return orders.OnPlaceAck(ctx, tx, e.q, orders.PlaceAckParams{
 			RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
 			Symbol: c.Symbol, Ack: ack, Intent: intent, RawResp: mustJSON(ack),
@@ -328,6 +347,9 @@ func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, c
 			return
 		}
 		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			if ferr := e.completionFault(); ferr != nil {
+				return ferr
+			}
 			return orders.OnCancelResult(ctx, tx, e.q, orders.CancelResultParams{
 				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
 				Symbol: c.Symbol, ExchangeOrderID: fp.ExchangeOrderID, LocalClientID: fp.LocalClientOrderID,
@@ -426,6 +448,9 @@ func (e *Executor) handleSellCancel(ctx, sendCtx context.Context, c queue.Claime
 	err := client.CancelOrder(sendCtx, fp.ExchangeOrderID)
 	if err == nil || isDefiniteRejection(err) {
 		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			if ferr := e.completionFault(); ferr != nil {
+				return ferr
+			}
 			return orders.OnSellCancelResult(ctx, tx, e.q, orders.SellCancelParams{
 				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, ExchangeID: c.ExchangeID,
 				Symbol: c.Symbol, ExchangeOrderID: fp.ExchangeOrderID,

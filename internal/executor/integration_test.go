@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,9 @@ type fakeClient struct {
 	balErr    error
 	getStatus execution.OrderStatus
 	getErr    error
+	// send counters (PR26 crash/rollback tests assert no blind resend).
+	placeCount  int32
+	cancelCount int32
 }
 
 func (f *fakeClient) Name() string { return f.code }
@@ -46,9 +50,13 @@ func (f *fakeClient) GetBalances(context.Context) ([]domain.Balance, error) {
 	return []domain.Balance{{Asset: "USDT", Available: decimal.RequireFromString("100")}}, nil
 }
 func (f *fakeClient) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderAck, error) {
+	atomic.AddInt32(&f.placeCount, 1)
 	return f.placeAck, f.placeErr
 }
-func (f *fakeClient) CancelOrder(context.Context, string) error { return f.cancelErr }
+func (f *fakeClient) CancelOrder(context.Context, string) error {
+	atomic.AddInt32(&f.cancelCount, 1)
+	return f.cancelErr
+}
 func (f *fakeClient) GetOrder(context.Context, string) (execution.OrderStatus, error) {
 	return f.getStatus, f.getErr
 }
