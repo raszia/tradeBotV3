@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR27 — Deploy packaging & local/staging dry-run readiness (Docker/compose + production.example.toml + DEPLOY runbook; safe-by-default, no live trading, no API keys).**
+Last updated: **PR2 correction — schema hardening (forward migration 025: signals FKs, operational indexes on comparison_events/signals, financial-value CHECK constraints). Built on the corrected PR1 (EnsureCurrent checksum/unknown-version enforcement).**
 
 ---
 
@@ -261,6 +261,18 @@ Implemented (**PR2**, migrations `002`–`007`):
 - **Discovery runs (007):** `market_discovery_runs`.
 - **PR4 (008):** adds `api_call_logs.exchange_code` (+ index) so the raw-API IO
   logger can attribute logs by exchange code.
+- **PR2 correction (025):** schema hardening, delivered as a FORWARD ALTER migration
+  (not an edit of 002/005/006 — applied migrations are immutable, per `EnsureCurrent`):
+  FKs `signals.exchange_id → exchanges.id` and `signals.config_version →
+  config_versions.id` (both NULLable; a NULL passes); operational indexes
+  `comparison_events(exchange_id, canonical_symbol, created_at)` and
+  `signals(exchange_id, canonical_symbol, created_at)` for "latest by exchange+symbol"
+  queries; and DB-level financial CHECK constraints — `orders` (quantity / filled ≥ 0,
+  filled ≤ quantity, limit_price / fee ≥ 0), `fills` (quantity / price / fee ≥ 0),
+  `exchange_markets` (tick / step ≥ 0 — 0 is the documented "no snap" sentinel; min
+  qty / min amount ≥ 0), and `wallet_balances_current` / `wallet_balance_history`
+  (available / locked / total ≥ 0 — spot wallets are non-negative). NULL columns keep
+  NULL semantics (a CHECK against NULL passes). No FK is added to a retention table.
 
 Planned (**PR15**): `market_regime_baskets`, `market_regime_basket_symbols`,
 `market_regime_timeframes`, `market_regime_current`, `market_regime_history`.
@@ -2123,6 +2135,18 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR2 (correction) — schema hardening as a forward migration**: the missing FKs
+  (`signals.exchange_id`, `signals.config_version`), operational indexes
+  (`comparison_events`/`signals` by exchange+symbol+created_at), and financial-value CHECK
+  constraints (`orders`/`fills`/`exchange_markets`/`wallet_balances_*`) ship as new migration
+  025 rather than edits to the original 002/005/006 files — consistent with the immutable-
+  applied-migrations rule enforced by the PR1 correction (`EnsureCurrent` would hard-fail any
+  DB that had applied the old checksums). `tick_size`/`step_size` use `>= 0` (not `> 0`)
+  because 0 is the system's documented "no snapping" sentinel; relaxed after the sellflow
+  fixtures surfaced it. No FK was added to a retention table (those stay FK-free for cheap
+  pruning). This branch is cut from the corrected PR1 branch, so it includes the
+  EnsureCurrent checksum/unknown-version fixes + the Makefile config-comment fix.
 
 - **PR1 (correction) — startup migration safety hardened**: `migrate.EnsureCurrent`/`Status`
   now verify the integrity of the APPLIED set, not just version presence — an edited
