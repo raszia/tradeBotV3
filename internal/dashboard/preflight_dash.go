@@ -30,11 +30,15 @@ func (s *Server) livePreflight(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, report)
 }
 
-// liveAcknowledgements lists the recorded acknowledgements (read-only; no secrets).
+// liveAcknowledgements lists the recorded acknowledgements (read-only; no secrets). An
+// `expired` flag is computed from the configured ack window so the dashboard shows when an
+// active ack has aged out (the guard enforces the same expiry before a live buy).
 func (s *Server) liveAcknowledgements(w http.ResponseWriter, r *http.Request) {
 	s.list(w, r, `
 SELECT la.id, la.operator, e.code AS exchange_code, la.canonical_symbol, la.credential_id,
-  la.preflight_hash, la.reason, la.active, la.acknowledged_at, la.revoked_at
+  la.preflight_hash, la.reason, la.active, la.acknowledged_at, la.revoked_at,
+  (la.active=1 AND TIMESTAMPDIFF(MINUTE, la.acknowledged_at, NOW(6)) >
+     COALESCE((SELECT canary_ack_max_age_minutes FROM live_controls WHERE id=1), 30)) AS expired
 FROM live_acknowledgements la JOIN exchanges e ON e.id=la.exchange_id
 ORDER BY la.id DESC LIMIT ?`, s.limit(r))
 }

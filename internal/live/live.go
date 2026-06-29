@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -32,10 +33,11 @@ type Controls struct {
 	MaxUnresolvedReconcile int
 	ConfigVersion          int64
 	// PR23 canary acknowledgement gate.
-	RequireCanaryAck bool
-	CanaryExchangeID int64
-	CanaryMarketID   int64
-	loaded           bool
+	RequireCanaryAck   bool
+	CanaryExchangeID   int64
+	CanaryMarketID     int64
+	CanaryAckMaxAgeMin int
+	loaded             bool
 }
 
 // Configured reports whether every required cap is set (a missing cap blocks live).
@@ -77,14 +79,14 @@ func NewGuard(db *sql.DB, clk clock.Clock, log *slog.Logger) *Guard {
 func (g *Guard) LoadControls(ctx context.Context) (Controls, error) {
 	var c Controls
 	var (
-		kill, reqAck                           int
-		maxOpen, maxDaily, maxConsec, maxUnres sql.NullInt64
-		maxDailyQuote, maxNotional, maxBase    sql.NullString
-		cfgVersion, canaryEx, canaryMk         sql.NullInt64
+		kill, reqAck                              int
+		maxOpen, maxDaily, maxConsec, maxUnres    sql.NullInt64
+		maxDailyQuote, maxNotional, maxBase       sql.NullString
+		cfgVersion, canaryEx, canaryMk, ackMaxAge sql.NullInt64
 	)
 	err := g.db.QueryRowContext(ctx,
-		"SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile, COALESCE(config_version,0), require_canary_ack, canary_exchange_id, canary_market_id FROM live_controls WHERE id=1").
-		Scan(&kill, &maxOpen, &maxDaily, &maxDailyQuote, &maxNotional, &maxBase, &maxConsec, &maxUnres, &cfgVersion, &reqAck, &canaryEx, &canaryMk)
+		"SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile, COALESCE(config_version,0), require_canary_ack, canary_exchange_id, canary_market_id, canary_ack_max_age_minutes FROM live_controls WHERE id=1").
+		Scan(&kill, &maxOpen, &maxDaily, &maxDailyQuote, &maxNotional, &maxBase, &maxConsec, &maxUnres, &cfgVersion, &reqAck, &canaryEx, &canaryMk, &ackMaxAge)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Controls{KillSwitch: true}, nil // no row => safe: kill switch engaged, unconfigured
 	}
@@ -104,6 +106,7 @@ func (g *Guard) LoadControls(ctx context.Context) (Controls, error) {
 	c.RequireCanaryAck = reqAck != 0
 	c.CanaryExchangeID = canaryEx.Int64
 	c.CanaryMarketID = canaryMk.Int64
+	c.CanaryAckMaxAgeMin = int(ackMaxAge.Int64)
 	return c, nil
 }
 
@@ -199,7 +202,7 @@ func (g *Guard) canaryAckOK(ctx context.Context, ctrl Controls, exchangeID, mark
 	if exchangeID != ctrl.CanaryExchangeID || marketID != ctrl.CanaryMarketID {
 		return deny("outside canary scope: only the acknowledged exchange/symbol may trade live")
 	}
-	ackHash, ok := preflight.ActiveAckHash(ctx, g.db, exchangeID, marketID)
+	ack, ok := preflight.ActiveAck(ctx, g.db, exchangeID, marketID)
 	if !ok {
 		return deny("no live acknowledgement: run preflight and acknowledge before live trading")
 	}
@@ -207,10 +210,29 @@ func (g *Guard) canaryAckOK(ctx context.Context, ctrl Controls, exchangeID, mark
 	if err != nil {
 		return deny("failed to compute preflight hash")
 	}
-	if ackHash != curHash {
+	if ack.Hash != curHash {
 		return deny("live acknowledgement is stale: config changed since preflight — re-run preflight and re-acknowledge")
 	}
+	// Expiry: a config-only hash cannot catch conditions that rot with time, so the
+	// acknowledgement itself ages out and must be renewed.
+	maxAge := g.canaryAckMaxAge(ctrl)
+	if g.clk.Now().UTC().Sub(ack.AcknowledgedAt) > maxAge {
+		return deny("live acknowledgement expired: re-run preflight and re-acknowledge")
+	}
+	// Dynamic re-check of the time-sensitive safety conditions immediately before the buy
+	// (credential/market/balance freshness, reconcile cap, stuck-IN_FLIGHT, dangerous queue).
+	if dok, reason := preflight.DynamicRecheck(ctx, g.db, g.clk, exchangeID, marketID); !dok {
+		return deny("live recheck failed: " + reason)
+	}
 	return allow("acknowledged")
+}
+
+func (g *Guard) canaryAckMaxAge(ctrl Controls) time.Duration {
+	m := ctrl.CanaryAckMaxAgeMin
+	if m <= 0 {
+		m = 30 // safe default
+	}
+	return time.Duration(m) * time.Minute
 }
 
 // CheckCancel gates a real CANCEL_ORDER. A cancel reduces risk, so it is permitted even

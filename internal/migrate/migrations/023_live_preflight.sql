@@ -16,6 +16,10 @@ ALTER TABLE live_controls
   ADD COLUMN IF NOT EXISTS market_data_max_age_seconds INT NULL,
   ADD COLUMN IF NOT EXISTS balance_max_age_minutes INT NULL,
   ADD COLUMN IF NOT EXISTS dry_run_success_max_age_minutes INT NULL,
+  -- an acknowledgement older than this is EXPIRED: a config-only hash cannot catch
+  -- conditions that rot with time, so the ack itself ages out and the guard re-checks the
+  -- dynamic safety conditions before every live buy (NULL -> a safe built-in default)
+  ADD COLUMN IF NOT EXISTS canary_ack_max_age_minutes INT NULL,
   -- when 1, private health must be OK to pass preflight; when 0, an unhealthy private
   -- probe is a WARNING the operator accepts (still recorded)
   ADD COLUMN IF NOT EXISTS health_required TINYINT(1) NOT NULL DEFAULT 0;

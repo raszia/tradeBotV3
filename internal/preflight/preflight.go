@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"v3TradeBot/internal/clock"
 )
@@ -60,6 +61,7 @@ const (
 	defMarketAgeSec = 30
 	defBalanceMin   = 10
 	defDryRunMin    = 1440
+	defCanaryAckMin = 30
 )
 
 // AckMissing/AckStale describe why a live ack is not usable (for the guard + dashboard).
@@ -106,6 +108,7 @@ type controls struct {
 	marketDataMaxSec     sql.NullInt64
 	balanceMaxMin        sql.NullInt64
 	dryRunSuccessMaxMin  sql.NullInt64
+	canaryAckMaxMin      sql.NullInt64
 	healthRequired       bool
 }
 
@@ -116,11 +119,11 @@ func loadControls(ctx context.Context, q querier) (controls, error) {
 SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty,
   max_consecutive_failures, max_unresolved_reconcile, require_canary_ack, canary_exchange_id, canary_market_id,
   credential_validation_max_age_minutes, market_data_max_age_seconds, balance_max_age_minutes,
-  dry_run_success_max_age_minutes, health_required
+  dry_run_success_max_age_minutes, canary_ack_max_age_minutes, health_required
 FROM live_controls WHERE id=1`).Scan(
 		&kill, &c.maxOpenCycles, &c.maxDailyOrders, &c.maxDailyQuote, &c.maxOrderNotional, &c.maxBaseQty,
 		&c.maxConsecFailures, &c.maxUnresolvedRecon, &reqAck, &c.canaryExchangeID, &c.canaryMarketID,
-		&c.credValidationMaxMin, &c.marketDataMaxSec, &c.balanceMaxMin, &c.dryRunSuccessMaxMin, &healthReq)
+		&c.credValidationMaxMin, &c.marketDataMaxSec, &c.balanceMaxMin, &c.dryRunSuccessMaxMin, &c.canaryAckMaxMin, &healthReq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return controls{exists: false, killSwitch: true}, nil
 	}
@@ -205,7 +208,7 @@ func (c *Checker) Run(ctx context.Context, exchangeID, marketID int64) (Report, 
 	c.checkHealth(ctx, exchangeID, ctrl, add)
 
 	// 7. balance freshness.
-	c.checkBalance(ctx, exchangeID, symbol, ctrl, add)
+	c.checkBalance(ctx, exchangeID, ctrl, add)
 
 	// 8. market data freshness (DB proxy: a recent comparison_event implies fresh Binance +
 	// Iranian books, since the engine writes one only when both are fresh).
@@ -332,76 +335,30 @@ func (c *Checker) checkHealth(ctx context.Context, exchangeID int64, ctrl contro
 	}
 }
 
-func (c *Checker) checkBalance(ctx context.Context, exchangeID int64, symbol string, ctrl controls, add func(string, Status, string)) {
-	var newest sql.NullTime
-	c.db.QueryRowContext(ctx, "SELECT MAX(COALESCE(last_seen_at, updated_at)) FROM wallet_balances_current WHERE exchange_id=?", exchangeID).Scan(&newest)
-	if !newest.Valid {
-		add("balance_recent", StatusFail, "no balance snapshot for the exchange (balance-sync has no data)")
-		return
-	}
-	maxAge := nullIntOr(ctrl.balanceMaxMin, defBalanceMin)
-	age := c.clk.Now().UTC().Sub(newest.Time)
-	if age.Minutes() > float64(maxAge) {
-		add("balance_recent", StatusFail, fmt.Sprintf("balance is %.0fm old (max %dm)", age.Minutes(), maxAge))
-	} else {
-		add("balance_recent", StatusPass, fmt.Sprintf("balance updated %.0fm ago", age.Minutes()))
-	}
+func (c *Checker) checkBalance(ctx context.Context, exchangeID int64, ctrl controls, add func(string, Status, string)) {
+	ok, detail := balanceFresh(ctx, c.db, c.clk, exchangeID, ctrl)
+	add("balance_recent", passFail(ok), detail)
 }
 
 func (c *Checker) checkMarketData(ctx context.Context, symbol string, ctrl controls, add func(string, Status, string)) {
-	maxAge := nullIntOr(ctrl.marketDataMaxSec, defMarketAgeSec)
-	var newest sql.NullTime
-	var hasBinance sql.NullBool
-	// A recent comparison_event means the engine had fresh Binance + Iranian books.
-	c.db.QueryRowContext(ctx,
-		"SELECT MAX(created_at), MAX(binance_price IS NOT NULL) FROM comparison_events WHERE canonical_symbol=?", symbol).
-		Scan(&newest, &hasBinance)
-	if !newest.Valid {
-		add("market_data_fresh", StatusFail, "no recent comparison_event for the symbol")
-		add("binance_reference_fresh", StatusFail, "no Binance reference (no comparison)")
-		add("iranian_market_fresh", StatusFail, "no Iranian book (no comparison)")
-		return
-	}
-	age := c.clk.Now().UTC().Sub(newest.Time)
-	fresh := age.Seconds() <= float64(maxAge)
-	st := StatusPass
-	if !fresh {
-		st = StatusFail
-	}
-	detail := fmt.Sprintf("last comparison %.0fs ago (max %ds)", age.Seconds(), maxAge)
-	add("market_data_fresh", st, detail)
-	if fresh && hasBinance.Bool {
+	ok, detail, hasBinance := marketFresh(ctx, c.db, c.clk, symbol, ctrl)
+	add("market_data_fresh", passFail(ok), detail)
+	if ok && hasBinance {
 		add("binance_reference_fresh", StatusPass, "Binance reference present in recent comparison")
 	} else {
-		add("binance_reference_fresh", st, "Binance reference "+detail)
+		add("binance_reference_fresh", passFail(ok), "Binance reference "+detail)
 	}
-	add("iranian_market_fresh", st, "Iranian book "+detail+" (implied by the comparison)")
+	add("iranian_market_fresh", passFail(ok), "Iranian book "+detail+" (implied by the comparison)")
 }
 
 func (c *Checker) checkReconcile(ctx context.Context, ctrl controls, add func(string, Status, string)) {
-	var n int
-	c.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM cycles WHERE dry_run=0 AND state='NEEDS_RECONCILE'").Scan(&n)
-	cap := int(nullIntOr(ctrl.maxUnresolvedRecon, 0))
-	if n > cap {
-		add("reconcile_within_cap", StatusFail, fmt.Sprintf("%d unresolved NEEDS_RECONCILE (cap %d)", n, cap))
-	} else {
-		add("reconcile_within_cap", StatusPass, fmt.Sprintf("%d unresolved NEEDS_RECONCILE (cap %d)", n, cap))
-	}
+	ok, detail := reconcileWithinCap(ctx, c.db, ctrl)
+	add("reconcile_within_cap", passFail(ok), detail)
 }
 
 func (c *Checker) checkStuckInflight(ctx context.Context, exchangeID int64, add func(string, Status, string)) {
-	// A mutating request IN_FLIGHT past its timeout is "stuck" (the sweeper should have
-	// reclaimed it). Any such row is a danger signal.
-	var n int
-	c.db.QueryRowContext(ctx, `
-SELECT COUNT(*) FROM exchange_requests
-WHERE exchange_id=? AND status='IN_FLIGHT' AND request_type IN ('PLACE_ORDER','CANCEL_ORDER')
-  AND inflight_at IS NOT NULL AND inflight_at < (NOW(6) - INTERVAL (timeout_ms/1000) SECOND)`, exchangeID).Scan(&n)
-	if n > 0 {
-		add("no_stuck_inflight", StatusFail, fmt.Sprintf("%d stuck IN_FLIGHT mutating request(s)", n))
-	} else {
-		add("no_stuck_inflight", StatusPass, "no stuck IN_FLIGHT mutating request")
-	}
+	ok, detail := noStuckInflight(ctx, c.db, exchangeID)
+	add("no_stuck_inflight", passFail(ok), detail)
 }
 
 func (c *Checker) checkStaleLock(ctx context.Context, add func(string, Status, string)) {
@@ -415,16 +372,105 @@ func (c *Checker) checkStaleLock(ctx context.Context, add func(string, Status, s
 }
 
 func (c *Checker) checkDangerousQueue(ctx context.Context, exchangeID int64, add func(string, Status, string)) {
-	// DEAD mutating requests tied to non-dry-run cycles are unresolved danger.
+	ok, detail := noDangerousQueue(ctx, c.db, exchangeID)
+	add("no_dangerous_queue_state", passFail(ok), detail)
+}
+
+// ---- dynamic safety predicates (shared by Run + DynamicRecheck) ----
+//
+// These are the TIME-SENSITIVE conditions that can rot after an acknowledgement even when
+// config does not change. The guard re-checks them immediately before every live buy, so a
+// config-only hash is never the sole gate.
+
+func credValidationFresh(ctx context.Context, q querier, clk clock.Clock, exchangeID int64, ctrl controls) (bool, string) {
+	var status string
+	var lastChecked sql.NullTime
+	err := q.QueryRowContext(ctx,
+		"SELECT status, last_checked_at FROM exchange_credentials WHERE exchange_id=? AND enabled=1 AND status='active' ORDER BY key_version DESC, id DESC LIMIT 1", exchangeID).
+		Scan(&status, &lastChecked)
+	if err != nil {
+		return false, "no active credential"
+	}
+	if !lastChecked.Valid {
+		return false, "credential never validated"
+	}
+	maxAge := nullIntOr(ctrl.credValidationMaxMin, defCredAgeMin)
+	age := clk.Now().UTC().Sub(lastChecked.Time)
+	if age.Minutes() > float64(maxAge) {
+		return false, fmt.Sprintf("credential validation %.0fm old (max %dm)", age.Minutes(), maxAge)
+	}
+	return true, fmt.Sprintf("validated %.0fm ago", age.Minutes())
+}
+
+func marketFresh(ctx context.Context, q querier, clk clock.Clock, symbol string, ctrl controls) (bool, string, bool) {
+	maxAge := nullIntOr(ctrl.marketDataMaxSec, defMarketAgeSec)
+	var newest sql.NullTime
+	var hasBinance sql.NullBool
+	q.QueryRowContext(ctx,
+		"SELECT MAX(created_at), MAX(binance_price IS NOT NULL) FROM comparison_events WHERE canonical_symbol=?", symbol).
+		Scan(&newest, &hasBinance)
+	if !newest.Valid {
+		return false, "no recent comparison_event for the symbol", false
+	}
+	age := clk.Now().UTC().Sub(newest.Time)
+	if age.Seconds() > float64(maxAge) {
+		return false, fmt.Sprintf("last comparison %.0fs ago (max %ds)", age.Seconds(), maxAge), hasBinance.Bool
+	}
+	return true, fmt.Sprintf("last comparison %.0fs ago (max %ds)", age.Seconds(), maxAge), hasBinance.Bool
+}
+
+func balanceFresh(ctx context.Context, q querier, clk clock.Clock, exchangeID int64, ctrl controls) (bool, string) {
+	var newest sql.NullTime
+	q.QueryRowContext(ctx, "SELECT MAX(COALESCE(last_seen_at, updated_at)) FROM wallet_balances_current WHERE exchange_id=?", exchangeID).Scan(&newest)
+	if !newest.Valid {
+		return false, "no balance snapshot (balance-sync has no data)"
+	}
+	maxAge := nullIntOr(ctrl.balanceMaxMin, defBalanceMin)
+	age := clk.Now().UTC().Sub(newest.Time)
+	if age.Minutes() > float64(maxAge) {
+		return false, fmt.Sprintf("balance %.0fm old (max %dm)", age.Minutes(), maxAge)
+	}
+	return true, fmt.Sprintf("balance updated %.0fm ago", age.Minutes())
+}
+
+func reconcileWithinCap(ctx context.Context, q querier, ctrl controls) (bool, string) {
 	var n int
-	c.db.QueryRowContext(ctx, `
+	q.QueryRowContext(ctx, "SELECT COUNT(*) FROM cycles WHERE dry_run=0 AND state='NEEDS_RECONCILE'").Scan(&n)
+	cap := int(nullIntOr(ctrl.maxUnresolvedRecon, 0))
+	if n > cap {
+		return false, fmt.Sprintf("%d unresolved NEEDS_RECONCILE (cap %d)", n, cap)
+	}
+	return true, fmt.Sprintf("%d unresolved NEEDS_RECONCILE (cap %d)", n, cap)
+}
+
+func noStuckInflight(ctx context.Context, q querier, exchangeID int64) (bool, string) {
+	var n int
+	q.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM exchange_requests
+WHERE exchange_id=? AND status='IN_FLIGHT' AND request_type IN ('PLACE_ORDER','CANCEL_ORDER')
+  AND inflight_at IS NOT NULL AND inflight_at < (NOW(6) - INTERVAL (timeout_ms/1000) SECOND)`, exchangeID).Scan(&n)
+	if n > 0 {
+		return false, fmt.Sprintf("%d stuck IN_FLIGHT mutating request(s)", n)
+	}
+	return true, "no stuck IN_FLIGHT mutating request"
+}
+
+func noDangerousQueue(ctx context.Context, q querier, exchangeID int64) (bool, string) {
+	var n int
+	q.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM exchange_requests er JOIN cycles c ON c.id=er.cycle_id
 WHERE er.exchange_id=? AND er.status='DEAD' AND er.request_type IN ('PLACE_ORDER','CANCEL_ORDER') AND c.dry_run=0`, exchangeID).Scan(&n)
 	if n > 0 {
-		add("no_dangerous_queue_state", StatusFail, fmt.Sprintf("%d DEAD mutating request(s) on real cycles", n))
-	} else {
-		add("no_dangerous_queue_state", StatusPass, "no DEAD mutating requests on real cycles")
+		return false, fmt.Sprintf("%d DEAD mutating request(s) on real cycles", n)
 	}
+	return true, "no DEAD mutating requests on real cycles"
+}
+
+func passFail(ok bool) Status {
+	if ok {
+		return StatusPass
+	}
+	return StatusFail
 }
 
 func (c *Checker) checkDryRun(ctx context.Context, marketID int64, ctrl controls, add func(string, Status, string)) {
@@ -561,17 +607,71 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	return id, report, nil
 }
 
-// ActiveAckHash returns the preflight_hash of the active acknowledgement for the
-// exchange/market (used by the guard to verify the ack still matches current config).
-func ActiveAckHash(ctx context.Context, q querier, exchangeID, marketID int64) (string, bool) {
-	var h string
+// AckInfo is the active acknowledgement the guard checks (hash + age + id).
+type AckInfo struct {
+	ID             int64
+	Hash           string
+	AcknowledgedAt time.Time
+}
+
+// ActiveAck returns the active acknowledgement for the exchange/market (used by the guard
+// to verify the ack still matches config AND has not expired).
+func ActiveAck(ctx context.Context, q querier, exchangeID, marketID int64) (AckInfo, bool) {
+	var a AckInfo
 	err := q.QueryRowContext(ctx,
-		"SELECT preflight_hash FROM live_acknowledgements WHERE exchange_id=? AND exchange_market_id=? AND active=1 ORDER BY id DESC LIMIT 1",
-		exchangeID, marketID).Scan(&h)
+		"SELECT id, preflight_hash, acknowledged_at FROM live_acknowledgements WHERE exchange_id=? AND exchange_market_id=? AND active=1 ORDER BY id DESC LIMIT 1",
+		exchangeID, marketID).Scan(&a.ID, &a.Hash, &a.AcknowledgedAt)
 	if err != nil {
-		return "", false
+		return AckInfo{}, false
 	}
-	return h, true
+	return a, true
+}
+
+// AckMaxAge returns the configured acknowledgement expiry window (default if unset). It is
+// read from live_controls so the guard and dashboard agree on "expired".
+func AckMaxAge(ctx context.Context, q querier) time.Duration {
+	ctrl, err := loadControls(ctx, q)
+	if err != nil {
+		return defCanaryAckMin * time.Minute
+	}
+	return time.Duration(nullIntOr(ctrl.canaryAckMaxMin, defCanaryAckMin)) * time.Minute
+}
+
+// DynamicRecheck re-evaluates ONLY the time-sensitive safety conditions (the ones a
+// config-only hash cannot catch) for a live buy: credential validation freshness, market
+// data freshness, balance freshness, unresolved-reconcile cap, no stuck IN_FLIGHT mutating
+// request, no dangerous (DEAD) queue state. It returns ok + the first failing reason. It is
+// read-only and contacts no exchange.
+func DynamicRecheck(ctx context.Context, db *sql.DB, clk clock.Clock, exchangeID, marketID int64) (bool, string) {
+	if clk == nil {
+		clk = clock.NewSystem()
+	}
+	ctrl, err := loadControls(ctx, db)
+	if err != nil {
+		return false, "failed to load live controls"
+	}
+	var symbol string
+	_ = db.QueryRowContext(ctx, "SELECT canonical_symbol FROM exchange_markets WHERE id=?", marketID).Scan(&symbol)
+
+	if ok, d := credValidationFresh(ctx, db, clk, exchangeID, ctrl); !ok {
+		return false, "credential: " + d
+	}
+	if ok, d, _ := marketFresh(ctx, db, clk, symbol, ctrl); !ok {
+		return false, "market data: " + d
+	}
+	if ok, d := balanceFresh(ctx, db, clk, exchangeID, ctrl); !ok {
+		return false, "balance: " + d
+	}
+	if ok, d := reconcileWithinCap(ctx, db, ctrl); !ok {
+		return false, "reconcile: " + d
+	}
+	if ok, d := noStuckInflight(ctx, db, exchangeID); !ok {
+		return false, "queue: " + d
+	}
+	if ok, d := noDangerousQueue(ctx, db, exchangeID); !ok {
+		return false, "queue: " + d
+	}
+	return true, "dynamic safety conditions ok"
 }
 
 // ---- small helpers ----

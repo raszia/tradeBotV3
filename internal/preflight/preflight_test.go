@@ -194,11 +194,12 @@ func TestPreflightFailsUnresolvedReconcileExceedsCap(t *testing.T) {
 
 func TestPreflightFailsStuckInflight(t *testing.T) {
 	f := setupPF(t)
+	uniq := fmt.Sprintf("%d_%d", time.Now().UnixNano(), pfseq)
 	cyc := f.lastID(f.exec("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state, dry_run) VALUES (?, ?, ?, 'BUY_SUBMITTED', 0)", f.mkID, f.exID, f.symbol))
-	ord := f.lastID(f.exec("INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, quantity) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'SUBMITTED', '1')", cyc, f.exID, f.mkID, fmt.Sprintf("o%d", pfseq)))
+	ord := f.lastID(f.exec("INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, quantity) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'SUBMITTED', '1')", cyc, f.exID, f.mkID, "o"+uniq))
 	// A PLACE_ORDER stuck IN_FLIGHT past its timeout.
 	f.exec(`INSERT INTO exchange_requests (exchange_id, cycle_id, order_id, request_type, status, idempotency_key, payload, timeout_ms, inflight_at)
-		VALUES (?, ?, ?, 'PLACE_ORDER', 'IN_FLIGHT', ?, '{}', 1000, NOW(6) - INTERVAL 1 HOUR)`, f.exID, cyc, ord, fmt.Sprintf("idem%d", pfseq))
+		VALUES (?, ?, ?, 'PLACE_ORDER', 'IN_FLIGHT', ?, '{}', 1000, NOW(6) - INTERVAL 1 HOUR)`, f.exID, cyc, ord, "idem"+uniq)
 	r := f.run()
 	if r.Ready || !failed(r, "no_stuck_inflight") {
 		t.Errorf("expected no_stuck_inflight to fail; ready=%v", r.Ready)
@@ -277,8 +278,8 @@ func TestConfigChangeInvalidatesAcknowledgement(t *testing.T) {
 		t.Error("changing a cap must change the config hash (ack should become stale)")
 	}
 	// The stored active ack still has the OLD hash.
-	stored, ok := ActiveAckHash(f.ctx, f.db, f.exID, f.mkID)
-	if !ok || stored == newHash {
+	stored, ok := ActiveAck(f.ctx, f.db, f.exID, f.mkID)
+	if !ok || stored.Hash == newHash {
 		t.Error("active ack should still hold the old hash (now != current config)")
 	}
 }
