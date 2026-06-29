@@ -121,6 +121,22 @@ func (s *Server) requireCredentialOperator(h func(http.ResponseWriter, *http.Req
 	}
 }
 
+// requireAdmin wraps a handler that only an admin may call (e.g. activating canary live).
+func (s *Server) requireAdmin(h func(http.ResponseWriter, *http.Request, operator)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		op, ok := s.authenticate(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+			return
+		}
+		if op.role != RoleAdmin {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin role required"})
+			return
+		}
+		h(w, r, op)
+	}
+}
+
 func bearerToken(header string) string {
 	const p = "Bearer "
 	if strings.HasPrefix(header, p) {

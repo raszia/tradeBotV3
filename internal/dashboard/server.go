@@ -20,6 +20,7 @@ import (
 	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/credentials"
 	"v3TradeBot/internal/opreconcile"
+	"v3TradeBot/internal/preflight"
 	"v3TradeBot/internal/regime"
 )
 
@@ -66,6 +67,7 @@ type Server struct {
 	regStore    *regime.Store
 	resolver    *opreconcile.Resolver
 	provisioner *credentials.Provisioner
+	preflight   *preflight.Checker
 	cfg         Config
 	log         *slog.Logger
 }
@@ -81,6 +83,7 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 		s.cfgStore = configstore.New(db)
 		s.regStore = regime.NewStore(db)
 		s.resolver = opreconcile.New(db, nil, log)
+		s.preflight = preflight.New(db, nil, log, cfg.ExecutionMode)
 		// Credential provisioning (PR22) needs the master key; an empty key leaves the
 		// provisioner nil and the create/rotate/disable endpoints respond safe-disabled.
 		if cfg.MasterKey != "" {
@@ -147,6 +150,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/credentials", s.requireCredentialOperator(s.createCredential))
 	mux.HandleFunc("POST /api/credentials/rotate", s.requireCredentialOperator(s.rotateCredential))
 	mux.HandleFunc("POST /api/credentials/{id}/disable", s.requireCredentialOperator(s.disableCredential))
+
+	// Live preflight + canary acknowledgement (PR23). Preflight + ack list are read-only;
+	// acknowledging (activating canary live) requires admin. None of these place/cancel.
+	mux.HandleFunc("GET /api/live/preflight", s.livePreflight)
+	mux.HandleFunc("GET /api/live/acknowledgements", s.liveAcknowledgements)
+	mux.HandleFunc("POST /api/live/acknowledge", s.requireAdmin(s.liveAcknowledge))
 	return mux
 }
 

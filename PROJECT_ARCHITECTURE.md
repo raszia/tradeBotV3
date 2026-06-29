@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR22 — Credential provisioning & rotation tooling (encrypt-in-memory, audited).**
+Last updated: **PR23 — Live preflight & canary rollout controls (readiness checklist + acknowledgement gate).**
 
 ---
 
@@ -1655,6 +1655,64 @@ old/new status, old/new key_version, reason, and timestamp — **no secret mater
 optional offline encrypt-and-insert CLI for first-token bootstrap (the same `Provisioner`
 would back it). HSM/KMS-backed master keys remain future work.
 
+## 16g. Live preflight & canary rollout (PR23 — `internal/preflight`)
+
+PR23 adds a strict, read-only **readiness checklist** plus an explicit operator
+**acknowledgement** that the live guard enforces — so live trading cannot start by accident
+even when credentials, caps, and live controls all exist. Preflight does **not** replace
+the PR20 executor guard; both are mandatory.
+
+**Read-only checker (`preflight.Checker`).** Holds ONLY a DB handle (reflection guard: no
+place/cancel/balance/order method) — it never contacts an exchange and never mutates trading
+state. `GET /api/live/preflight` runs it for the target exchange/market (defaults to the
+configured canary scope) and returns a `Report` with a per-check pass/fail/warn list, the
+failing/warning names, overall `ready`, and a `config_hash`.
+
+**Checks** (all DB-only, read-only): execution mode is live (the executor derives
+AllowLiveExecution from it); kill-switch state known + disengaged; exchange + symbol
+live-enabled; caps configured + sane (+ canary expects `max_open_cycles=1`); credential
+exists/enabled/active/validated and validation **fresh** (within
+`credential_validation_max_age_minutes`); private health ok (or a WARN accepted when
+`health_required=0`); balance-sync data recent; market data fresh (a recent
+`comparison_event` — which the engine writes only when **both** Binance + Iranian books are
+fresh — so it covers Binance-reference + Iranian-market freshness); unresolved
+NEEDS_RECONCILE within cap; no stuck IN_FLIGHT mutating request; no stale (expired ACTIVE)
+symbol lock; no DEAD mutating request on a real cycle; a recent successful **dry-run**
+(CLOSED) for the same exchange/symbol; the auth path (an enabled dashboard token exists);
+and the audit path (`live_audit` present). Freshness windows live in `live_controls`
+(migration 023; NULL → a safe built-in default).
+
+**Preflight config hash + acknowledgement.** `ConfigHash` hashes the **config-relevant**
+inputs (mode, caps, live flags, canary scope, credential identity, freshness windows,
+ack requirement) — deliberately EXCLUDING ephemeral values (market freshness, balances, the
+kill switch), so a market tick does not invalidate an ack but a config change does. `POST
+/api/live/acknowledge` (admin only) re-runs preflight, refuses unless `ready` (HTTP 409 with
+the failing checks), then records a `live_acknowledgements` row bound to the current
+`config_hash` (deactivating any prior ack) with operator, exchange, symbol, credential id,
+caps snapshot, and reason.
+
+**Canary gate in the guard (the teeth).** When `live_controls.require_canary_ack=1`
+(default), the PR20 guard's live-BUY path additionally requires: the order is within the
+configured canary exchange/symbol scope **and** an ACTIVE acknowledgement exists whose
+`preflight_hash` still equals the freshly-recomputed `ConfigHash`. A missing ack, an
+out-of-scope market, or a stale ack (config changed since acknowledgement) DENIES the buy.
+Combined with `max_open_cycles=1` and the single canary exchange/symbol, this is the
+one-exchange / one-symbol / one-cycle / one-buy-at-a-time canary. Sells/cancels are
+unaffected (risk-reducing).
+
+**No exchange mutation.** Preflight reads DB state only; it places/cancels nothing and runs
+no real exchange call. (The read-only credential validation that feeds the freshness check
+is PR20a/PR22's balance read, recorded separately.)
+
+**Dashboard visibility.** `GET /api/live/preflight` (status, failed checks, warnings,
+credential-validation age, market/balance freshness, dry-run last success, unresolved
+reconcile, kill switch) + `GET /api/live/acknowledgements` (canary ack status, read-only).
+
+**What remains after PR23.** Wiring the canary scope/freshness windows through the config
+dashboard UI (set via SQL/admin today), and an "accept this warning" workflow for the
+health WARN. The first real live order is still gated by both the acknowledgement and the
+PR20 guard.
+
 ## 17. Safety rules (the hard rules)
 
 1. **No real order before it is recorded.** create cycle/order/request in MySQL →
@@ -1693,6 +1751,15 @@ would back it). HSM/KMS-backed master keys remain future work.
 
 ## 18. Known limitations (current)
 
+- **Live preflight + canary ship a JSON API; the canary scope/freshness windows are set via
+  SQL/admin, not a config UI yet.** PR23 delivers the read-only `GET /api/live/preflight`,
+  `GET /api/live/acknowledgements`, and the admin `POST /api/live/acknowledge`, plus the
+  guard-enforced acknowledgement gate. Operators still set `live_controls.canary_exchange_id`
+  / `canary_market_id` / freshness windows / `require_canary_ack` directly (no dedicated
+  editor). The private-health WARN is accepted automatically when `health_required=0`; a
+  per-warning "accept" workflow is future work. Market-data freshness is a DB proxy (a recent
+  `comparison_event`), so it reflects what the engine last computed rather than a live Redis
+  read. No real live order has been executed end-to-end against a venue (rule #3).
 - **Credential provisioning ships a JSON API, not a UI or CLI yet.** PR22 delivers
   create/rotate/disable/validate via the `Provisioner` + authenticated dashboard endpoints,
   but no bespoke credential UI and no offline encrypt-and-insert CLI (useful for first-token
@@ -1811,11 +1878,29 @@ processing), PR11 (sell + repricing), PR13 (balance sync), PR14 (health),
 PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer), PR20a (credential
 decryption + real private-client wiring), PR21 (operator resolution for `NEEDS_RECONCILE`),
-PR22 (credential provisioning & rotation tooling). **Remaining:** bespoke UIs for credential
-provisioning + operator reconciliation (both ship JSON APIs + audit today), an optional
-offline encrypt-and-insert CLI for first-token bootstrap, and HSM/KMS-backed master keys.
+PR22 (credential provisioning & rotation tooling), PR23 (live preflight & canary rollout
+controls). **Remaining:** bespoke UIs for credential provisioning + operator reconciliation +
+canary/preflight config (all ship JSON APIs + audit today), an optional offline
+encrypt-and-insert CLI for first-token bootstrap, HSM/KMS-backed master keys, and a real
+end-to-end live order against a venue (rule #3 keeps tests venue-free).
 
 ## 19a. Decisions log
+
+- **PR23 — preflight is read-only; the acknowledgement is the gate**: `preflight.Checker`
+  (DB handle only, reflection guard: no exchange method) runs the full readiness checklist
+  and never mutates trading state. A live BUY additionally requires an operator
+  acknowledgement bound to the preflight `config_hash`, enforced inside the PR20 guard — so
+  accidental live trading is blocked even with creds/caps/controls present.
+- **PR23 — the config hash binds config, not ephemera**: `ConfigHash` covers caps, live
+  flags, canary scope, credential identity, freshness windows, mode + ack requirement;
+  excludes market freshness/balances/kill switch. So a config change invalidates a prior ack
+  (re-acknowledge required) but a market tick does not.
+- **PR23 — canary = require_canary_ack(default 1) + single scope + max_open_cycles=1**: the
+  guard restricts live buys to the configured canary exchange/symbol with a valid ack; the
+  cap of one open cycle yields one-buy-at-a-time. Market-data freshness is proxied by a
+  recent `comparison_event` (engine writes only when Binance + Iranian books are both fresh),
+  keeping preflight DB-only (no Redis dependency). Migration 023 adds the freshness/canary
+  columns + `live_acknowledgements`.
 
 - **PR22 — credential provisioning encrypts in memory, stores only ciphertext**:
   `Provisioner.Create`/`Rotate` use the PR20a `secrets.Cipher` (AES-256-GCM,
@@ -2222,4 +2307,5 @@ offline encrypt-and-insert CLI for first-token bootstrap, and HSM/KMS-backed mas
 | PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
 | PR20a | `pr20a-credential-decryption` | **accepted** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |
 | PR21 | `pr21-operator-reconcile` | **accepted** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button). mark_failed safety: FAILED is terminal, so with open/unknown exposure it is REFUSED (kept in NEEDS_RECONCILE, lock held, audited) unless the operator sets external_resolution_confirmed=true + a mandatory external_resolution_reason (then FAILED + lock released, audited with the flag); proven zero exposure allowed but prefers cancel_zero_exposure. Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required, mark_failed-open-exposure-refused+kept-in-reconcile, mark_failed-forced-with-external-confirmation, forced-requires-external-reason, zero-exposure-failed-warns) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). Correction: `mark_failed` refuses to strand open/unknown exposure (kept in NEEDS_RECONCILE) unless explicitly forced with `external_resolution_confirmed`+reason (migration 021 adds the audit column). |
-| PR22 | `pr22-credential-provisioning` | **in review** | `internal/credentials.Provisioner` + dashboard endpoints + migration 022 (`credential_audit`): operator create/rotate/disable/validate of exchange credentials. Plaintext exists ONLY in memory: Create/Rotate encrypt each secret with the PR20a `secrets.Cipher` (AES-256-GCM, `nonce‖ciphertext‖tag`, key=SHA-256(master key)) and store ONLY ciphertext — never logged (log-capture test), never returned (API responds id+status only), never audited. Master key from the config file only (no runtime env); empty key → `ErrNoMasterKey` → endpoints safe-disabled (503); wrong key cannot decrypt (PR20a ErrDecrypt). Create: exchange/label/key_version/algorithm(only AES-256-GCM)/enabled/status(enum)/api_key/api_secret/optional passphrase + mandatory reason; duplicate (exchange,label) → 400. Rotate: new active at key_version+1 (derived `…#vN` label) + disable ALL previously-active in one tx → exactly one active credential (no ambiguity); PR20a provider resolves to the new secret. Disable: enabled=0/status=disabled, KEEPS the row (secrets not deleted), provider ignores it. Validate: read-only balance read via the narrow `BalanceReader` (cannot place/cancel), stamps status + audits. Authz: create/rotate/disable require `credential_operator`/`admin` (`requireCredentialOperator` → 401/403); viewer/config_operator/reconcile_operator refused. Dashboard shows status only (`GET /api/credentials`, `/api/credentials/audit`) — never key material/blob/plaintext. Audit `credential_audit` (exchange/credential/operator/action/old+new status/old+new key_version/reason; no secrets). Tests: gated credentials (create-encrypts+roundtrips+no-plaintext-in-blob/logs, wrong-master-key-cannot-decrypt, duplicate-label→400, input validation, create-audit, rotation-activates-new+disables-old+single-active+both-audited, disable-ignored-by-provider+row-kept, validate-read-only+audit, no-master-key→ErrNoMasterKey) + gated dashboard (create/disable 401/bad/403-for-viewer+config_operator+reconcile_operator, create-via-http-returns-no-secrets+stores-ciphertext, invalid→400, disable-via-http, audit-endpoint-no-secrets). No real network in any test; validation cannot place/cancel; no runtime env var. |
+| PR22 | `pr22-credential-provisioning` | **accepted** | `internal/credentials.Provisioner` + dashboard endpoints + migration 022 (`credential_audit`): operator create/rotate/disable/validate of exchange credentials. Plaintext exists ONLY in memory: Create/Rotate encrypt each secret with the PR20a `secrets.Cipher` (AES-256-GCM, `nonce‖ciphertext‖tag`, key=SHA-256(master key)) and store ONLY ciphertext — never logged (log-capture test), never returned (API responds id+status only), never audited. Master key from the config file only (no runtime env); empty key → `ErrNoMasterKey` → endpoints safe-disabled (503); wrong key cannot decrypt (PR20a ErrDecrypt). Create: exchange/label/key_version/algorithm(only AES-256-GCM)/enabled/status(enum)/api_key/api_secret/optional passphrase + mandatory reason; duplicate (exchange,label) → 400. Rotate: new active at key_version+1 (derived `…#vN` label) + disable ALL previously-active in one tx → exactly one active credential (no ambiguity); PR20a provider resolves to the new secret. Disable: enabled=0/status=disabled, KEEPS the row (secrets not deleted), provider ignores it. Validate: read-only balance read via the narrow `BalanceReader` (cannot place/cancel), stamps status + audits. Authz: create/rotate/disable require `credential_operator`/`admin` (`requireCredentialOperator` → 401/403); viewer/config_operator/reconcile_operator refused. Dashboard shows status only (`GET /api/credentials`, `/api/credentials/audit`) — never key material/blob/plaintext. Audit `credential_audit` (exchange/credential/operator/action/old+new status/old+new key_version/reason; no secrets). Tests: gated credentials (create-encrypts+roundtrips+no-plaintext-in-blob/logs, wrong-master-key-cannot-decrypt, duplicate-label→400, input validation, create-audit, rotation-activates-new+disables-old+single-active+both-audited, disable-ignored-by-provider+row-kept, validate-read-only+audit, no-master-key→ErrNoMasterKey) + gated dashboard (create/disable 401/bad/403-for-viewer+config_operator+reconcile_operator, create-via-http-returns-no-secrets+stores-ciphertext, invalid→400, disable-via-http, audit-endpoint-no-secrets). No real network in any test; validation cannot place/cancel; no runtime env var. |
+| PR23 | `pr23-live-preflight` | **in review** | `internal/preflight` + `internal/live` (canary ack gate) + dashboard endpoints + migration 023 (`live_controls` freshness/canary cols + `live_acknowledgements`): strict read-only live readiness checklist + an explicit operator acknowledgement the guard enforces, so live trading can't start accidentally even with creds/caps/controls. `preflight.Checker` (DB handle only — reflection guard: no place/cancel/balance/order; no exchange import; mutates nothing): `Run` produces a Report (per-check pass/fail/warn, failures/warnings, ready, config_hash). Checks: execution-mode-live, kill-switch known+disengaged, exchange+symbol live-enabled, caps configured+sane (+canary max_open_cycles=1), credential exists/enabled/active/validated + validation-fresh (credential_validation_max_age_minutes), private-health ok (WARN accepted when health_required=0), balance recent, market-data fresh (recent comparison_event ⇒ Binance+Iranian fresh), reconcile within cap, no stuck IN_FLIGHT mutating, no stale lock, no DEAD mutating on real cycles, recent dry-run CLOSED for the exchange/symbol, auth path (enabled token), audit path (live_audit). `ConfigHash` covers config-relevant inputs only (caps/live-flags/canary/credential-identity/freshness/mode/ack-req — excludes market freshness/balances/kill-switch). `POST /api/live/acknowledge` (admin) re-runs preflight, refuses unless ready (409), records `live_acknowledgements` bound to the config hash (operator/exchange/symbol/credential/caps/reason), deactivating any prior. Guard (require_canary_ack default 1): a live BUY must be within the canary exchange/symbol scope AND covered by an active ack whose preflight_hash == current ConfigHash — missing/out-of-scope/stale → deny; sells+cancels unaffected. `GET /api/live/preflight` + `GET /api/live/acknowledgements` read-only. No exchange mutation; preflight places/cancels nothing. PR20 guard remains mandatory. Tests: offline (checker-holds-no-exchange-client) + gated preflight (passes-when-ready, fails on credential-missing/validation-stale/kill-switch/caps-missing/market-stale/balance-stale/reconcile-over-cap/stuck-inflight/no-recent-dry-run, does-not-mutate, ack-records-operator+hash, ack-refused-when-not-ready, config-change-invalidates-ack) + gated live (canary-ack-required+stale-after-config-change, canary-scope-restricts-to-one-market, ack-required-but-scope-unset) + gated dashboard (preflight-read-only, acknowledge-requires-admin [401/403 viewer+config+credential+reconcile, 200 admin records operator+hash], not-ready→409). No real network in any test. |

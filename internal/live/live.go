@@ -16,6 +16,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"v3TradeBot/internal/clock"
+	"v3TradeBot/internal/preflight"
 )
 
 // Controls is the global live-control row (caps + kill switch). A nil/zero cap means
@@ -30,7 +31,11 @@ type Controls struct {
 	MaxConsecutiveFailures int
 	MaxUnresolvedReconcile int
 	ConfigVersion          int64
-	loaded                 bool
+	// PR23 canary acknowledgement gate.
+	RequireCanaryAck bool
+	CanaryExchangeID int64
+	CanaryMarketID   int64
+	loaded           bool
 }
 
 // Configured reports whether every required cap is set (a missing cap blocks live).
@@ -72,14 +77,14 @@ func NewGuard(db *sql.DB, clk clock.Clock, log *slog.Logger) *Guard {
 func (g *Guard) LoadControls(ctx context.Context) (Controls, error) {
 	var c Controls
 	var (
-		kill                                   int
+		kill, reqAck                           int
 		maxOpen, maxDaily, maxConsec, maxUnres sql.NullInt64
 		maxDailyQuote, maxNotional, maxBase    sql.NullString
-		cfgVersion                             sql.NullInt64
+		cfgVersion, canaryEx, canaryMk         sql.NullInt64
 	)
 	err := g.db.QueryRowContext(ctx,
-		"SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile, COALESCE(config_version,0) FROM live_controls WHERE id=1").
-		Scan(&kill, &maxOpen, &maxDaily, &maxDailyQuote, &maxNotional, &maxBase, &maxConsec, &maxUnres, &cfgVersion)
+		"SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile, COALESCE(config_version,0), require_canary_ack, canary_exchange_id, canary_market_id FROM live_controls WHERE id=1").
+		Scan(&kill, &maxOpen, &maxDaily, &maxDailyQuote, &maxNotional, &maxBase, &maxConsec, &maxUnres, &cfgVersion, &reqAck, &canaryEx, &canaryMk)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Controls{KillSwitch: true}, nil // no row => safe: kill switch engaged, unconfigured
 	}
@@ -96,6 +101,9 @@ func (g *Guard) LoadControls(ctx context.Context) (Controls, error) {
 	c.MaxOrderNotional = decOrZero(maxNotional)
 	c.MaxBaseQty = decOrZero(maxBase)
 	c.ConfigVersion = cfgVersion.Int64
+	c.RequireCanaryAck = reqAck != 0
+	c.CanaryExchangeID = canaryEx.Int64
+	c.CanaryMarketID = canaryMk.Int64
 	return c, nil
 }
 
@@ -161,7 +169,7 @@ func (g *Guard) checkPlace(ctx context.Context, p PlaceCheck) Decision {
 	if g.dailyQuote(ctx).Add(p.Notional).GreaterThan(ctrl.MaxDailyQuote) {
 		return deny("max daily quote exposure reached")
 	}
-	// BUY-only: kill switch + open-cycle cap (new exposure).
+	// BUY-only: kill switch + open-cycle cap (new exposure) + canary acknowledgement.
 	if p.Side == "buy" {
 		if ctrl.KillSwitch {
 			return deny("kill switch engaged: no new buy orders")
@@ -169,8 +177,40 @@ func (g *Guard) checkPlace(ctx context.Context, p PlaceCheck) Decision {
 		if g.openCycles(ctx) > ctrl.MaxOpenCycles {
 			return deny("max open cycles reached")
 		}
+		if d := g.canaryAckOK(ctx, ctrl, p.ExchangeID, p.ExchangeMarketID); !d.Allow {
+			return d
+		}
 	}
 	return allow("ok")
+}
+
+// canaryAckOK enforces the PR23 canary acknowledgement gate for a live BUY: when
+// require_canary_ack is on, the buy must be within the configured canary exchange/symbol
+// scope AND covered by an ACTIVE acknowledgement whose preflight hash still matches the
+// current config (so a config change since the operator acknowledged invalidates it). This
+// is what prevents accidental live trading even when credentials/caps/live flags exist.
+func (g *Guard) canaryAckOK(ctx context.Context, ctrl Controls, exchangeID, marketID int64) Decision {
+	if !ctrl.RequireCanaryAck {
+		return allow("ack not required")
+	}
+	if ctrl.CanaryExchangeID == 0 || ctrl.CanaryMarketID == 0 {
+		return deny("canary acknowledgement required but canary scope is not configured")
+	}
+	if exchangeID != ctrl.CanaryExchangeID || marketID != ctrl.CanaryMarketID {
+		return deny("outside canary scope: only the acknowledged exchange/symbol may trade live")
+	}
+	ackHash, ok := preflight.ActiveAckHash(ctx, g.db, exchangeID, marketID)
+	if !ok {
+		return deny("no live acknowledgement: run preflight and acknowledge before live trading")
+	}
+	curHash, err := preflight.ConfigHash(ctx, g.db, exchangeID, marketID, "live")
+	if err != nil {
+		return deny("failed to compute preflight hash")
+	}
+	if ackHash != curHash {
+		return deny("live acknowledgement is stale: config changed since preflight — re-run preflight and re-acknowledge")
+	}
+	return allow("acknowledged")
 }
 
 // CheckCancel gates a real CANCEL_ORDER. A cancel reduces risk, so it is permitted even
@@ -210,6 +250,9 @@ func (g *Guard) AllowNewBuyCycle(ctx context.Context, exchangeID, exchangeMarket
 	}
 	if g.openCycles(ctx) >= ctrl.MaxOpenCycles {
 		return deny("max open cycles reached")
+	}
+	if d := g.canaryAckOK(ctx, ctrl, exchangeID, exchangeMarketID); !d.Allow {
+		return d
 	}
 	return allow("ok")
 }

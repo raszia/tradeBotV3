@@ -35,8 +35,9 @@ func (it *intg) liveControls(killSwitch int, withCreds bool) {
 	it.db.Exec("DELETE FROM live_controls")
 	// Count-based caps are HUGE so shared-DB pollution (other packages' non-dry-run
 	// cycles/orders) never trips the gate; these tests exercise kill-switch/creds/flags.
-	it.db.Exec(`INSERT INTO live_controls (id, kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile)
-		VALUES (1, ?, 1000000000, 1000000000, '1000000000000000', '100000', '1000', 1000000000, 1000000000)`, killSwitch)
+	// require_canary_ack=0: the PR23 canary-ack gate is covered by its own tests.
+	it.db.Exec(`INSERT INTO live_controls (id, kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty, max_consecutive_failures, max_unresolved_reconcile, require_canary_ack)
+		VALUES (1, ?, 1000000000, 1000000000, '1000000000000000', '100000', '1000', 1000000000, 1000000000, 0)`, killSwitch)
 }
 
 func (it *intg) liveAuditCount(decision string) int {
