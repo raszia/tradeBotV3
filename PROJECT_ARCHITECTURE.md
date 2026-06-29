@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR20a — Credential decryption & real private-client wiring (gated by the PR20 live guard).**
+Last updated: **PR21 — Operator resolution for NEEDS_RECONCILE (authenticated, audited, explicit).**
 
 ---
 
@@ -1517,6 +1517,72 @@ insert tool** (credentials are inserted out-of-band today; `secrets.Encrypt` is 
 building block). The first real live rollout is still gated tiny by the PR20 caps. The
 operator exit from `NEEDS_RECONCILE` remains a dedicated future PR.
 
+## 16e. Operator resolution for NEEDS_RECONCILE (PR21 — `internal/opreconcile`)
+
+`NEEDS_RECONCILE` is a holding state with **no automatic exit** (PR3). PR21 adds the ONLY
+exit: an authenticated operator's explicit, validated, audited resolution. It is a LOCAL
+tool — it contacts **no exchange** (the `opreconcile.Resolver` holds only a DB handle; a
+reflection guard asserts no Place/Cancel surface), there is **no blind/one-click close**,
+and every state change goes through `internal/state`.
+
+**Operator-only state-machine exit.** `internal/state` gains `ApplyCycleResolution` /
+`ApplyOrderResolution` — separate from the normal trading map so the engine/executor can
+never exit `NEEDS_RECONCILE`. They require `From=NEEDS_RECONCILE` and a `To` in an explicit
+whitelist (cycle: BUY_FILLED / BUY_PARTIALLY_FILLED / SELL_PARTIALLY_FILLED / SELL_FILLED /
+CANCELLED / FAILED / CLOSED; order: FILLED / PARTIALLY_FILLED / CANCELLED / FAILED), with
+the same version-guarded CAS + event-row write as any transition. An illegal target is
+rejected (`ErrNotReconcileResolution`).
+
+**Auth + roles.** List/detail/audit are read-only; **preview/apply require a
+`reconcile_operator` or `admin` bearer token** (`requireReconcileOperator`: 401 no/invalid
+token, 403 insufficient role). A viewer / config-only user cannot resolve. The
+authenticated operator name is recorded in the audit (never taken from the request body).
+
+**No blind resolution — preview then apply.** `GET /api/reconcile/{id}` shows the full
+context an operator must see first: cycle, exchange + symbol, every order (local + exchange
+order id + last state), fills, queue requests, state events, locks, recent logs, the
+`NEEDS_RECONCILE` reason (last entering event), a balance snapshot for the base asset, prior
+resolutions, and the available actions. `POST …/preview` returns the **exact** proposed
+state changes + warnings and writes nothing; `POST …/apply` re-validates in one tx and
+applies. A `reason` is mandatory on apply.
+
+**Resolution actions.** `cancel_zero_exposure` (no exposure → cancel cycle+orders, release
+lock), `attach_exchange_order_id` (set the id, no state change), `mark_buy_filled` (record
+fill → BUY_FILLED, lock held — sell resumes), `mark_buy_zero_filled` (→ CANCELLED, release
+lock), `mark_sell_filled` (record full-exit fill → CLOSED + PnL accounting, release lock),
+`mark_sell_partially_filled` (→ SELL_PARTIALLY_FILLED, lock held), `mark_order_cancelled_zero_fill`
+(cancel one order, cycle stays NEEDS_RECONCILE), `keep_needs_reconcile` (audit only),
+`mark_failed` (→ FAILED; lock released **only** if no exposure, else kept + warning). Each
+validates its required fields.
+
+**Lock safety.** A symbol lock is released **only** when the resolution proves no remaining
+exposure (net inventory = 0) or a full safe exit — never because a button was clicked. A
+`mark_failed` (or any action) with open exposure keeps the lock and surfaces a warning.
+
+**Fill safety.** Operator-supplied fills validate side (matches the order role), positive
+quantity + price, non-negative fee, a fee asset when a fee is given, and a fill id (for
+dedup). They reject oversell (buy: filled+qty ≤ ordered; sell: total sold+qty ≤ bought) and
+a duplicate fill id (the `(order_id, exchange_fill_id)` unique key), update the order's
+cumulative `filled_quantity`/`avg_fill_price`/`quote_spent`/`fee`, and on a closing sell run
+the shared PnL accounting (`orders.ResolveCloseFromReconcile`).
+
+**Balance cross-check (advisory).** When `wallet_balances_current` has the base asset, the
+preview/apply compares the resolution's implied exposure to the balance and adds a
+**warning** if they materially disagree (>1%). It never auto-blocks.
+
+**No exchange mutation.** PR21 places/cancels nothing. The only allowed exchange activity
+elsewhere is the existing read-only balance/health/reconcile reads (PR20a); the resolution
+tool itself does no exchange I/O.
+
+**Audit (`reconcile_resolutions`; migration 021).** Every applied resolution writes an
+immutable row: operator, timestamp, cycle id, order id, action, old/new cycle + order
+states, reason, supplied fill JSON, before/after snapshots, and whether the lock was
+released. Preview writes nothing.
+
+**What remains after PR21.** A richer operator UI (this PR ships the JSON API + a static
+action catalog), and optionally a read-only exchange status fetch button surfaced in the
+detail view (the data path exists via PR20a read-only clients; PR21 does not wire it).
+
 ## 17. Safety rules (the hard rules)
 
 1. **No real order before it is recorded.** create cycle/order/request in MySQL →
@@ -1555,6 +1621,13 @@ operator exit from `NEEDS_RECONCILE` remains a dedicated future PR.
 
 ## 18. Known limitations (current)
 
+- **Operator reconciliation ships a JSON API + static action catalog, not a rich UI.** PR21
+  delivers the list/detail/preview/apply/audit endpoints (auth: `reconcile_operator`/`admin`)
+  but no bespoke operator front-end. The detail view does not yet offer a live read-only
+  exchange status-fetch button (the read-only client path exists via PR20a; wiring it into
+  the detail view is a later refinement). The balance cross-check is a single-asset advisory
+  heuristic (base asset, 1% tolerance), never a hard block. `mark_failed` with open exposure
+  deliberately keeps the lock — the operator must first record/sell the inventory.
 - **Live is wired but credentials are provisioned out-of-band.** PR20a builds real private
   clients (factory + in-memory decryption) gated by the unchanged PR20 guard, but there is
   **no provisioning/rotation UI or encrypt-and-insert CLI yet** — encrypted credential rows
@@ -1658,11 +1731,31 @@ PR8 (engine signal loop), PR9 (cycle/lock/buy enqueue), PR10 (order-status/fill
 processing), PR11 (sell + repricing), PR13 (balance sync), PR14 (health),
 PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer), PR20a (credential
-decryption + real private-client wiring). **Remaining:** a credential provisioning/
-rotation UI + an encrypt-and-insert CLI (credentials are inserted out-of-band today), and
-the operator exit from `NEEDS_RECONCILE`.
+decryption + real private-client wiring), PR21 (operator resolution for `NEEDS_RECONCILE`).
+**Remaining:** a credential provisioning/rotation UI + an encrypt-and-insert CLI
+(credentials are inserted out-of-band today), and a richer operator reconciliation UI
+(the JSON API + audit ship in PR21).
 
 ## 19a. Decisions log
+
+- **PR21 — NEEDS_RECONCILE has exactly one exit: an operator resolution**: a dedicated
+  state-machine path (`ApplyCycleResolution`/`ApplyOrderResolution`) separate from the
+  trading map, gated to `From=NEEDS_RECONCILE` + an explicit target whitelist, so the
+  automatic flow can never exit and an illegal target is rejected. Every change still goes
+  through `internal/state` (CAS + event row).
+- **PR21 — no blind close**: the operator must see the full context (`GET /api/reconcile/
+  {id}`) and a `preview` (exact proposed changes, zero mutation) before an `apply`; a reason
+  is mandatory. Preview/apply require `reconcile_operator`/`admin`; list/detail/audit are
+  read-only.
+- **PR21 — lock released only on proven no-exposure**: the symbol lock is released only when
+  net inventory = 0 / full safe exit; `mark_failed` (or anything) with open exposure keeps
+  the lock + warns. Never released on the button alone.
+- **PR21 — fill safety**: operator fills validate side/qty/price/fee/fee-asset, reject
+  oversell + duplicate fill id (`(order_id, exchange_fill_id)` unique), update cumulative
+  order fields, and reuse `orders.ResolveCloseFromReconcile` for closing PnL accounting.
+- **PR21 — local tool, no exchange mutation**: the `opreconcile.Resolver` holds only a DB
+  handle (reflection guard: no Place/Cancel); a balance cross-check is advisory (warns, never
+  auto-blocks). Audited immutably in `reconcile_resolutions` (migration 021).
 
 - **PR20a — credentials decrypt in memory only, gated by the unchanged PR20 guard**:
   `internal/secrets` (AES-256-GCM, `nonce||ciphertext||tag`, key=SHA-256(master key)) +
@@ -2030,4 +2123,5 @@ the operator exit from `NEEDS_RECONCILE`.
 | PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
 | PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
 | PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
-| PR20a | `pr20a-credential-decryption` | **in review** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |
+| PR20a | `pr20a-credential-decryption` | **accepted** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |
+| PR21 | `pr21-operator-reconcile` | **in review** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button; mark_failed with exposure keeps lock + warns). Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). |

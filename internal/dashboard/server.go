@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"v3TradeBot/internal/configstore"
+	"v3TradeBot/internal/opreconcile"
 	"v3TradeBot/internal/regime"
 )
 
@@ -58,6 +59,7 @@ type Server struct {
 	db       *sql.DB
 	cfgStore *configstore.Store
 	regStore *regime.Store
+	resolver *opreconcile.Resolver
 	cfg      Config
 	log      *slog.Logger
 }
@@ -72,6 +74,7 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if db != nil {
 		s.cfgStore = configstore.New(db)
 		s.regStore = regime.NewStore(db)
+		s.resolver = opreconcile.New(db, nil, log)
 	}
 	return s
 }
@@ -112,6 +115,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/config/regime/basket/{id}", s.requireConfigOperator(s.editRegimeBasket))
 	mux.HandleFunc("POST /api/config/regime/basket/{id}/symbol", s.requireConfigOperator(s.editRegimeSymbol))
 	mux.HandleFunc("POST /api/config/regime/basket/{id}/timeframe", s.requireConfigOperator(s.editRegimeTimeframe))
+
+	// Operator reconciliation (PR21): inspect + resolve NEEDS_RECONCILE. List/detail/audit
+	// are read-only; preview/apply require an authenticated reconcile_operator/admin. The
+	// tool never places/cancels orders (local resolution only).
+	mux.HandleFunc("GET /api/reconcile", s.reconcileList)
+	mux.HandleFunc("GET /api/reconcile/audit", s.reconcileAudit)
+	mux.HandleFunc("GET /api/reconcile/{id}", s.reconcileDetail)
+	mux.HandleFunc("POST /api/reconcile/{id}/preview", s.requireReconcileOperator(s.reconcilePreview))
+	mux.HandleFunc("POST /api/reconcile/{id}/apply", s.requireReconcileOperator(s.reconcileApply))
 	return mux
 }
 

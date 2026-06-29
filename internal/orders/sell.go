@@ -251,6 +251,28 @@ func ProcessSellStatus(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellSt
 // denominated in the quote currency; fees in other assets are stored raw but not
 // folded into realized_quote (so it is not silently wrong).
 func closeCycleWithPnL(ctx context.Context, tx *sql.Tx, cycleID int64, scope, reason string) (bool, error) {
+	_ = scope // the lock is released by cycle (ActiveByCycle), not by scope string
+	if err := writeCloseAccounting(ctx, tx, cycleID, reason); err != nil {
+		return false, err
+	}
+	if err := resolveCycleTo(ctx, tx, cycleID, state.CycleClosed, "closed", reason); err != nil {
+		return false, err
+	}
+	// Fully exited -> no exposure -> release the lock.
+	if lock, ok, err := symbollock.ActiveByCycle(ctx, tx, cycleID); err != nil {
+		return false, err
+	} else if ok {
+		return true, symbollock.Release(ctx, tx, lock.ID)
+	}
+	return false, nil
+}
+
+// writeCloseAccounting computes exit/PnL accounting from the recorded buy + sell order
+// fills and stamps it onto the cycle (sold qty, avg sell, sell quote/fee, net qty,
+// realized_quote, close reason, closed_at). realized_quote nets ONLY quote-denominated
+// fees (non-quote fees are stored raw). It writes no state transition and contacts no
+// exchange — shared by the automatic close and the operator resolution close.
+func writeCloseAccounting(ctx context.Context, tx *sql.Tx, cycleID int64, reason string) error {
 	var (
 		canonical                   string
 		buyQty, buyQuote, buyFee    decimal.Decimal
@@ -282,18 +304,38 @@ FROM orders WHERE cycle_id=? AND role='exit_sell'`, cycleID).Scan(&sellQty, &sel
 	}
 	net := buyQty.Sub(sellQty)
 
-	if _, err := tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 UPDATE cycles SET sold_quantity=?, avg_sell_price=?, sell_quote=?, sell_fee=?, sell_fee_asset=?,
   net_quantity=?, realized_quote=?, close_reason=?, closed_at=NOW(6)
 WHERE id=?`,
 		sellQty.String(), decimalOrNull(avgSell), decimalOrNull(sellQuote), decimalOrNull(sellFee), sellFeeAsset,
-		net.String(), realized.String(), reason, cycleID); err != nil {
+		net.String(), realized.String(), reason, cycleID)
+	return err
+}
+
+// ResolveCloseFromReconcile finalizes a NEEDS_RECONCILE cycle as CLOSED with full PnL
+// accounting + symbol-lock release, using the operator-resolution transition (the
+// operator-path analogue of the automatic close). It contacts NO exchange. The caller
+// (the reconciliation tool) must have already recorded any operator-supplied fills onto
+// the orders so the accounting reads correct cumulative quantities. Returns whether the
+// lock was released. The cycle MUST currently be NEEDS_RECONCILE.
+func ResolveCloseFromReconcile(ctx context.Context, tx *sql.Tx, cycleID int64, reason string) (bool, error) {
+	if err := writeCloseAccounting(ctx, tx, cycleID, reason); err != nil {
 		return false, err
 	}
-	if err := resolveCycleTo(ctx, tx, cycleID, state.CycleClosed, "closed", reason); err != nil {
+	cur, ver, err := readCycle(ctx, tx, cycleID)
+	if err != nil {
 		return false, err
 	}
-	// Fully exited -> no exposure -> release the lock.
+	if cur != state.CycleNeedsReconcile {
+		return false, fmt.Errorf("orders: ResolveCloseFromReconcile expects NEEDS_RECONCILE, got %s (cycle %d)", cur, cycleID)
+	}
+	if _, err := state.ApplyCycleResolution(ctx, tx, state.CycleTransition{
+		CycleID: cycleID, From: cur, To: state.CycleClosed, Version: ver,
+		EventType: "operator_resolution", Reason: reason,
+	}); err != nil {
+		return false, err
+	}
 	if lock, ok, err := symbollock.ActiveByCycle(ctx, tx, cycleID); err != nil {
 		return false, err
 	} else if ok {

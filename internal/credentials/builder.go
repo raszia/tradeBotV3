@@ -44,7 +44,7 @@ func (b *Builder) BuildPrivate(ctx context.Context, code string) (exchanges.Priv
 // balance/health/reconcile reads do not need it, only order placement does).
 func (b *Builder) loadSymbols(ctx context.Context, code string) map[string]string {
 	rows, err := b.db.QueryContext(ctx,
-		"SELECT em.canonical_symbol, em.exchange_symbol FROM exchange_markets em JOIN exchanges e ON e.id=em.exchange_id WHERE e.code=? AND em.enabled=1",
+		"SELECT em.canonical_symbol, em.exchange_symbol FROM exchange_markets em JOIN exchanges e ON e.id=em.exchange_id WHERE e.code=?",
 		code)
 	if err != nil {
 		return nil

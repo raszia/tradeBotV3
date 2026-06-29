@@ -16,6 +16,7 @@ const (
 	RoleViewer             = "viewer"
 	RoleConfigOperator     = "config_operator"
 	RoleCredentialOperator = "credential_operator"
+	RoleReconcileOperator  = "reconcile_operator"
 	RoleAdmin              = "admin"
 )
 
@@ -64,6 +65,31 @@ func (s *Server) requireConfigOperator(h func(http.ResponseWriter, *http.Request
 		}
 		if !canEditConfig(op.role) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient role for config editing"})
+			return
+		}
+		h(w, r, op)
+	}
+}
+
+// canResolveReconcile reports whether a role may resolve NEEDS_RECONCILE cases. Only a
+// dedicated reconcile_operator or an admin — a viewer/config-only user must not (a
+// resolution can close cycles + release locks, so it is gated like the riskiest action).
+func canResolveReconcile(role string) bool {
+	return role == RoleReconcileOperator || role == RoleAdmin
+}
+
+// requireReconcileOperator wraps a resolution handler with authentication + authorization:
+// 401 when no/invalid token, 403 when the role is insufficient. The authenticated operator
+// is passed through so the resolution audit records who acted.
+func (s *Server) requireReconcileOperator(h func(http.ResponseWriter, *http.Request, operator)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		op, ok := s.authenticate(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+			return
+		}
+		if !canResolveReconcile(op.role) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient role for reconciliation resolution"})
 			return
 		}
 		h(w, r, op)
