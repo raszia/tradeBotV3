@@ -5,7 +5,7 @@
 > queue/config/recovery behaviour, a safety rule, a limitation, or a deferral)
 > MUST update this file in the same PR. Outdated docs are treated as a bug.
 
-Last updated: **PR24 — First real canary live-run instrumentation (session start/stop + first-order checklist + audit correlation).**
+Last updated: **PR25 — Real canary execution runbook & production hardening (startup safety summary + emergency-stop + audit export + operator warnings).**
 
 ---
 
@@ -1765,9 +1765,58 @@ acknowledgement status, session status, kill switch, and the request/order/cycle
 secrets** (credential status only). It is idempotent (only the first buy writes it).
 
 **What remains after PR24.** A live operator console UI (this PR ships the JSON API), and the
-actual first venue order (rule #3 keeps tests venue-free; PR20a real-client wiring + a real
-master key + a started session are the remaining operational prerequisites). Broadening
-beyond the single canary scope is explicitly out of scope.
+actual first venue order. PR20a's real private-client wiring is **already complete** — the
+remaining prerequisites for a real order are purely operational: a real master key
+configured, a real encrypted credential provisioned + recently validated, live config
+enabled, caps configured, the kill switch intentionally disengaged, preflight passing, an
+active (non-expired) acknowledgement, an active canary session, and an operator watching the
+dashboard/live audit. Broadening beyond the single canary scope is explicitly out of scope.
+
+## 16i. Real canary execution: runbook & production hardening (PR25)
+
+PR25 prepares the system for the **first real venue canary order** with an explicit operator
+runbook, startup safety reporting, operator warnings, emergency-stop behavior, and a per-run
+audit export. It does **not** broaden live scope (still one exchange / one symbol / one open
+cycle / tiny notional, gated by preflight + acknowledgement + active session).
+
+**Operator runbook (`RUNBOOK.md`).** Step-by-step for the first live run: provision a
+credential → validate (read-only) → configure caps + canary scope → run a dry-run → run
+preflight → acknowledge → disengage the kill switch → start the session → watch the first
+order → stop the session → engage the kill switch → inspect/export the live audit → resolve
+`NEEDS_RECONCILE`. Includes the emergency-stop behavior table by cycle state.
+
+**Startup safety summary (`live.BuildSafetySummary`).** Each live-capable binary
+(`order-executor`, `trade-engine`) logs a one-line, **secret-free** startup snapshot:
+execution mode, live enabled, kill switch, canary exchange + symbol, caps configured,
+credential **status**, active session, and **whether new live buys are currently allowed**
+(the full guard verdict for the canary scope). Read-only; writes nothing.
+
+**Recent dry-run precedes the first live buy.** `StartSession` now also requires a recent
+successful dry-run (CLOSED) for the exchange/symbol (`preflight.RecentDryRunOK`), in addition
+to the preflight readiness it already implied — so a live buy is never the first time that
+exchange/symbol path runs. Visible in preflight (`recent_dry_run_success`) + warnings.
+
+**Operator warnings (`GET /api/live/warnings`).** Read-only, severity-tagged warnings for
+live-danger states: live mode enabled, kill switch disengaged, session active, first order
+pending vs **sent**, unresolved `NEEDS_RECONCILE`, and stale balance / market / credential
+validation.
+
+**Emergency stop.** Stopping the session (scope-local) or engaging the kill switch (global)
+blocks new buys **immediately** while risk-reducing **sell / cancel / status** paths keep
+working (they never pass the canary buy gate). Neither recalls an already-sent request; the
+executor/reconciler continue their conservative handling (ambiguous → `NEEDS_RECONCILE`,
+never blind-resent). The per-cycle-state matrix is documented + tested.
+
+**Live audit export (`GET /api/live/session/export`).** Read-only, **secret-free** bundle for
+a session (the active one or `?session_id=`): the session, preflight hash, acknowledgement,
+caps, requests, orders, allow **decisions**, **denials**, the first-order checklist, and the
+stop reason — using the PR24 `live_audit` session correlation.
+
+**What remains after PR25.** A bespoke live operator console UI (all of the above ship as
+JSON APIs + a runbook), and the actual first venue order — which now needs only the
+operational pre-reqs in `RUNBOOK.md` (real master key, provisioned + validated credential,
+live config + caps, kill switch deliberately off, passing preflight, active non-expired
+acknowledgement, active session, operator watching). Rule #3 keeps tests venue-free.
 
 ## 17. Safety rules (the hard rules)
 
@@ -1807,6 +1856,13 @@ beyond the single canary scope is explicitly out of scope.
 
 ## 18. Known limitations (current)
 
+- **No real venue order has executed yet; PR25 ships the runbook + hardening, not a console.**
+  `RUNBOOK.md` + the startup safety summary + operator warnings + the per-session audit export
+  are all in place, but the first real order is an operational action still pending its
+  pre-reqs (real master key, provisioned+validated credential, deliberate kill-switch-off,
+  passing preflight, active acknowledgement + session). The live operator console remains a
+  JSON-API-only surface (no bespoke UI). The warnings/export read from DB state; market-data
+  freshness is the `comparison_event` proxy. Rule #3 keeps tests venue-free.
 - **The canary run session ships a JSON API + audit, not a live operator console.** PR24
   adds `POST /api/live/session/start|stop` (admin) + `GET /api/live/session` + the
   first-order checklist + live_audit correlation, but no bespoke UI. The actual first venue
@@ -1941,13 +1997,25 @@ PR15 (regime), PR16 (dashboard read views), PR17 (dashboard config editing),
 PR18 (retention), PR19 (dry-run), PR20 (limited-live safety layer), PR20a (credential
 decryption + real private-client wiring), PR21 (operator resolution for `NEEDS_RECONCILE`),
 PR22 (credential provisioning & rotation tooling), PR23 (live preflight & canary rollout
-controls), PR24 (first real canary live-run instrumentation). **Remaining:** bespoke UIs for
-credential provisioning + operator reconciliation + canary/preflight config + the live
-operator console (all ship JSON APIs + audit today), an optional offline encrypt-and-insert
-CLI for first-token bootstrap, HSM/KMS-backed master keys, and a real end-to-end live order
+controls), PR24 (first real canary live-run instrumentation), PR25 (real canary execution runbook &
+production hardening). **Remaining:** bespoke UIs for credential provisioning + operator
+reconciliation + canary/preflight config + the live operator console (all ship JSON APIs +
+audit + a runbook today), an optional offline encrypt-and-insert CLI for first-token
+bootstrap, HSM/KMS-backed master keys, and the operator-driven first end-to-end live order
 against a venue (rule #3 keeps tests venue-free).
 
 ## 19a. Decisions log
+
+- **PR25 — production hardening for the first canary order, no scope change**: a `RUNBOOK.md`
+  operator runbook + a secret-free startup safety summary logged by each live-capable binary
+  (`live.BuildSafetySummary`) + operator warnings (`GET /api/live/warnings`) + a secret-free
+  per-session live-audit export (`GET /api/live/session/export`). Emergency stop (session stop
+  or kill switch) blocks new buys immediately, keeps sell/cancel/status, recalls nothing
+  already sent — documented + tested per cycle state.
+- **PR25 — a recent dry-run must precede the first live buy**: `StartSession` enforces
+  `preflight.RecentDryRunOK` for the exchange/symbol (a live buy is never the first run of
+  that path). Also fixed `asInt` to parse driver `[]byte`/`float64` ids so session-view
+  counts + the audit export correlate correctly.
 
 - **PR24 — a live run session makes the first order observable + stoppable, without
   broadening scope**: `live_run_sessions` (migration 024) records operator/scope/credential/
@@ -2393,4 +2461,5 @@ against a venue (rule #3 keeps tests venue-free).
 | PR21 | `pr21-operator-reconcile` | **accepted** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button). mark_failed safety: FAILED is terminal, so with open/unknown exposure it is REFUSED (kept in NEEDS_RECONCILE, lock held, audited) unless the operator sets external_resolution_confirmed=true + a mandatory external_resolution_reason (then FAILED + lock released, audited with the flag); proven zero exposure allowed but prefers cancel_zero_exposure. Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required, mark_failed-open-exposure-refused+kept-in-reconcile, mark_failed-forced-with-external-confirmation, forced-requires-external-reason, zero-exposure-failed-warns) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). Correction: `mark_failed` refuses to strand open/unknown exposure (kept in NEEDS_RECONCILE) unless explicitly forced with `external_resolution_confirmed`+reason (migration 021 adds the audit column). |
 | PR22 | `pr22-credential-provisioning` | **accepted** | `internal/credentials.Provisioner` + dashboard endpoints + migration 022 (`credential_audit`): operator create/rotate/disable/validate of exchange credentials. Plaintext exists ONLY in memory: Create/Rotate encrypt each secret with the PR20a `secrets.Cipher` (AES-256-GCM, `nonce‖ciphertext‖tag`, key=SHA-256(master key)) and store ONLY ciphertext — never logged (log-capture test), never returned (API responds id+status only), never audited. Master key from the config file only (no runtime env); empty key → `ErrNoMasterKey` → endpoints safe-disabled (503); wrong key cannot decrypt (PR20a ErrDecrypt). Create: exchange/label/key_version/algorithm(only AES-256-GCM)/enabled/status(enum)/api_key/api_secret/optional passphrase + mandatory reason; duplicate (exchange,label) → 400. Rotate: new active at key_version+1 (derived `…#vN` label) + disable ALL previously-active in one tx → exactly one active credential (no ambiguity); PR20a provider resolves to the new secret. Disable: enabled=0/status=disabled, KEEPS the row (secrets not deleted), provider ignores it. Validate: read-only balance read via the narrow `BalanceReader` (cannot place/cancel), stamps status + audits. Authz: create/rotate/disable require `credential_operator`/`admin` (`requireCredentialOperator` → 401/403); viewer/config_operator/reconcile_operator refused. Dashboard shows status only (`GET /api/credentials`, `/api/credentials/audit`) — never key material/blob/plaintext. Audit `credential_audit` (exchange/credential/operator/action/old+new status/old+new key_version/reason; no secrets). Tests: gated credentials (create-encrypts+roundtrips+no-plaintext-in-blob/logs, wrong-master-key-cannot-decrypt, duplicate-label→400, input validation, create-audit, rotation-activates-new+disables-old+single-active+both-audited, disable-ignored-by-provider+row-kept, validate-read-only+audit, no-master-key→ErrNoMasterKey) + gated dashboard (create/disable 401/bad/403-for-viewer+config_operator+reconcile_operator, create-via-http-returns-no-secrets+stores-ciphertext, invalid→400, disable-via-http, audit-endpoint-no-secrets). No real network in any test; validation cannot place/cancel; no runtime env var. |
 | PR23 | `pr23-live-preflight` | **accepted** | `internal/preflight` + `internal/live` (canary ack gate) + dashboard endpoints + migration 023 (`live_controls` freshness/canary cols + `live_acknowledgements`): strict read-only live readiness checklist + an explicit operator acknowledgement the guard enforces, so live trading can't start accidentally even with creds/caps/controls. `preflight.Checker` (DB handle only — reflection guard: no place/cancel/balance/order; no exchange import; mutates nothing): `Run` produces a Report (per-check pass/fail/warn, failures/warnings, ready, config_hash). Checks: execution-mode-live, kill-switch known+disengaged, exchange+symbol live-enabled, caps configured+sane (+canary max_open_cycles=1), credential exists/enabled/active/validated + validation-fresh (credential_validation_max_age_minutes), private-health ok (WARN accepted when health_required=0), balance recent, market-data fresh (recent comparison_event ⇒ Binance+Iranian fresh), reconcile within cap, no stuck IN_FLIGHT mutating, no stale lock, no DEAD mutating on real cycles, recent dry-run CLOSED for the exchange/symbol, auth path (enabled token), audit path (live_audit). `ConfigHash` covers config-relevant inputs only (caps/live-flags/canary/credential-identity/freshness/mode/ack-req — excludes market freshness/balances/kill-switch). `POST /api/live/acknowledge` (admin) re-runs preflight, refuses unless ready (409), records `live_acknowledgements` bound to the config hash (operator/exchange/symbol/credential/caps/reason), deactivating any prior. Guard (require_canary_ack default 1): a live BUY must be within the canary exchange/symbol scope AND covered by an active ack whose preflight_hash == current ConfigHash AND not expired (canary_ack_max_age_minutes) AND pass a dynamic re-check (credential/market/balance freshness, reconcile cap, stuck IN_FLIGHT, dangerous queue) — missing/out-of-scope/stale/expired/dynamic-fail → deny; sells+cancels unaffected. `GET /api/live/preflight` + `GET /api/live/acknowledgements` (with an `expired` flag) read-only. No exchange mutation; preflight places/cancels nothing. PR20 guard remains mandatory. Tests: offline (checker-holds-no-exchange-client) + gated preflight (passes-when-ready, fails on credential-missing/validation-stale/kill-switch/caps-missing/market-stale/balance-stale/reconcile-over-cap/stuck-inflight/no-recent-dry-run, does-not-mutate, ack-records-operator+hash, ack-refused-when-not-ready, config-change-invalidates-ack) + gated live (canary-ack-required+stale-after-config-change, canary-scope-restricts-to-one-market, ack-required-but-scope-unset) + gated dashboard (preflight-read-only, acknowledge-requires-admin [401/403 viewer+config+credential+reconcile, 200 admin records operator+hash], not-ready→409). No real network in any test. Correction: a config-only hash is not the sole gate — the live-BUY guard also enforces ack EXPIRY (canary_ack_max_age_minutes) + a dynamic re-check (preflight.DynamicRecheck) before each buy; tests: expired-ack-denies, stale-credential/market/balance-after-ack-denies, new-reconcile/stuck-inflight-after-ack-denies, kill-switch-reengaged-denies, sell/cancel-unaffected. |
-| PR24 | `pr24-canary-session` | **in review** | `internal/live` (run sessions) + executor + dashboard endpoints + migration 024 (`live_run_sessions` + `live_audit` correlation cols): first real canary live-run instrumentation — makes the first order observable, correlatable, and stoppable WITHOUT broadening scope (still one exchange/symbol/cycle/tiny notional, gated by the PR23 ack). `live_run_sessions` records operator/exchange/symbol/credential/preflight-hash/ack-id/caps/status/start+stop reasons/first-order-checklist. `StartSession`: verifies canary scope + a current (hash-matching, non-expired) acknowledgement + dynamic readiness + no active session, then inserts ACTIVE; contacts no exchange. The guard's live-BUY path now ALSO requires an ACTIVE session (added to canaryAckOK after ack/expiry/dynamic), so `StopSession` blocks new buys immediately while sell/cancel/status stay allowed (per-run audited complement to the kill switch). `POST /api/live/session/start|stop` require admin (start re-runs preflight → 409 if not ready; 400 on scope/ack/readiness; 409 if already active); `GET /api/live/session` read-only shows session + order count/quote used/open cycles/last order/last deny/kill switch/mode/ack status. Every live_audit row tagged with live_session_id + acknowledgement_id + preflight_hash. First real buy of a session writes a one-time first-order checklist (mode/exchange/symbol/caps-remaining/credential-status/ack/session/kill-switch/request+order+cycle ids) — no secrets, idempotent. Tests: gated live (start-requires-valid-ack, out-of-scope-rejected, failed-readiness-rejected, succeeds+recorded+single, stop-blocks-buys+allows-sell/cancel+audited, stop-without-active, no-active-session-denies-buy, live_audit-includes-session+ack+hash, first-order-checklist-written+no-secrets+idempotent) + gated dashboard (start requires admin [401/403], requires ack [400], failed-preflight [409], start→view-ACTIVE→stop→no-active + second-stop 409). No real network in any test; scope stays single-canary. |
+| PR24 | `pr24-canary-session` | **accepted** | `internal/live` (run sessions) + executor + dashboard endpoints + migration 024 (`live_run_sessions` + `live_audit` correlation cols): first real canary live-run instrumentation — makes the first order observable, correlatable, and stoppable WITHOUT broadening scope (still one exchange/symbol/cycle/tiny notional, gated by the PR23 ack). `live_run_sessions` records operator/exchange/symbol/credential/preflight-hash/ack-id/caps/status/start+stop reasons/first-order-checklist. `StartSession`: verifies canary scope + a current (hash-matching, non-expired) acknowledgement + dynamic readiness + no active session, then inserts ACTIVE; contacts no exchange. The guard's live-BUY path now ALSO requires an ACTIVE session (added to canaryAckOK after ack/expiry/dynamic), so `StopSession` blocks new buys immediately while sell/cancel/status stay allowed (per-run audited complement to the kill switch). `POST /api/live/session/start|stop` require admin (start re-runs preflight → 409 if not ready; 400 on scope/ack/readiness; 409 if already active); `GET /api/live/session` read-only shows session + order count/quote used/open cycles/last order/last deny/kill switch/mode/ack status. Every live_audit row tagged with live_session_id + acknowledgement_id + preflight_hash. First real buy of a session writes a one-time first-order checklist (mode/exchange/symbol/caps-remaining/credential-status/ack/session/kill-switch/request+order+cycle ids) — no secrets, idempotent. Tests: gated live (start-requires-valid-ack, out-of-scope-rejected, failed-readiness-rejected, succeeds+recorded+single, stop-blocks-buys+allows-sell/cancel+audited, stop-without-active, no-active-session-denies-buy, live_audit-includes-session+ack+hash, first-order-checklist-written+no-secrets+idempotent) + gated dashboard (start requires admin [401/403], requires ack [400], failed-preflight [409], start→view-ACTIVE→stop→no-active + second-stop 409). No real network in any test; scope stays single-canary. |
+| PR25 | `pr25-canary-runbook` | **in review** | `RUNBOOK.md` + `internal/live` (startup summary, dry-run gate) + `internal/preflight` (RecentDryRunOK) + cmd (startup log) + dashboard (warnings + audit export) + the asInt fix: real-canary execution runbook & production hardening, no scope change (still one exchange/symbol/cycle/tiny notional, gated by preflight+ack+session). RUNBOOK.md: provision→validate→configure caps/scope→dry-run→preflight→acknowledge→disengage kill switch→start session→watch first order→stop→kill switch→inspect/export audit→resolve NEEDS_RECONCILE, + an emergency-stop-by-cycle-state table. `live.BuildSafetySummary` (read-only, no secrets): execution mode/live-enabled/kill-switch/canary exchange+symbol/caps-configured/credential STATUS/active-session/new-live-buys-allowed (full guard verdict) — logged at startup by order-executor + trade-engine. `StartSession` now also requires a recent successful dry-run (preflight.RecentDryRunOK) for the exchange/symbol. `GET /api/live/warnings` (read-only, severity-tagged): live-mode-enabled, kill-switch-disengaged, session-active, first-order-pending/sent, unresolved-reconcile, balance/market/credential-validation stale. Emergency stop (session stop or kill switch) blocks new buys immediately + keeps sell/cancel/status + recalls nothing already sent (documented + tested per cycle state). `GET /api/live/session/export` (read-only, no secrets): session + preflight hash + acknowledgement + caps + requests + orders + allow decisions + denials + first-order checklist + stop reason (via PR24 live_audit correlation). Fixed asInt to parse driver []byte/float64 ids so session counts + export correlation work. Tests: gated live (startup-summary-no-secrets + off-mode, emergency-stop-matrix [stop blocks buys/keeps sell+cancel; kill switch same], start-requires-recent-dry-run) + gated dashboard (warnings appear in live-danger states incl. stale balance/market, audit export includes session/caps/checklist/decisions + no secrets). No real network in any test; scope stays single-canary. |

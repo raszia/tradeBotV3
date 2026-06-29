@@ -474,20 +474,38 @@ func passFail(ok bool) Status {
 }
 
 func (c *Checker) checkDryRun(ctx context.Context, marketID int64, ctrl controls, add func(string, Status, string)) {
+	ok, detail := recentDryRun(ctx, c.db, c.clk, marketID, ctrl)
+	add("recent_dry_run_success", passFail(ok), detail)
+}
+
+// recentDryRun reports whether a successful dry-run (CLOSED) for the exchange/symbol exists
+// within the configured window. Shared by the preflight check + RecentDryRunOK.
+func recentDryRun(ctx context.Context, q querier, clk clock.Clock, marketID int64, ctrl controls) (bool, string) {
 	var newest sql.NullTime
-	c.db.QueryRowContext(ctx,
+	q.QueryRowContext(ctx,
 		"SELECT MAX(closed_at) FROM cycles WHERE dry_run=1 AND state='CLOSED' AND exchange_market_id=?", marketID).Scan(&newest)
 	if !newest.Valid {
-		add("recent_dry_run_success", StatusFail, "no successful dry-run (CLOSED) for this exchange/symbol")
-		return
+		return false, "no successful dry-run (CLOSED) for this exchange/symbol"
 	}
 	maxAge := nullIntOr(ctrl.dryRunSuccessMaxMin, defDryRunMin)
-	age := c.clk.Now().UTC().Sub(newest.Time)
+	age := clk.Now().UTC().Sub(newest.Time)
 	if age.Minutes() > float64(maxAge) {
-		add("recent_dry_run_success", StatusFail, fmt.Sprintf("last dry-run success %.0fm old (max %dm)", age.Minutes(), maxAge))
-	} else {
-		add("recent_dry_run_success", StatusPass, fmt.Sprintf("dry-run succeeded %.0fm ago", age.Minutes()))
+		return false, fmt.Sprintf("last dry-run success %.0fm old (max %dm)", age.Minutes(), maxAge)
 	}
+	return true, fmt.Sprintf("dry-run succeeded %.0fm ago", age.Minutes())
+}
+
+// RecentDryRunOK reports whether a recent successful dry-run exists for the exchange/symbol
+// (used by session start to enforce "a recent successful dry-run precedes the first live buy").
+func RecentDryRunOK(ctx context.Context, db *sql.DB, clk clock.Clock, marketID int64) (bool, string) {
+	if clk == nil {
+		clk = clock.NewSystem()
+	}
+	ctrl, err := loadControls(ctx, db)
+	if err != nil {
+		return false, "failed to load controls"
+	}
+	return recentDryRun(ctx, db, clk, marketID, ctrl)
 }
 
 func (c *Checker) checkAuthPath(ctx context.Context, add func(string, Status, string)) {

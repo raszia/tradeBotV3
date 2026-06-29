@@ -111,6 +111,7 @@ func (s *Server) respondSessionErr(w http.ResponseWriter, err error, what string
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 	case errors.Is(err, live.ErrOutOfCanaryScope), errors.Is(err, live.ErrNoValidAck),
 		errors.Is(err, live.ErrAckStale), errors.Is(err, live.ErrAckExpired), errors.Is(err, live.ErrNotReady),
+		errors.Is(err, live.ErrNoRecentDryRun),
 		errors.Is(err, live.ErrSessionOperatorRequired), errors.Is(err, live.ErrSessionReasonRequired):
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 	default:

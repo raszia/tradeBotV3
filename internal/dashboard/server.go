@@ -160,6 +160,8 @@ func (s *Server) Handler() http.Handler {
 	// Live canary RUN sessions (PR24): view is read-only; start/stop require admin. Starting
 	// needs a ready preflight + a current acknowledgement; stopping blocks new buys at once.
 	mux.HandleFunc("GET /api/live/session", s.liveSession)
+	mux.HandleFunc("GET /api/live/warnings", s.liveWarnings)
+	mux.HandleFunc("GET /api/live/session/export", s.liveSessionExport)
 	mux.HandleFunc("POST /api/live/session/start", s.requireAdmin(s.liveSessionStart))
 	mux.HandleFunc("POST /api/live/session/stop", s.requireAdmin(s.liveSessionStop))
 	return mux
@@ -461,6 +463,16 @@ func asInt(v any) int {
 		return int(n)
 	case int:
 		return n
+	case uint64:
+		return int(n)
+	case float64:
+		return int(n)
+	case []byte:
+		i, _ := strconv.ParseInt(string(n), 10, 64)
+		return int(i)
+	case string:
+		i, _ := strconv.ParseInt(n, 10, 64)
+		return int(i)
 	}
 	return 0
 }

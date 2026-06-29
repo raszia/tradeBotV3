@@ -27,6 +27,7 @@ var (
 	ErrNotReady                = errors.New("live: dynamic safety re-check failed (not ready)")
 	ErrSessionAlreadyActive    = errors.New("live: a canary session is already active for this scope")
 	ErrNoActiveSession         = errors.New("live: no active canary session for this scope")
+	ErrNoRecentDryRun          = errors.New("live: no recent successful dry-run for this exchange/symbol (run a dry-run first)")
 )
 
 // sessionQuerier is satisfied by *sql.DB and *sql.Tx.
@@ -101,6 +102,12 @@ func StartSession(ctx context.Context, db *sql.DB, clk clock.Clock, exchangeID, 
 	// Dynamic safety conditions must still hold at start.
 	if dok, _ := preflight.DynamicRecheck(ctx, db, clk, exchangeID, marketID); !dok {
 		return 0, ErrNotReady
+	}
+	// A recent successful dry-run for the same exchange/symbol must precede the first live
+	// buy (PR25 requirement 7). The session is the gate for the first buy, so we enforce it
+	// here regardless of how the session is started.
+	if dryOK, _ := preflight.RecentDryRunOK(ctx, db, clk, marketID); !dryOK {
+		return 0, ErrNoRecentDryRun
 	}
 	// At most one active session for the scope.
 	if _, exists := ActiveSession(ctx, db, exchangeID, marketID); exists {

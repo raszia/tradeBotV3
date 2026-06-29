@@ -31,11 +31,13 @@ func (f *lfix) lastID(r interface{ LastInsertId() (int64, error) }) int64 {
 }
 
 // seedDynamicReady makes every TIME-SENSITIVE condition fresh so the guard's dynamic
-// re-check passes: a recently-validated credential, a fresh balance, fresh market data.
+// re-check passes: a recently-validated credential, a fresh balance, fresh market data, and
+// a recent successful dry-run for the canary symbol (required before the first live buy).
 func (f *lfix) seedDynamicReady() {
 	f.exec("UPDATE exchange_credentials SET last_checked_at=NOW(6) WHERE exchange_id=?", f.ex)
 	f.exec("INSERT INTO wallet_balances_current (exchange_id, asset, available, locked, total, last_seen_at) VALUES (?, 'IRT', '1', '0', '1', NOW(6))", f.ex)
 	f.exec("INSERT INTO comparison_events (exchange_id, canonical_symbol, binance_price, created_at) VALUES (?, ?, '100', NOW(6))", f.ex, f.symbolOf())
+	f.exec("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state, dry_run, closed_at) VALUES (?, ?, ?, 'CLOSED', 1, NOW(6))", f.em, f.ex, f.symbolOf())
 }
 
 func (f *lfix) insertAck(hash string) { f.insertAckAt(hash, 0) }

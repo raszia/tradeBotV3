@@ -74,6 +74,10 @@ func main() {
 			base.Log.Info("order-executor ready (execution off; no clients; live execution disabled)")
 		}
 
+		// Startup live-safety summary (no secrets) so an operator can see exactly how
+		// dangerous this process is at a glance.
+		base.Log.Info("live startup safety", live.BuildSafetySummary(ctx, store.DB(), clock.NewSystem(), base.Cfg.Execution.Mode).LogArgs()...)
+
 		exec := executor.New(store, q, clients, base.Log, executor.Config{
 			Name:               "order-executor",
 			AllowLiveExecution: allowLive,

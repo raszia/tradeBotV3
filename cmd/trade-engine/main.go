@@ -48,6 +48,8 @@ func main() {
 			LiveGuard: liveGuard,
 		})
 		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
+		// Startup live-safety summary (no secrets).
+		base.Log.Info("live startup safety", live.BuildSafetySummary(ctx, store.DB(), clock.NewSystem(), base.Cfg.Execution.Mode).LogArgs()...)
 		return eng.Run(ctx) // blocks until shutdown
 	})
 	if err != nil {
