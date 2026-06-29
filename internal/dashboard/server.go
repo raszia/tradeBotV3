@@ -156,6 +156,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/live/preflight", s.livePreflight)
 	mux.HandleFunc("GET /api/live/acknowledgements", s.liveAcknowledgements)
 	mux.HandleFunc("POST /api/live/acknowledge", s.requireAdmin(s.liveAcknowledge))
+
+	// Live canary RUN sessions (PR24): view is read-only; start/stop require admin. Starting
+	// needs a ready preflight + a current acknowledgement; stopping blocks new buys at once.
+	mux.HandleFunc("GET /api/live/session", s.liveSession)
+	mux.HandleFunc("POST /api/live/session/start", s.requireAdmin(s.liveSessionStart))
+	mux.HandleFunc("POST /api/live/session/stop", s.requireAdmin(s.liveSessionStop))
 	return mux
 }
 

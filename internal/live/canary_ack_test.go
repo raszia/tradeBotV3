@@ -57,12 +57,18 @@ func (f *lfix) sell() PlaceCheck {
 	return PlaceCheck{ExchangeID: f.ex, ExchangeMarketID: f.em, Side: "sell", Notional: dec("50"), BaseQty: dec("0.5")}
 }
 
-// readyAck sets up canary controls + fresh dynamics + a matching active ack, so a live buy
-// would be ALLOWED. Returns once that baseline holds.
+// insertSession inserts an ACTIVE live run session for the fixture's canary scope.
+func (f *lfix) insertSession() {
+	f.exec("INSERT INTO live_run_sessions (operator, exchange_id, exchange_market_id, canonical_symbol, preflight_hash, status) VALUES ('op', ?, ?, 'S', 'h', 'ACTIVE')", f.ex, f.em)
+}
+
+// readyAck sets up canary controls + fresh dynamics + a matching active ack + an active run
+// session, so a live buy would be ALLOWED. Returns once that baseline holds.
 func (f *lfix) readyAck() {
 	f.canaryControls()
 	f.seedDynamicReady()
 	f.insertAck(f.hash())
+	f.insertSession()
 	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); !d.Allow {
 		f.t.Fatalf("baseline canary buy should be allowed: %s", d.Reason)
 	}
@@ -81,12 +87,28 @@ func TestCanaryAckGateRequiresValidAck(t *testing.T) {
 		t.Error("buy place must be denied without a live acknowledgement")
 	}
 	f.insertAck(f.hash())
+	f.insertSession()
 	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); !d.Allow {
 		t.Errorf("buy must be allowed with a valid ack: %s", d.Reason)
 	}
 	f.set("max_order_notional", "999") // config change -> hash mismatch
 	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); d.Allow {
 		t.Error("buy must be denied after a config change (ack stale)")
+	}
+}
+
+func TestNoActiveSessionDeniesBuy(t *testing.T) {
+	f := setupL(t)
+	f.canaryControls()
+	f.seedDynamicReady()
+	f.insertAck(f.hash())
+	// A valid ack but NO active session -> buy denied (PR24 session gate).
+	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); d.Allow {
+		t.Error("a valid ack without an active session must deny the buy")
+	}
+	f.insertSession()
+	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); !d.Allow {
+		t.Errorf("with an active session the buy should be allowed: %s", d.Reason)
 	}
 }
 
@@ -162,6 +184,7 @@ func TestNewReconcileAfterAckDenies(t *testing.T) {
 	f.db.QueryRow("SELECT COUNT(*) FROM cycles WHERE dry_run=0 AND state='NEEDS_RECONCILE'").Scan(&cur)
 	f.set("max_unresolved_reconcile", cur)
 	f.insertAck(f.hash())
+	f.insertSession()
 	if d := f.g.AllowNewBuyCycle(f.ctx, f.ex, f.em); !d.Allow {
 		t.Fatalf("baseline should be allowed: %s", d.Reason)
 	}

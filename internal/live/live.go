@@ -224,6 +224,11 @@ func (g *Guard) canaryAckOK(ctx context.Context, ctrl Controls, exchangeID, mark
 	if dok, reason := preflight.DynamicRecheck(ctx, g.db, g.clk, exchangeID, marketID); !dok {
 		return deny("live recheck failed: " + reason)
 	}
+	// PR24: a live buy requires an ACTIVE canary run session. Stopping the session blocks
+	// new buys immediately (sells/cancels/status are unaffected — they never reach here).
+	if _, ok := ActiveSession(ctx, g.db, exchangeID, marketID); !ok {
+		return deny("no active canary session: start a live run session before buying")
+	}
 	return allow("acknowledged")
 }
 
@@ -355,13 +360,33 @@ func (g *Guard) audit(ctx context.Context, a auditRow) {
 	if a.Decision.Allow {
 		decision = "allow"
 	}
+	// PR24 correlation: tag every live-guard decision with the run session, acknowledgement,
+	// and config hash in force for the scope (best-effort; all nullable).
+	sessionID, ackID, hash := g.correlation(ctx, a.ExchangeID, a.ExchangeMarketID)
 	if _, err := g.db.ExecContext(ctx, `
-INSERT INTO live_audit (exchange_id, exchange_market_id, cycle_id, order_id, request_id, action, side, notional, decision, reason, execution_mode)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live')`,
+INSERT INTO live_audit (exchange_id, exchange_market_id, cycle_id, order_id, request_id, action, side, notional, decision, reason, execution_mode, live_session_id, acknowledgement_id, preflight_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, ?)`,
 		nz(a.ExchangeID), nz(a.ExchangeMarketID), nz(a.CycleID), nz(a.OrderID), nz(a.RequestID),
-		a.Action, nstr(a.Side), decOrNull(a.Notional), decision, a.Decision.Reason); err != nil {
+		a.Action, nstr(a.Side), decOrNull(a.Notional), decision, a.Decision.Reason, sessionID, ackID, nstr(hash)); err != nil {
 		g.log.Warn("live: audit write failed", "err", err)
 	}
+}
+
+// correlation looks up the active session id + acknowledgement id + current config hash for
+// the scope (best-effort; any may be nil/empty). marketID 0 (e.g. a cancel) skips
+// session/ack lookup but still records the config hash by exchange where derivable.
+func (g *Guard) correlation(ctx context.Context, exchangeID, marketID int64) (sessionID any, ackID any, hash string) {
+	if exchangeID == 0 || marketID == 0 {
+		return nil, nil, ""
+	}
+	if sess, ok := ActiveSession(ctx, g.db, exchangeID, marketID); ok {
+		sessionID = sess.ID
+	}
+	if ack, ok := preflight.ActiveAck(ctx, g.db, exchangeID, marketID); ok {
+		ackID = ack.ID
+	}
+	hash, _ = preflight.ConfigHash(ctx, g.db, exchangeID, marketID, "live")
+	return sessionID, ackID, hash
 }
 
 func nz(v int64) any {

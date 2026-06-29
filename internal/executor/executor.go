@@ -526,14 +526,20 @@ func (e *Executor) liveGatePlace(ctx context.Context, c queue.Claimed, side stri
 	if e.cfg.ExecutionMode != "live" || e.cfg.Guard == nil {
 		return true
 	}
-	d := e.cfg.Guard.CheckPlace(ctx, live.PlaceCheck{
+	pc := live.PlaceCheck{
 		ExchangeID: c.ExchangeID, ExchangeMarketID: e.orderMarket(ctx, c.OrderID), ExchangeCode: c.ExchangeCode,
 		Symbol: c.Symbol, CycleID: derefID(c.CycleID), OrderID: derefID(c.OrderID), RequestID: c.ID,
 		Side: side, Notional: notional, BaseQty: baseQty, DryRun: e.cycleDryRun(ctx, c.CycleID),
-	})
+	}
+	d := e.cfg.Guard.CheckPlace(ctx, pc)
 	if !d.Allow {
 		e.failTx(ctx, c.ID, "live guard denied: "+d.Reason)
 		return false
+	}
+	// PR24: just before the first real BUY of the canary session is sent, record the final
+	// pre-send checklist snapshot (idempotent; no secrets). Best-effort — never blocks.
+	if side == "buy" {
+		e.cfg.Guard.RecordFirstOrderChecklist(ctx, pc)
 	}
 	return true
 }
