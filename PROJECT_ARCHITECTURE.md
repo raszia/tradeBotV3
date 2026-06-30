@@ -367,6 +367,21 @@ The `collector` binary (`internal/collector`) is the read-only market-data plane
   §12). Each observed book is normalized, written to the `orderbook:`/`price:`
   keys, and published on `market_events`; per-exchange health is recorded in
   `exchange_health_current`/`exchange_health_samples`.
+- **WebSocket resilience (PR5 correction):** an unexpected stream close while the
+  collector context is still active is **never** treated as a normal shutdown — it is
+  logged + counted as a health failure (and on `WSFailureCount`), and the subscriber
+  **reconnects with capped exponential backoff** (200 ms → 30 s), retrying for the whole
+  lifetime of the context. A target is never silently abandoned; the only clean exit is
+  context cancellation. During a sustained outage it additionally does a one-shot REST
+  poll between attempts (sequential, no double-ingest) as a safety net while it keeps
+  trying to restore the stream.
+- **Publish-after-save ordering (PR5 correction):** a `market_event` is published **only
+  after** both the order-book and price snapshots are written to Redis. If either save
+  fails, the event is suppressed — consumers are never pointed at a snapshot that is not
+  in the cache.
+- **REST `received_at` (PR5 correction):** for poll fetches, `received_at` is stamped
+  **after** a successful `GetOrderBook` (when the data is actually in hand), not before the
+  request; latency is still measured from request start.
 - Raw API calls are logged through the secret-masking IO logger (§12).
 - Decoupled via interfaces (`MarketStore`, `HealthRecorder`) so it is unit-tested
   with fakes and never needs a live exchange/Redis/DB in unit tests.
@@ -2157,6 +2172,18 @@ venue-free).
 
 ## 19a. Decisions log
 
+- **PR5 (correction) — collector resilience & publish ordering**: an unexpected WebSocket
+  close while the collector context is active is no longer a silent stop — it is logged,
+  counted as a health failure (`WSFailureCount`), and reconnected with capped exponential
+  backoff (200 ms → 30 s) for the lifetime of the context; the only clean exit is
+  ctx-cancel, and a sustained outage additionally polls REST between attempts (sequential,
+  no double-ingest). `ingest` now publishes a `market_event` ONLY after both `SaveOrderBook`
+  and `SavePrice` succeed (a failed save suppresses the event so consumers never see a
+  snapshot that is not cached). REST `received_at` is stamped after a successful
+  `GetOrderBook`, not before the request. Collector remains PublicClient-only with no
+  order/private/credential path. The single PR5 history row was corrected (the pre-rebase
+  branch's duplicate row is gone after rebasing onto `pr4-exchange-masking-precision`).
+
 - **PR4 (correction) — token masking, error-text masking, exact decimals**: the raw-API IO
   logger now (a) masks bearer/JWT token fields (`access`/`refresh`/`accessToken`/
   `refreshToken`/`jwt`/`bearer`) in JSON + non-JSON bodies, so Bitpin's `{"access":…,
@@ -2659,7 +2686,7 @@ venue-free).
 | PR2 | `pr2-database-schema` | **accepted** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
 | PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
-| PR5 | `pr5-redis-collector` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; no trading/order/cycle code. |
+| PR5 | `pr5-collector-ws-reconnect` | **in review** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. **Correction:** an unexpected WS close while ctx is active reconnects with capped exponential backoff (never silently abandons a target; only ctx-cancel stops it; counted as a health failure + `WSFailureCount`); `market_event` is published ONLY after both `SaveOrderBook` and `SavePrice` succeed; REST `received_at` is stamped after a successful `GetOrderBook`. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only, **ws-reconnect-on-unexpected-close**, **no-publish-when-save-book/price-fails**), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; collector uses only PublicClient; no trading/order/cycle/credential code. |
 | PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |

@@ -18,11 +18,12 @@ import (
 // --- test doubles ---
 
 type fakeStore struct {
-	mu      sync.Mutex
-	books   []events.BookSnapshot
-	prices  []events.PriceSnapshot
-	pubs    []events.MarketEvent
-	saveErr error
+	mu       sync.Mutex
+	books    []events.BookSnapshot
+	prices   []events.PriceSnapshot
+	pubs     []events.MarketEvent
+	saveErr  error // injected SaveOrderBook error
+	priceErr error // injected SavePrice error
 }
 
 func (s *fakeStore) SaveOrderBook(_ context.Context, bs events.BookSnapshot) error {
@@ -37,6 +38,9 @@ func (s *fakeStore) SaveOrderBook(_ context.Context, bs events.BookSnapshot) err
 func (s *fakeStore) SavePrice(_ context.Context, ps events.PriceSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.priceErr != nil {
+		return s.priceErr
+	}
 	s.prices = append(s.prices, ps)
 	return nil
 }
@@ -67,6 +71,11 @@ func (h *fakeHealth) RecordFailure(context.Context, string, error) {
 	h.mu.Lock()
 	h.failures++
 	h.mu.Unlock()
+}
+func (h *fakeHealth) fails() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failures
 }
 
 func book(sym string) domain.OrderBook {
@@ -215,5 +224,122 @@ func TestCollectorUsesPublicClientType(t *testing.T) {
 	tgt := Target{Client: exchanges.NewFakePublicClient("x")}
 	if _, ok := any(tgt.Client).(exchanges.PrivateClient); ok {
 		t.Fatal("collector Target.Client must not be a PrivateClient")
+	}
+}
+
+// TestNoPublishWhenSaveOrderBookFails (PR5 correction) — a market_event must NOT be
+// published if the order-book snapshot failed to save.
+func TestNoPublishWhenSaveOrderBookFails(t *testing.T) {
+	pub := exchanges.NewFakePublicClient("fakeex")
+	pub.SetOrderBook("BTC/IRT", book("BTC/IRT"))
+	store := &fakeStore{saveErr: errors.New("redis down")}
+	c := newTestCollector(nil, store, &fakeHealth{})
+
+	c.pollOnce(context.Background(), Target{ExchangeCode: "fakeex", Client: pub, Symbols: []string{"BTC/IRT"}})
+
+	b, p, e := store.counts()
+	if e != 0 {
+		t.Errorf("PublishEvent must NOT be called when SaveOrderBook fails (events=%d)", e)
+	}
+	if b != 0 || p != 0 {
+		t.Errorf("nothing should be stored when SaveOrderBook fails, got books=%d prices=%d", b, p)
+	}
+}
+
+// TestNoPublishWhenSavePriceFails (PR5 correction) — a market_event must NOT be
+// published if the price snapshot failed to save (even though the book saved first).
+func TestNoPublishWhenSavePriceFails(t *testing.T) {
+	pub := exchanges.NewFakePublicClient("fakeex")
+	pub.SetOrderBook("BTC/IRT", book("BTC/IRT"))
+	store := &fakeStore{priceErr: errors.New("redis down")}
+	c := newTestCollector(nil, store, &fakeHealth{})
+
+	c.pollOnce(context.Background(), Target{ExchangeCode: "fakeex", Client: pub, Symbols: []string{"BTC/IRT"}})
+
+	b, p, e := store.counts()
+	if e != 0 {
+		t.Errorf("PublishEvent must NOT be called when SavePrice fails (events=%d)", e)
+	}
+	if b != 1 || p != 0 {
+		t.Errorf("book saved, price not, no event: got books=%d prices=%d events=%d", b, p, e)
+	}
+}
+
+// wsReconnectClient is a PublicClient whose WebSocket delivers exactly ONE book and
+// then closes — simulating an unexpected disconnect. Each SubscribeOrderBook call
+// returns a fresh channel and increments a counter, so a test can observe reconnects.
+type wsReconnectClient struct {
+	*exchanges.FakePublicClient
+	mu       sync.Mutex
+	subCount int
+}
+
+func (c *wsReconnectClient) Capabilities() exchanges.Capabilities {
+	return exchanges.Capabilities{OrderBookREST: true, OrderBookWS: true}
+}
+
+func (c *wsReconnectClient) SubscribeOrderBook(context.Context, []string) (<-chan domain.OrderBook, error) {
+	c.mu.Lock()
+	c.subCount++
+	c.mu.Unlock()
+	ch := make(chan domain.OrderBook, 1)
+	ch <- book("BTC/IRT")
+	close(ch) // one message, then an UNEXPECTED close (ctx is still active)
+	return ch, nil
+}
+
+func (c *wsReconnectClient) subscribes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.subCount
+}
+
+// TestWSReconnectsOnUnexpectedClose (PR5 correction) — when a WebSocket stream closes
+// while the collector context is still active, the collector must detect it, count it
+// as a failure, and RECONNECT (not silently abandon the target). Cancelling the
+// context must then stop the reconnect loop cleanly.
+func TestWSReconnectsOnUnexpectedClose(t *testing.T) {
+	client := &wsReconnectClient{FakePublicClient: exchanges.NewFakePublicClient("fakeex")}
+	client.SetOrderBook("BTC/IRT", book("BTC/IRT"))
+	store := &fakeStore{}
+	health := &fakeHealth{}
+	c := New(
+		[]Target{{ExchangeCode: "fakeex", Client: client, Symbols: []string{"BTC/IRT"}}},
+		store, health, nil, clock.NewSystem(),
+		Config{PollInterval: 10 * time.Millisecond, WSReconnectMinBackoff: time.Millisecond, WSReconnectMaxBackoff: 5 * time.Millisecond},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = c.Run(ctx); close(done) }()
+
+	// The target must be re-subscribed after the first unexpected close — prove it
+	// reconnects several times rather than stopping.
+	deadline := time.After(2 * time.Second)
+	for client.subscribes() < 3 {
+		select {
+		case <-deadline:
+			t.Fatalf("collector did not reconnect after unexpected WS close (subscribes=%d)", client.subscribes())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	// The unexpected closes were counted as failures (not treated as normal shutdown).
+	if health.fails() == 0 {
+		t.Error("unexpected WS close must be recorded as a health failure")
+	}
+	if c.WSFailureCount() == 0 {
+		t.Error("WSFailureCount must be > 0 after unexpected disconnects")
+	}
+	// The delivered book(s) were ingested (target stayed productive while reconnecting).
+	if b, _, _ := store.counts(); b == 0 {
+		t.Error("expected at least one ingested book across reconnects")
+	}
+
+	// Cancelling the context must stop the reconnect loop cleanly.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect loop did not stop after ctx cancel")
 	}
 }
