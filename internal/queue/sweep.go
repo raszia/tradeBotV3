@@ -9,27 +9,42 @@ import (
 
 // StuckResult summarises a SweepStuck run.
 type StuckResult struct {
-	RequeuedReadOnly int
-	DeadMutating     int
+	RequeuedClaimed  int // stale CLAIMED (never sent) reset to QUEUED
+	RequeuedReadOnly int // stale read-only IN_FLIGHT rescheduled
+	DeadMutating     int // stale mutating IN_FLIGHT dead-lettered + order NEEDS_RECONCILE
 }
 
-// SweepStuck recovers requests that have been IN_FLIGHT longer than their timeout
-// (+ graceSeconds) — i.e. the executor likely crashed after marking IN_FLIGHT.
-// Recovery is CONSERVATIVE (rule #6):
+// SweepStuck recovers requests left behind by a crashed executor. Recovery is
+// CONSERVATIVE (rule #6):
 //
-//   - READ-ONLY requests are idempotent → re-queued (RETRY_SCHEDULED).
-//   - MUTATING requests (PLACE/CANCEL) are NEVER blindly re-sent: their send
-//     outcome is unknown, so the request is moved to DEAD and the owning order is
-//     pushed to NEEDS_RECONCILE (in the same transaction) for the reconciler /
-//     operator to resolve.
+//   - Stale CLAIMED requests (claimed but never marked IN_FLIGHT → NEVER sent to the
+//     exchange) are simply re-queued (status→QUEUED, claim cleared) so another executor
+//     can take them. This is always safe — including for mutating PLACE/CANCEL — because
+//     IN_FLIGHT (not CLAIMED) is the pre-send boundary.
+//   - Stale IN_FLIGHT READ-ONLY requests are idempotent → re-queued (RETRY_SCHEDULED).
+//   - Stale IN_FLIGHT MUTATING requests (PLACE/CANCEL) are NEVER blindly re-sent: their
+//     send outcome is unknown, so the request is moved to DEAD and the owning order is
+//     pushed to NEEDS_RECONCILE (same tx) for the reconciler / operator to resolve.
+//
+// "Stale" = older than its timeout_ms + graceSeconds.
 func (q *Queue) SweepStuck(ctx context.Context, graceSeconds int) (StuckResult, error) {
+	var res StuckResult
+
+	// 1. Recover stale CLAIMED requests (pre-send → safe to requeue).
+	requeuedClaimed, err := q.requeueStaleClaimed(ctx, graceSeconds)
+	if err != nil {
+		return res, err
+	}
+	res.RequeuedClaimed = requeuedClaimed
+
+	// 2. Recover stale IN_FLIGHT requests.
 	rows, err := q.db.QueryContext(ctx, `
 		SELECT id, request_type, order_id
 		FROM exchange_requests
 		WHERE status = 'IN_FLIGHT' AND inflight_at IS NOT NULL
 		  AND inflight_at < (NOW(6) - INTERVAL (timeout_ms/1000 + ?) SECOND)`, graceSeconds)
 	if err != nil {
-		return StuckResult{}, err
+		return res, err
 	}
 	type stuck struct {
 		id      int64
@@ -42,18 +57,17 @@ func (q *Queue) SweepStuck(ctx context.Context, graceSeconds int) (StuckResult, 
 		var t string
 		if err := rows.Scan(&s.id, &t, &s.orderID); err != nil {
 			rows.Close()
-			return StuckResult{}, err
+			return res, err
 		}
 		s.typ = RequestType(t)
 		found = append(found, s)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return StuckResult{}, err
+		return res, err
 	}
 	rows.Close()
 
-	var res StuckResult
 	for _, s := range found {
 		if s.typ.IsMutating() {
 			if err := q.deadMutatingStuck(ctx, s.id, s.orderID); err != nil {
@@ -69,6 +83,25 @@ func (q *Queue) SweepStuck(ctx context.Context, graceSeconds int) (StuckResult, 
 		res.RequeuedReadOnly++
 	}
 	return res, nil
+}
+
+// requeueStaleClaimed resets CLAIMED requests whose claim is older than their
+// timeout_ms + graceSeconds back to QUEUED, clearing claimed_by/claimed_at. A CLAIMED
+// request has NOT been sent to the exchange (IN_FLIGHT is the pre-send marker), so
+// requeuing is ALWAYS safe — even for mutating PLACE/CANCEL — and needs no
+// NEEDS_RECONCILE. Without this, a crash between Claim and MarkInFlight would strand the
+// request in CLAIMED forever (and hold a per-exchange concurrency slot). Returns the count.
+func (q *Queue) requeueStaleClaimed(ctx context.Context, graceSeconds int) (int, error) {
+	res, err := q.db.ExecContext(ctx, `
+		UPDATE exchange_requests
+		SET status='QUEUED', claimed_by=NULL, claimed_at=NULL, updated_at=NOW(6)
+		WHERE status='CLAIMED' AND claimed_at IS NOT NULL
+		  AND claimed_at < (NOW(6) - INTERVAL (timeout_ms/1000 + ?) SECOND)`, graceSeconds)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // deadMutatingStuck marks a stuck mutating request DEAD and pushes its order to

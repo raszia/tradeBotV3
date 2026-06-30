@@ -309,6 +309,43 @@ func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
 	}
 }
 
+// TestMarkInFlightFailureBlocksSend (PR7 correction) — if MarkInFlight does not move the
+// request CLAIMED→IN_FLIGHT (e.g. a concurrent sweep requeued it), the executor must NOT
+// call PlaceOrder or CancelOrder. We simulate the race by flipping the row off CLAIMED after
+// building the Claimed but before processing.
+func TestMarkInFlightFailureBlocksSend(t *testing.T) {
+	it := setup(t)
+	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
+
+	// PLACE: row no longer CLAIMED -> MarkInFlight fails -> no PlaceOrder.
+	cPlace := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	if _, err := it.db.Exec("UPDATE exchange_requests SET status='QUEUED', claimed_by=NULL, claimed_at=NULL WHERE id=?", cPlace.ID); err != nil {
+		t.Fatal(err)
+	}
+	it.exec.process(it.ctx, cPlace)
+	if got := atomic.LoadInt32(&it.fake.placeCount); got != 0 {
+		t.Errorf("PlaceOrder called %d times after MarkInFlight failure, want 0", got)
+	}
+
+	// CANCEL: same — a request not CLAIMED must not reach CancelOrder.
+	fp := orders.FollowupPayload{ExchangeOrderID: "EX1"}
+	payload, _ := json.Marshal(fp)
+	res, err := it.db.Exec(`INSERT INTO exchange_requests
+		(exchange_id, cycle_id, order_id, request_type, priority, status, payload, timeout_ms, max_retries, idempotency_key)
+		VALUES (?, ?, ?, 'CANCEL_ORDER', 50, 'QUEUED', ?, 10000, 5, ?)`,
+		it.exID, cycleID, orderID, payload, fmt.Sprintf("idem_cancel_%d", time.Now().UnixNano()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelID, _ := res.LastInsertId()
+	cCancel := queue.Claimed{ID: cancelID, ExchangeID: it.exID, ExchangeCode: it.code, Type: queue.TypeCancelOrder,
+		Payload: json.RawMessage(payload), OrderID: &orderID, CycleID: &cycleID, Symbol: "X/IRT", TimeoutMS: 10000, MaxRetries: 5}
+	it.exec.process(it.ctx, cCancel)
+	if got := atomic.LoadInt32(&it.fake.cancelCount); got != 0 {
+		t.Errorf("CancelOrder called %d times after MarkInFlight failure, want 0", got)
+	}
+}
+
 func TestPlaceSuccessRollsBackWhenOrderTransitionInvalid(t *testing.T) {
 	it := setup(t)
 	// Order already FILLED (terminal): the place-ack transitions are invalid, so the

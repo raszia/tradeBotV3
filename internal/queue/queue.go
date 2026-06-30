@@ -20,6 +20,17 @@ import (
 // rejected request rather than a second send (rule #8).
 var ErrDuplicateIdempotencyKey = errors.New("queue: duplicate idempotency key")
 
+// ErrRequestNotClaimed is returned by MarkInFlight when the guarded CLAIMED→IN_FLIGHT
+// update matches zero rows (the request is not — or no longer — CLAIMED). It is
+// safety-critical: the executor MUST treat this as "do not send to the exchange".
+var ErrRequestNotClaimed = errors.New("queue: request not in CLAIMED state")
+
+// ErrRequestNotActive is returned by the terminal Mark* methods when their guarded
+// update matches zero rows — the request already moved to a terminal status
+// (DEAD/FAILED/SUCCEEDED) or away from CLAIMED/IN_FLIGHT. Refusing the update stops a
+// late worker from clobbering a newer status (e.g. overwriting DEAD with SUCCEEDED).
+var ErrRequestNotActive = errors.New("queue: request not in a markable (CLAIMED/IN_FLIGHT) state")
+
 // Backoff parameters for retry scheduling.
 const (
 	retryBaseDelay = 500 * time.Millisecond
@@ -235,39 +246,90 @@ func (q *Queue) loadClaimed(ctx context.Context, ids []int64) ([]Claimed, error)
 // MarkInFlight moves a CLAIMED request to IN_FLIGHT and stamps inflight_at. The
 // executor MUST call this (and have it committed) BEFORE sending a mutating
 // request, so a crash leaves a recoverable IN_FLIGHT marker (rule #6).
+//
+// It is GUARDED on status='CLAIMED' and verifies exactly one row changed: if the row
+// is no longer CLAIMED (already swept, requeued, or never claimed) it returns
+// ErrRequestNotClaimed and the executor must NOT send to the exchange — preventing a
+// stale/duplicate mutating send.
 func (q *Queue) MarkInFlight(ctx context.Context, id int64) error {
-	_, err := q.db.ExecContext(ctx,
+	res, err := q.db.ExecContext(ctx,
 		"UPDATE exchange_requests SET status='IN_FLIGHT', inflight_at=NOW(6), updated_at=NOW(6) WHERE id=? AND status='CLAIMED'",
 		id)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: id=%d", ErrRequestNotClaimed, id)
+	}
+	return nil
 }
 
 // MarkSucceeded moves a request to SUCCEEDED within the caller's tx (so it can be
-// atomic with an order-state transition — rule #9).
+// atomic with an order-state transition — rule #9). GUARDED: only a request still in
+// CLAIMED (read-only success) or IN_FLIGHT (mutating success) is advanced; a row that
+// already moved to a CONFLICTING terminal status (e.g. DEAD/FAILED) yields
+// ErrRequestNotActive and the tx rolls back. Re-applying the SAME status is an
+// idempotent no-op (safe for crash-recovery reprocessing).
 func (q *Queue) MarkSucceeded(ctx context.Context, tx *sql.Tx, id int64, response json.RawMessage) error {
-	_, err := tx.ExecContext(ctx,
-		"UPDATE exchange_requests SET status='SUCCEEDED', response=?, last_error=NULL, updated_at=NOW(6) WHERE id=?",
+	return q.markTerminal(ctx, tx, id, "SUCCEEDED",
+		"UPDATE exchange_requests SET status='SUCCEEDED', response=?, last_error=NULL, updated_at=NOW(6) WHERE id=? AND status IN ('CLAIMED','IN_FLIGHT')",
 		payloadOrNil(response), id)
-	return err
 }
 
-// MarkFailed moves a request to FAILED (a definitive, non-retryable failure)
-// within the caller's tx.
+// MarkFailed moves a request to FAILED (a definitive, non-retryable failure — pre-send
+// from CLAIMED, or a definite exchange rejection from IN_FLIGHT) within the caller's tx.
+// Guarded the same way as MarkSucceeded (conflicting status → ErrRequestNotActive;
+// same-status → idempotent no-op).
 func (q *Queue) MarkFailed(ctx context.Context, tx *sql.Tx, id int64, cause string) error {
-	_, err := tx.ExecContext(ctx,
-		"UPDATE exchange_requests SET status='FAILED', last_error=?, updated_at=NOW(6) WHERE id=?",
+	return q.markTerminal(ctx, tx, id, "FAILED",
+		"UPDATE exchange_requests SET status='FAILED', last_error=?, updated_at=NOW(6) WHERE id=? AND status IN ('CLAIMED','IN_FLIGHT')",
 		nullStr(cause), id)
-	return err
 }
 
-// MarkDead moves a request to DEAD (exhausted/abandoned; e.g. an ambiguous
-// mutating outcome) within the caller's tx. The owning order should be pushed to
-// NEEDS_RECONCILE in the SAME tx by the caller.
+// MarkDead moves a request to DEAD (exhausted/abandoned; e.g. an ambiguous mutating
+// outcome) within the caller's tx. The owning order should be pushed to NEEDS_RECONCILE
+// in the SAME tx by the caller. Guarded the same way (conflicting status →
+// ErrRequestNotActive; re-marking an already-DEAD row → idempotent no-op).
 func (q *Queue) MarkDead(ctx context.Context, tx *sql.Tx, id int64, cause string) error {
-	_, err := tx.ExecContext(ctx,
-		"UPDATE exchange_requests SET status='DEAD', last_error=?, updated_at=NOW(6) WHERE id=?",
+	return q.markTerminal(ctx, tx, id, "DEAD",
+		"UPDATE exchange_requests SET status='DEAD', last_error=?, updated_at=NOW(6) WHERE id=? AND status IN ('CLAIMED','IN_FLIGHT')",
 		nullStr(cause), id)
-	return err
+}
+
+// markTerminal runs a guarded terminal UPDATE (WHERE status IN ('CLAIMED','IN_FLIGHT'))
+// and disambiguates a zero-row result by re-reading the current status in the SAME tx:
+//
+//   - exactly one row changed   → applied (nil);
+//   - already in `target`       → idempotent no-op (nil) — safe re-processing, no double work;
+//   - any OTHER status          → ErrRequestNotActive — a late worker must NOT overwrite a
+//     newer/conflicting terminal status (e.g. SUCCEEDED clobbering DEAD).
+func (q *Queue) markTerminal(ctx context.Context, tx *sql.Tx, id int64, target, update string, args ...any) error {
+	res, err := tx.ExecContext(ctx, update, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 1 {
+		return nil
+	}
+	var cur string
+	switch err := tx.QueryRowContext(ctx, "SELECT status FROM exchange_requests WHERE id=?", id).Scan(&cur); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: id=%d (no such request)", ErrRequestNotActive, id)
+	case err != nil:
+		return err
+	}
+	if cur == target {
+		return nil // already in the target terminal status — idempotent no-op
+	}
+	return fmt.Errorf("%w: id=%d is %s, refusing to set %s", ErrRequestNotActive, id, cur, target)
 }
 
 // ScheduleRetry bumps retry_count and either schedules a backoff retry
