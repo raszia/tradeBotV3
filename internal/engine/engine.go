@@ -45,6 +45,10 @@ type Config struct {
 	// caps + kill switch (PR20). It is the first check; the executor re-checks before
 	// the actual send.
 	LiveGuard *live.Guard
+	// SubscribeMinBackoff / SubscribeMaxBackoff bound the exponential backoff between
+	// market_events resubscribe attempts after an unexpected close (defaults 200ms / 30s).
+	SubscribeMinBackoff time.Duration
+	SubscribeMaxBackoff time.Duration
 }
 
 func (c *Config) withDefaults() {
@@ -63,6 +67,21 @@ func (c *Config) withDefaults() {
 	if c.SellManageInterval <= 0 {
 		c.SellManageInterval = 2 * time.Second
 	}
+	if c.SubscribeMinBackoff <= 0 {
+		c.SubscribeMinBackoff = 200 * time.Millisecond
+	}
+	if c.SubscribeMaxBackoff < c.SubscribeMinBackoff {
+		c.SubscribeMaxBackoff = 30 * time.Second
+		if c.SubscribeMaxBackoff < c.SubscribeMinBackoff {
+			c.SubscribeMaxBackoff = c.SubscribeMinBackoff
+		}
+	}
+}
+
+// marketSubscriber is the market-event subscription seam the signal loop depends on, so
+// reconnect behaviour is unit-testable without a live Redis. *redis.Client satisfies it.
+type marketSubscriber interface {
+	SubscribeMarketEvents(ctx context.Context) (<-chan events.MarketEvent, error)
 }
 
 // Engine is the trade-engine signal loop. It reads market data from Redis and
@@ -74,6 +93,7 @@ func (c *Config) withDefaults() {
 type Engine struct {
 	store      *db.Store
 	rc         *redis.Client
+	subSource  marketSubscriber // market_events source for Run; defaults to rc (test-overridable)
 	cache      *configstore.Cache
 	q          *queue.Queue
 	sellMgr    *sellflow.Manager
@@ -97,6 +117,9 @@ func New(store *db.Store, rc *redis.Client, cache *configstore.Cache, clk clock.
 		q = queue.New(store.DB(), clk)
 	}
 	e := &Engine{store: store, rc: rc, cache: cache, q: q, clk: clk, log: log, cfg: cfg}
+	if rc != nil {
+		e.subSource = rc // the live market_events source; tests inject a fake
+	}
 	if store != nil && rc != nil {
 		// Sell-side manager (PR11): drives exit-sell creation/poll/reprice using the
 		// engine's Binance reference price. It writes DB rows + queue requests only.
@@ -159,10 +182,6 @@ func (e *Engine) binanceRefFor(ctx context.Context, m configstore.MarketConfig) 
 // ctx is cancelled. A single subscriber drives the loop; evaluation is synchronous
 // per event (PR8 has no real throughput — correctness over concurrency here).
 func (e *Engine) Run(ctx context.Context) error {
-	sub, err := e.rc.SubscribeMarketEvents(ctx)
-	if err != nil {
-		return err
-	}
 	e.log.Info("trade-engine signal loop started",
 		"reference_exchange", e.cfg.ReferenceExchange, "max_book_age", e.cfg.MaxBookAge)
 
@@ -179,14 +198,65 @@ func (e *Engine) Run(ctx context.Context) error {
 		}()
 	}
 
+	return e.runSignalLoop(ctx)
+}
+
+// runSignalLoop keeps a market_events subscription alive for the LIFETIME of ctx. An
+// unexpected close (or a failed subscribe) while ctx is still active is NEVER treated as a
+// normal shutdown — it is logged and the subscription is re-established with capped
+// exponential backoff. It returns ONLY when ctx is cancelled (returning ctx.Err(), a
+// non-nil error), so a Redis pub/sub drop can never silently stop the engine.
+func (e *Engine) runSignalLoop(ctx context.Context) error {
+	if e.subSource == nil {
+		return errors.New("engine: no market_events source configured")
+	}
+	backoff := e.cfg.SubscribeMinBackoff
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		sub, err := e.subSource.SubscribeMarketEvents(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			e.log.Warn("market_events subscribe failed; retrying with backoff", "err", err)
+			if !e.sleep(ctx, backoff) {
+				return ctx.Err()
+			}
+			backoff = minDur(2*backoff, e.cfg.SubscribeMaxBackoff)
+			continue
+		}
+
+		delivered := e.consumeEvents(ctx, sub)
+		if ctx.Err() != nil {
+			return ctx.Err() // the only clean exit: context cancelled
+		}
+		// Unexpected close while ctx is active: do NOT return nil — resubscribe.
+		e.log.Warn("market_events subscription closed unexpectedly; resubscribing with backoff")
+		if delivered {
+			backoff = e.cfg.SubscribeMinBackoff // a working subscription blipped: recover fast
+		}
+		if !e.sleep(ctx, backoff) {
+			return ctx.Err()
+		}
+		backoff = minDur(2*backoff, e.cfg.SubscribeMaxBackoff)
+	}
+}
+
+// consumeEvents reads + evaluates events until the channel closes or ctx is cancelled.
+// Returns whether at least one event was delivered (so the caller can reset backoff after a
+// connection that actually worked).
+func (e *Engine) consumeEvents(ctx context.Context, sub <-chan events.MarketEvent) (delivered bool) {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return delivered
 		case ev, ok := <-sub:
 			if !ok {
-				return nil
+				return delivered // channel closed; caller checks ctx to classify it
 			}
+			delivered = true
 			snap := e.cache.Snapshot()
 			for _, m := range e.targets(snap, ev) {
 				if err := e.evaluate(ctx, snap, m); err != nil {
@@ -197,6 +267,25 @@ func (e *Engine) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// sleep waits d or until ctx is cancelled; returns false if cancelled.
+func (e *Engine) sleep(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func minDur(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // runSellManagement ticks the sell Manager until ctx is cancelled.
@@ -217,16 +306,26 @@ func (e *Engine) runSellManagement(ctx context.Context) {
 
 // targets returns the Iranian markets to (re)evaluate for a market event. An
 // unconfigured system (config version 0) produces nothing (rule: no signal when
-// config is version 0). When the event is from the reference venue, every Iranian
-// signal-enabled market on the same base asset is re-evaluated (its reference
-// moved); otherwise only the specific Iranian market that ticked.
+// config is version 0).
+//
+//   - Reference-venue event (e.g. Binance BASE/USDT): every Iranian signal-enabled market
+//     on the same base asset is re-evaluated (its reference price moved).
+//   - Iranian-venue event for the configured QUOTE-RATE symbol (e.g. Nobitex USDT/IRT):
+//     EVERY signal-enabled rial-quoted (non-USDT) market on the SAME exchange is
+//     re-evaluated, because their reference is derived as Binance(USDT) × this rate. So a
+//     Nobitex USDT/IRT tick re-evaluates Nobitex BTC/IRT, ETH/IRT, SOL/IRT, … Without this
+//     a quote-rate move would silently NOT refresh dependent IRT comparisons/signals.
+//   - Any other Iranian-venue event: only the specific market that ticked.
+//
+// USDT-quoted markets carry no quote-rate dependency, so they are not pulled in by a
+// USDT/IRT event.
 func (e *Engine) targets(snap *configstore.Snapshot, ev events.MarketEvent) []configstore.MarketConfig {
 	if snap == nil || snap.Version == 0 {
 		return nil
 	}
-	var out []configstore.MarketConfig
 	if ev.Exchange == e.cfg.ReferenceExchange {
 		base := baseOf(ev.Symbol)
+		var out []configstore.MarketConfig
 		for _, m := range snap.MarketsByID {
 			if m.ExchangeCode != e.cfg.ReferenceExchange && m.EnabledForSignal && baseOf(m.CanonicalSymbol) == base {
 				out = append(out, m)
@@ -234,9 +333,29 @@ func (e *Engine) targets(snap *configstore.Snapshot, ev events.MarketEvent) []co
 		}
 		return out
 	}
+
+	// Iranian-venue event. Dedup by exchange_market_id (the ticked symbol and the
+	// quote-rate dependents can overlap).
+	seen := make(map[int64]bool)
+	var out []configstore.MarketConfig
+	add := func(m configstore.MarketConfig) {
+		if !seen[m.ExchangeMarketID] {
+			seen[m.ExchangeMarketID] = true
+			out = append(out, m)
+		}
+	}
 	for _, m := range snap.MarketsBySymbol[ev.Symbol] {
 		if m.ExchangeCode == ev.Exchange && m.EnabledForSignal {
-			out = append(out, m)
+			add(m)
+		}
+	}
+	// Quote-rate dependency: a USDT/IRT tick re-evaluates every rial-quoted IRT/IRR market
+	// on the same exchange (their Binance reference is converted through this rate).
+	if ev.Symbol == e.cfg.QuoteRateSymbol {
+		for _, m := range snap.MarketsByID {
+			if m.ExchangeCode == ev.Exchange && m.EnabledForSignal && !isUSDTQuote(quoteOf(m.CanonicalSymbol)) {
+				add(m)
+			}
 		}
 	}
 	return out

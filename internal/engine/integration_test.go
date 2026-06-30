@@ -458,7 +458,183 @@ func TestBelowThresholdNoCycle(t *testing.T) {
 	}
 }
 
+// TestSignalOnlyMarketTouchesNoExecutionState (PR8 correction) — a signal-enabled but
+// NOT-trading market writes ONLY comparison_events + signals. The engine must create no
+// cycle/order/symbol-lock and must NOT mutate exchange_requests.
+func TestSignalOnlyMarketTouchesNoExecutionState(t *testing.T) {
+	f := setupE(t)
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, false) // signal yes, trading NO
+	base := baseOf(sym)
+	f.seedBook(f.exCode, sym, "99", "100", 0)
+	f.seedBook("binance", base+"/USDT", "101", "102", 0) // ~100 bps > 50 → passes
+	reqBefore := f.exchangeRequestCount()
+
+	f.run(mc)
+
+	if f.comparisonCount(sym) != 1 || f.signalCount(sym) != 1 {
+		t.Errorf("signal path: comparison=%d signal=%d, want 1/1", f.comparisonCount(sym), f.signalCount(sym))
+	}
+	if n := f.cycleCount(mc); n != 0 {
+		t.Errorf("cycles=%d, want 0 (signal-only must not create a cycle)", n)
+	}
+	if n := f.orderCountForMarket(mc); n != 0 {
+		t.Errorf("orders=%d, want 0", n)
+	}
+	if n := f.lockCountForMarket(mc); n != 0 {
+		t.Errorf("symbol_locks=%d, want 0", n)
+	}
+	if n := f.exchangeRequestCount(); n != reqBefore {
+		t.Errorf("exchange_requests changed %d -> %d; the trade-engine must not mutate the queue", reqBefore, n)
+	}
+}
+
+// TestQuoteRateEventReevaluatesDependentIRTMarket (PR8 correction) — a USDT/IRT tick must
+// re-evaluate dependent IRT markets on the same exchange and write a signal when the spread
+// passes. Drives targets()→evaluate exactly as Run does.
+func TestQuoteRateEventReevaluatesDependentIRTMarket(t *testing.T) {
+	f := setupE(t)
+	mc, sym := f.seedMarket("IRT", 50, "0", "0", true, false) // IRT market depends on USDT/IRT
+	base := baseOf(sym)
+	f.seedBook(f.exCode, sym, "9", "10", 0)                    // iranian ask 10 (toman)
+	f.seedBook("binance", base+"/USDT", "0.0101", "0.0102", 0) // binance bid 0.0101 USDT
+	f.seedRate(f.exCode, "1000", 0)                            // USDT/IRT = 1000 → ref = 10.1 > 10 → ~100 bps
+
+	snap := f.cache.Snapshot()
+	ev := events.MarketEvent{Exchange: f.exCode, Symbol: "USDT/IRT"}
+	tg := f.e.targets(snap, ev)
+	found := false
+	for _, m := range tg {
+		if m.ExchangeMarketID == mc.ExchangeMarketID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("USDT/IRT event did not select dependent IRT market %s", sym)
+	}
+	for _, m := range tg {
+		if err := f.e.evaluate(f.ctx, snap, m); err != nil {
+			t.Fatalf("evaluate: %v", err)
+		}
+	}
+	if f.comparisonCount(sym) < 1 {
+		t.Errorf("dependent IRT market got no comparison_event on USDT/IRT tick")
+	}
+	if f.signalCount(sym) < 1 {
+		t.Errorf("dependent IRT market got no signal (spread should pass)")
+	}
+}
+
+// TestEngineUsesPerExchangeDefaultFeeAndOverride (PR8 correction) — the engine resolves fees
+// via Snapshot.FeeFor(exchangeID, exchangeMarketID): two exchanges with DIFFERENT default
+// fees must produce different fee-adjusted spreads (no shared key-0 leak), and a
+// market-specific fee overrides the exchange default.
+func TestEngineUsesPerExchangeDefaultFeeAndOverride(t *testing.T) {
+	f := setupE(t)
+	last := func(r sql.Result) int64 { id, _ := r.LastInsertId(); return id }
+	ex := func(q string, a ...any) sql.Result {
+		r, err := f.db.Exec(q, a...)
+		if err != nil {
+			f.t.Fatalf("seed %q: %v", q, err)
+		}
+		return r
+	}
+	// Exchange B, distinct from the fixture's exchange A (f.exID).
+	eseq++
+	bCode := fmt.Sprintf("engB_%d_%d", time.Now().UnixNano(), eseq)
+	bID := last(ex("INSERT INTO exchanges (code, name, enabled) VALUES (?, 'Eng B', 1)", bCode))
+
+	// DEFAULT fees (exchange_market_id NULL): A has zero fee, B has 100 bps taker.
+	ex("INSERT INTO exchange_fees (exchange_id, exchange_market_id, maker_fee, taker_fee) VALUES (?, NULL, '0', '0')", f.exID)
+	ex("INSERT INTO exchange_fees (exchange_id, exchange_market_id, maker_fee, taker_fee) VALUES (?, NULL, '0', '0.01')", bID)
+
+	// A USDT market on each exchange with the SAME prices and NO market-specific fee.
+	seedNoFeeMarket := func(exID int64) (int64, string) {
+		eseq++
+		base := fmt.Sprintf("FB%d_%d", exID, eseq)
+		canonical := base + "/USDT"
+		bAsset := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", base))
+		qAsset := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", fmt.Sprintf("FQ%d_%d", exID, eseq)))
+		mID := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", canonical, bAsset, qAsset))
+		emID := last(ex(`INSERT INTO exchange_markets
+			(exchange_id, market_id, exchange_symbol, canonical_symbol, enabled_for_collection, enabled_for_signal, enabled_for_trading, enabled_for_sell_manage)
+			VALUES (?, ?, ?, ?, 1, 1, 0, 0)`, exID, mID, base+"USDT", canonical))
+		ex(`INSERT INTO symbol_configs (exchange_market_id, min_spread_bps, buy_size, buy_size_unit, sell_offset_bps, reprice_interval_seconds, order_timeout_ms, max_retries, retry_backoff_ms)
+			VALUES (?, 10, '1', 'base', 20, 5, 3000, 3, 500)`, emID)
+		return emID, canonical
+	}
+	emA, symA := seedNoFeeMarket(f.exID)
+	emB, symB := seedNoFeeMarket(bID)
+
+	if _, err := f.cfg.ActivateVersion(f.ctx, "test", "fee"); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.cache.Reload(f.ctx, f.cfg); err != nil {
+		f.t.Fatal(err)
+	}
+	snap := f.cache.Snapshot()
+	mcA, _ := snap.Market(emA)
+	mcB, _ := snap.Market(emB)
+
+	// Same prices for both → same RAW spread (1000 bps), different fee-adjusted by exchange.
+	f.seedBook(f.exCode, symA, "99", "100", 0)
+	f.seedBook(bCode, symB, "99", "100", 0)
+	f.seedBook("binance", baseOf(symA)+"/USDT", "110", "111", 0)
+	f.seedBook("binance", baseOf(symB)+"/USDT", "110", "111", 0)
+
+	if err := f.e.evaluate(f.ctx, snap, mcA); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.e.evaluate(f.ctx, snap, mcB); err != nil {
+		f.t.Fatal(err)
+	}
+	faA, faB := f.lastFeeAdjusted(symA), f.lastFeeAdjusted(symB)
+	if faA <= faB {
+		t.Errorf("fee-adjusted A=%d B=%d; A (no fee) must exceed B (100bps default) — per-exchange fee not applied", faA, faB)
+	}
+	if faA-faB != 100 {
+		t.Errorf("fee-adjusted gap = %d, want 100 bps (exchange B's default taker fee)", faA-faB)
+	}
+
+	// Market-specific override on B (zero fee) must beat B's exchange default.
+	ex("INSERT INTO exchange_fees (exchange_id, exchange_market_id, maker_fee, taker_fee) VALUES (?, ?, '0', '0')", bID, emB)
+	if _, err := f.cfg.ActivateVersion(f.ctx, "test", "override"); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.cache.Reload(f.ctx, f.cfg); err != nil {
+		f.t.Fatal(err)
+	}
+	snap2 := f.cache.Snapshot()
+	mcB2, _ := snap2.Market(emB)
+	if err := f.e.evaluate(f.ctx, snap2, mcB2); err != nil {
+		f.t.Fatal(err)
+	}
+	if faB2 := f.lastFeeAdjusted(symB); faB2 != faA {
+		t.Errorf("after override, B fee-adjusted = %d, want %d (override fee 0 beats the 100bps default)", faB2, faA)
+	}
+}
+
 // ---- helpers ----
+
+func (f *efix) orderCountForMarket(mc configstore.MarketConfig) int {
+	var n int
+	f.db.QueryRow("SELECT COUNT(*) FROM orders WHERE exchange_market_id=?", mc.ExchangeMarketID).Scan(&n)
+	return n
+}
+func (f *efix) lockCountForMarket(mc configstore.MarketConfig) int {
+	var n int
+	f.db.QueryRow(`SELECT COUNT(*) FROM symbol_locks sl JOIN cycles c ON c.id=sl.cycle_id WHERE c.exchange_market_id=?`, mc.ExchangeMarketID).Scan(&n)
+	return n
+}
+func (f *efix) exchangeRequestCount() int {
+	var n int
+	f.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE exchange_id=?", f.exID).Scan(&n)
+	return n
+}
+func (f *efix) lastFeeAdjusted(canonical string) int {
+	var n int
+	f.db.QueryRow("SELECT fee_adjusted_spread_bps FROM comparison_events WHERE canonical_symbol=? ORDER BY id DESC LIMIT 1", canonical).Scan(&n)
+	return n
+}
 
 func redisConfig(addr string) config.RedisConfig { return config.RedisConfig{Addr: addr, DB: 15} }
 
