@@ -158,3 +158,25 @@ func TestReadOnlyServiceMainsHoldNoPrivateClient(t *testing.T) {
 		}
 	}
 }
+
+// TestTradeEngineSignalOnlyInPR8 (PR8) asserts the trade-engine binary stays SIGNAL-ONLY: it
+// must NOT enable buy-cycle preparation. Setting PrepareBuyCycles: true (which lets the engine
+// create/refresh cycles/orders/exchange_requests/symbol_locks via buyflow) belongs to PR9, so
+// the PR8 binary wiring must leave it disabled.
+func TestTradeEngineSignalOnlyInPR8(t *testing.T) {
+	re := regexp.MustCompile(`PrepareBuyCycles\s*:\s*true`)
+	found := false
+	for _, l := range scan(t) {
+		if isComment(l.text) {
+			continue
+		}
+		if strings.HasPrefix(l.path, "cmd/trade-engine/") && re.MatchString(l.text) {
+			found = true
+			t.Errorf("%s:%d cmd/trade-engine enables PrepareBuyCycles; PR8 must be signal-only (enable it in PR9): %s",
+				l.path, l.num, strings.TrimSpace(l.text))
+		}
+	}
+	if found {
+		t.Log("the trade-engine binary must keep PrepareBuyCycles disabled in PR8")
+	}
+}

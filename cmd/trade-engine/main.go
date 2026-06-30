@@ -1,8 +1,9 @@
 // Command trade-engine consumes market events and market data, computes the
-// (owner-defined) spread/signal, and writes comparison_events / signals. It NEVER
-// calls an exchange API directly (no private clients, no PlaceOrder/CancelOrder)
-// and in PR8 does NOT create cycles/orders (that is PR9). It may refresh/remove an
-// existing not-yet-claimed QUEUED buy intent to avoid duplicate pending intent.
+// (owner-defined) spread/signal, and writes ONLY comparison_events / signals. It is
+// SIGNAL-ONLY in PR8: it NEVER calls an exchange API (no private clients, no
+// PlaceOrder/CancelOrder) and does NOT create or refresh cycles, orders,
+// exchange_requests, symbol locks, or pending buy intents. Buy-cycle preparation
+// (engine.Config.PrepareBuyCycles) stays DISABLED here until PR9 reviews and enables it.
 package main
 
 import (
@@ -36,9 +37,10 @@ func main() {
 			base.Log.Warn("config reload failed (keeping previous snapshot)", "err", e)
 		})
 
-		// In dry-run mode the engine stamps created cycles as dry-run so the dashboard/
-		// reconciler can identify them (the executor wires the simulated client). In
-		// LIVE mode the live guard gates new buy-cycle creation (kill switch + caps).
+		// DryRun / LiveGuard are wired forward but INERT in PR8: they only take effect once
+		// buy-cycle preparation is enabled (PR9). DryRun later stamps created cycles for the
+		// dashboard/reconciler; in LIVE mode the guard gates new buy-cycle creation. In PR8 no
+		// cycle is ever created, so neither has any effect.
 		var liveGuard *live.Guard
 		if base.Cfg.Execution.IsLive() {
 			liveGuard = live.NewGuard(store.DB(), clock.NewSystem(), base.Log)
@@ -46,9 +48,10 @@ func main() {
 		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
 			DryRun:    base.Cfg.Execution.IsDryRun(),
 			LiveGuard: liveGuard,
-			// PR9+: the full trade-engine binary prepares buy cycles on passing signals.
-			// (The engine library itself is signal-only by default — PR8 boundary.)
-			PrepareBuyCycles: true,
+			// PR8 BOUNDARY: the binary stays signal-only — it writes only comparison_events +
+			// signals. Buy-cycle preparation (cycles/orders/exchange_requests/symbol_locks via
+			// buyflow) is DISABLED here and is enabled in PR9. Do NOT set this true in PR8.
+			PrepareBuyCycles: false,
 		})
 		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
 		// Startup live-safety summary (no secrets).

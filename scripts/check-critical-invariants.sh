@@ -46,6 +46,12 @@ say "== 6. trade-engine / reconciler / balance-sync / health-monitor / dashboard
 hits=$(grep -rnE 'PrivateClient' cmd/trade-engine cmd/reconciler cmd/balance-sync cmd/health-monitor cmd/dashboard --include='*.go' 2>/dev/null | grep -v '_test.go' || true)
 [ -n "$hits" ] && { bad "a read-only service main references PrivateClient:"; echo "$hits"; } || say "  ok"
 
+say "== 7. PR8: cmd/trade-engine stays signal-only (must NOT enable buy-cycle preparation) =="
+# Enabling PrepareBuyCycles lets the engine create/refresh cycles/orders/exchange_requests/
+# symbol_locks via buyflow — that is PR9's job. The PR8 binary must leave it disabled.
+hits=$(grep -rnE 'PrepareBuyCycles[[:space:]]*:[[:space:]]*true' cmd/trade-engine --include='*.go' 2>/dev/null | grep -v '_test.go' || true)
+[ -n "$hits" ] && { bad "cmd/trade-engine enables PrepareBuyCycles (PR8 must be signal-only; enable in PR9):"; echo "$hits"; } || say "  ok"
+
 if [ "$fail" -ne 0 ]; then
   say ""
   say "CRITICAL INVARIANT CHECK FAILED"
