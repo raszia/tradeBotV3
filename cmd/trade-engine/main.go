@@ -46,6 +46,9 @@ func main() {
 		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
 			DryRun:    base.Cfg.Execution.IsDryRun(),
 			LiveGuard: liveGuard,
+			// PR9+: the full trade-engine binary prepares buy cycles on passing signals.
+			// (The engine library itself is signal-only by default — PR8 boundary.)
+			PrepareBuyCycles: true,
 		})
 		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
 		// Startup live-safety summary (no secrets).

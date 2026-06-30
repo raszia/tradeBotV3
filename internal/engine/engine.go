@@ -45,6 +45,14 @@ type Config struct {
 	// caps + kill switch (PR20). It is the first check; the executor re-checks before
 	// the actual send.
 	LiveGuard *live.Guard
+	// PrepareBuyCycles enables PR9 buy-cycle preparation: on a PASSING signal for a
+	// trading-enabled market the engine creates (or refreshes the QUEUED buy of) a cycle +
+	// symbol lock + order + queued PLACE request, transactionally via internal/buyflow.
+	//
+	// PR8 is SIGNAL-ONLY and leaves this FALSE — the engine's only writes are then
+	// comparison_events + signals, and it touches no cycles/orders/exchange_requests/locks.
+	// The PR9 wiring (cmd/trade-engine) sets it true.
+	PrepareBuyCycles bool
 	// SubscribeMinBackoff / SubscribeMaxBackoff bound the exponential backoff between
 	// market_events resubscribe attempts after an unexpected close (defaults 200ms / 30s).
 	SubscribeMinBackoff time.Duration
@@ -449,11 +457,12 @@ func (e *Engine) evaluate(ctx context.Context, snap *configstore.Snapshot, m con
 	if _, err := e.writeSignal(ctx, m, quote, binanceRef, iAsk.Price, refRate, res, snap.Version); err != nil {
 		return err
 	}
-	// Trading-enabled markets prepare the buy intent (§2a, §10a). PR9 creates the
-	// cycle/lock/order/request under the symbol lock — or, if the scope is already
-	// locked, refreshes the existing QUEUED (unsent) buy instead of duplicating it.
-	// It still NEVER calls an exchange or sends an order.
-	if m.EnabledForTrading {
+	// SIGNAL-ONLY boundary (PR8): the engine stops here. Buy-cycle preparation
+	// (cycle + lock + order + QUEUED request, transactionally via internal/buyflow) is
+	// PR9's responsibility and is gated behind Config.PrepareBuyCycles, which PR8 leaves
+	// FALSE. So in PR8 a passing signal for a trading-enabled market still writes ONLY
+	// comparison_events + signals — no cycles/orders/exchange_requests/symbol_locks.
+	if m.EnabledForTrading && e.cfg.PrepareBuyCycles {
 		return e.prepareBuy(ctx, m, iAsk.Price, binanceRef, refRate, quote, fee, res, snap.Version)
 	}
 	return nil

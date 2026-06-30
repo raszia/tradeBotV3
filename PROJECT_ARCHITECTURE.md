@@ -163,9 +163,10 @@ no-open-order is not proof of zero fill; proven zero-fill may safely close/expir
 the attempt; proven partial/full fill must preserve the filled amount and keep the
 cycle safe for later sell management.
 
-**Implementation placement:** pre-cycle no-duplicate-queued-signal (update/remove an
-unsent intent) → PR8; one-active-pending-intent via the **symbol lock** +
-maker/taker decision + buy enqueue → **PR9**; simulated-IOC execution + fill/status
+**Implementation placement:** signal evaluation + write `comparison_events`/`signals`
+→ PR8 (signal-only); one-active-pending-intent via the **symbol lock** +
+no-duplicate-queued-signal (refresh the unsent QUEUED buy) + maker/taker decision +
+buy enqueue → **PR9** (all transactional); simulated-IOC execution + fill/status
 recording + `actual_execution_mode` → PR10; sell/reprice on filled qty → PR11;
 reconciler crash/ambiguity handling → PR12; dashboard exposes the maker/taker policy,
 simulated-IOC wait interval, and per-attempt mode/fill reporting → PR16/PR17. Each
@@ -388,18 +389,24 @@ The `collector` binary (`internal/collector`) is the read-only market-data plane
 
 ## 7b. Trade-engine signal loop (implemented in PR8 — `internal/engine`)
 
-The `trade-engine` binary consumes `market_events`, reads the latest books/prices
-from Redis and trading config from the configstore cache, computes the spread, and
-writes `comparison_events` / `signals`. **Hard boundaries — PR8 is signal-only:** it
-NEVER calls an exchange (no private clients, no `PlaceOrder`/`CancelOrder` — a
-reflection guard asserts no engine field can place/cancel), and its ONLY direct
-writes are `comparison_events` and `signals`. It does **not** create/update/delete
-cycles, orders, `exchange_requests`, or symbol locks. (Buy-cycle preparation for a
-trading-enabled market is delegated to **PR9's `internal/buyflow`**, which does
-cycle + order + QUEUED request + lock in ONE transaction — the engine itself never
-independently mutates `exchange_requests`, so there is no orphan-state risk. The
-historical `UpdatePendingBuyRequest`/`RemovePendingBuyRequest` helpers were never
-implemented; pending-buy refresh is `buyflow.RefreshActiveCycleBuy`, PR9, transactional.)
+The signal loop consumes `market_events`, reads the latest books/prices from Redis
+and trading config from the configstore cache, computes the spread, and writes
+`comparison_events` / `signals`. **Hard boundaries — PR8 is SIGNAL-ONLY:** it NEVER
+calls an exchange (no private clients, no `PlaceOrder`/`CancelOrder` — a reflection
+guard asserts no engine field can place/cancel), and its ONLY writes are
+`comparison_events` and `signals`. **Even for a trading-enabled market with a passing
+signal, PR8 creates no cycle, order, `exchange_request`, or symbol lock, and calls no
+`buyflow`.**
+
+Buy-cycle preparation is a SEPARATE capability gated behind `Config.PrepareBuyCycles`,
+which the engine **leaves false by default** (the PR8 boundary). Only when a later
+stage turns it on (PR9, wired in `cmd/trade-engine`) does a passing signal for a
+trading-enabled market prepare the buy — cycle + symbol lock + order + QUEUED
+`PLACE_ORDER` request — and that is done in ONE transaction via `internal/buyflow`
+(so a queue row is never created/updated/deleted in isolation; no orphan state). The
+no-duplicate "refresh the existing QUEUED buy" path is `buyflow.RefreshActiveCycleBuy`
+(PR9, transactional). There are no standalone `UpdatePendingBuyRequest`/
+`RemovePendingBuyRequest` methods — those never existed.
 
 **Fee lookup (PR6 model).** Fees come from `Snapshot.FeeFor(m.ExchangeID,
 m.ExchangeMarketID)` — a market-specific override else THIS exchange's default,
@@ -2125,11 +2132,12 @@ stack). Rule #3 keeps automated tests venue-free.
   `order-executor` binary wires no real private clients (`AllowLiveExecution=false`);
   and the `reconciler` binary wires no read-only clients yet (credential decryption
   is a later PR), so it inspects DB state and safely skips unverifiable exchanges.
-- **PR8 does not create the buy request, so its §2a intent helpers update/remove an
-  existing QUEUED request but never create one** — until PR9 creates buy requests,
-  the update/remove paths are exercised only by tests. The simulated-IOC execution
-  parameters (wait/cancel) are not in the schema yet; PR8's refreshed intent payload
-  carries only price/quantity/config context. `comparison_events` are written
+- **PR8 is signal-only: it neither creates NOR refreshes any buy request** — the
+  no-duplicate "refresh the existing QUEUED buy" logic belongs to PR9's `buyflow`
+  (`RefreshActiveCycleBuy`, transactional with the cycle/lock), gated behind
+  `Config.PrepareBuyCycles` (off by default). The simulated-IOC execution parameters
+  (wait/cancel) are not in the schema yet; the PR9 buy-intent payload carries only
+  price/quantity/config context. `comparison_events` are written
   synchronously (async batching is a later optimization). For IRT/IRR markets the
   USDT→IRT conversion uses the same exchange's `USDT/IRT` best bid as the rate.
 - **PR12 reconciler does not do fill accounting** (PR10): it conservatively flags
@@ -2226,18 +2234,23 @@ venue-free).
 
 ## 19a. Decisions log
 
-- **PR8 (correction) — engine is signal-only, resilient subscription, quote-rate fan-out**:
-  the trade-engine's only direct writes are `comparison_events` + `signals`; it does not
-  mutate `exchange_requests`/cycles/orders/locks (buy-cycle prep is PR9's transactional
-  `buyflow`, which keeps cycle + order + request + lock consistent in one tx). The dangerous
-  standalone `UpdatePendingBuyRequest`/`RemovePendingBuyRequest` the reviewer flagged were a
-  STALE doc artifact — they were never in the code; the doc was corrected. Fee resolution
-  already used `Snapshot.FeeFor` (per-exchange default, no key-0 leak — PR6). Two real bugs
-  fixed: (a) the `market_events` loop returned `nil` on an unexpected channel close
-  (silent stop); it now resubscribes with capped backoff and only stops on ctx-cancel; (b)
-  `targets` did not re-evaluate IRT markets when their `USDT/IRT` quote rate ticked — it now
-  re-evaluates all signal-enabled rial-quoted markets on that exchange. Branch cut from
-  `pr7-queue-recovery-guards`; single PR8 history row (pre-rebase duplicate gone).
+- **PR8 (correction, round 2) — engine truly signal-only via a capability flag**: the
+  signal path called `prepareBuy`→`buyflow` unconditionally for trading-enabled markets, so
+  PR8 could still indirectly create cycles/orders/requests/locks. Buy-cycle preparation is
+  now gated behind `Config.PrepareBuyCycles`, which the engine **leaves false by default** —
+  so PR8's only writes are `comparison_events` + `signals` even when a trading-enabled
+  market's signal passes. The full-system binary (`cmd/trade-engine`, PR9) sets the flag
+  true; the gated cycle-creation tests enable it explicitly. New strong test
+  `TestSignalOnlyEvenWhenTradingEnabled` (signal+trading enabled, signal passes → 0
+  cycles/orders/exchange_requests/symbol_locks) fails under the old behavior and passes now.
+- **PR8 (correction, round 1) — resilient subscription, quote-rate fan-out, FeeFor**:
+  the `market_events` loop returned `nil` on an unexpected channel close (silent stop); it now
+  resubscribes with capped backoff and only stops on ctx-cancel. `targets` did not
+  re-evaluate IRT markets when their `USDT/IRT` quote rate ticked — it now re-evaluates all
+  signal-enabled rial-quoted markets on that exchange. Fee resolution already used
+  `Snapshot.FeeFor` (per-exchange default, no key-0 leak — PR6). The standalone
+  `UpdatePendingBuyRequest`/`RemovePendingBuyRequest` the review flagged never existed in
+  code (a stale doc artifact, corrected). Branch cut from `pr7-queue-recovery-guards`.
 
 - **PR7 (correction) — queue crash-recovery + guarded transitions**: `SweepStuck` now recovers
   stale `CLAIMED` requests (claimed but never marked `IN_FLIGHT`, so never sent) by resetting
@@ -2653,10 +2666,11 @@ venue-free).
 - **PR8 — the signal loop holds no exchange client by construction** (a reflection
   test asserts no engine field can `PlaceOrder`/`CancelOrder`); it never creates
   cycles/orders (PR9). Only `comparison_events`/`signals` are written.
-- **PR8 — pending-intent scope is `exchange_market_id`** (one strategy today). PR8
-  refreshes/removes an existing QUEUED buy request but never creates one;
-  `SELECT … FOR UPDATE` + a `status='QUEUED'` guard make CLAIMED/IN_FLIGHT requests
-  untouchable.
+- **Pending-intent scope is `exchange_market_id`** (one strategy today). The
+  no-duplicate refresh of an existing QUEUED buy request is **PR9's** `buyflow`
+  (`SELECT … FOR UPDATE` + a `status='QUEUED'` guard make CLAIMED/IN_FLIGHT requests
+  untouchable), gated behind `Config.PrepareBuyCycles`. **PR8 itself never creates OR
+  refreshes a buy request** — it is signal-only.
 - **PR8 — `comparison_events` written synchronously** for now (low PR8 throughput);
   async batching deferred. Stale/missing/invalid data writes nothing (fail-safe).
 - **PR8 — `MarketConfig` gained `ExchangeID`** so the engine can stamp
@@ -2786,7 +2800,7 @@ venue-free).
 | PR6 | `pr6-config-fee-scope-validation` | **in review** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. **Corrections:** default fees are scoped per exchange (`DefaultFeesByExchangeID` keyed by exchange_id + `FeesByMarketID` keyed by exchange_market_id) with `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (market override → THIS exchange's default, never another's) — replaces the unsafe single map where every default collided at key 0; `UpdateMinSpreadBps` validates BEFORE the tx (negative spread activates no version / mutates no symbol_config / writes no audit); `ActiveVersion` returns `ErrMultipleActiveVersions` instead of silently picking the latest; integration tests use per-run suffixes (repeat-safe). Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, FeeFor scoping/priority (offline), gated fee-scoping/invalid-write-rejected/multiple-active-rejected + repeat-safe full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-queue-recovery-guards` | **in review** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. **Corrections:** `SweepStuck` also recovers stale `CLAIMED` (never sent → requeued to QUEUED, claim cleared); `MarkInFlight` checks `RowsAffected` → `ErrRequestNotClaimed` (executor does not send); `MarkSucceeded/Failed/Dead` are status-guarded (`WHERE status IN ('CLAIMED','IN_FLIGHT')` + `RowsAffected`) → `ErrRequestNotActive` on a conflicting newer status, idempotent no-op on same status; definite `PlaceOrder` rejection moves the order out of `QUEUED` to `FAILED` via `ApplyOrderTransition` (already correct); ambiguous → `DEAD` + order `NEEDS_RECONCILE` (already correct). Tests: queue sqlmock + gated MariaDB (concurrent claimers, **stale-CLAIMED recovery**, **MarkInFlight zero-row**, **terminal status guards + idempotency**), executor classifiers + reflection no-send guard + gated end-to-end with fake clients (**MarkInFlight-failure-blocks-send**, definite-rejection-out-of-QUEUED, ambiguous-NEEDS_RECONCILE). Order/cycle state only via `internal/state`; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
-| PR8 | `pr8-engine-signal-only` | **in review** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **SIGNAL-ONLY: the only direct writes are `comparison_events` + `signals` — no exchange calls, no cycle/order/exchange_request/symbol-lock writes** (buy-cycle prep is PR9's transactional `buyflow`). **Corrections:** fees via `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak); `market_events` subscription resilient — an unexpected close while ctx is active resubscribes with capped backoff and only stops on ctx-cancel (never silently returns nil); a `USDT/IRT` quote-rate tick re-evaluates all signal-enabled rial-quoted markets on the same exchange; corrected the stale doc that claimed non-existent `Update/RemovePendingBuyRequest` methods. Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/**targets-quote-rate-dependents**/**subscription-reconnect**/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing, disabled-for-signal, IRT conversion, fee-adjusted, **per-exchange-default-fee + override**, **signal-only-touches-no-execution-state**, **USDT/IRT-reevaluates-dependent-IRT**, config-stamp). |
+| PR8 | `pr8-engine-signal-only` | **in review** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **SIGNAL-ONLY: the only writes are `comparison_events` + `signals` — no exchange calls, no cycle/order/exchange_request/symbol-lock writes, EVEN for a trading-enabled market with a passing signal.** Buy-cycle preparation is gated behind `Config.PrepareBuyCycles` (default FALSE; PR9 turns it on in `cmd/trade-engine`) and is PR9's transactional `buyflow`. **Corrections:** removed the unconditional `prepareBuy`/`buyflow` call from the signal path (now flag-gated, off by PR8 default); fees via `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak); `market_events` subscription resilient — an unexpected close while ctx is active resubscribes with capped backoff and only stops on ctx-cancel (never silently returns nil); a `USDT/IRT` quote-rate tick re-evaluates all signal-enabled rial-quoted markets on the same exchange; corrected the stale doc that claimed non-existent `Update/RemovePendingBuyRequest` methods. Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients; PrepareBuyCycles on). Tests: offline spread/quote/**targets-quote-rate-dependents**/**subscription-reconnect**/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing, disabled-for-signal, IRT conversion, fee-adjusted, per-exchange-default-fee + override, **signal-only-EVEN-when-trading-enabled (0 cycles/orders/requests/locks)**, USDT/IRT-reevaluates-dependent-IRT, config-stamp; PR9-gated cycle-creation tests enable the flag). |
 | PR9 | `pr9-cycle-creation-buy-enqueue` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
 | PR10 | `pr10-order-fill-processing` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
 | PR11 | `pr11-sell-management` | **accepted** | `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |

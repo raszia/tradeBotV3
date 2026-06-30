@@ -150,6 +150,10 @@ func (f *efix) seedRate(exchange, bid string, age time.Duration) {
 	f.t.Cleanup(func() { f.rc.Redis().Del(context.Background(), redisx.PriceKey(exchange, "USDT/IRT")) })
 }
 
+// enableBuyPrep turns on PR9 buy-cycle preparation for tests that exercise cycle creation.
+// (The engine is signal-only by default — PR8 boundary.)
+func (f *efix) enableBuyPrep() { f.e.cfg.PrepareBuyCycles = true }
+
 // run evaluates one market and fails on a hard error.
 func (f *efix) run(mc configstore.MarketConfig) {
 	f.t.Helper()
@@ -368,6 +372,7 @@ func (f *efix) cycleCount(mc configstore.MarketConfig) int {
 
 func TestPassingSignalCreatesBuyCycle(t *testing.T) {
 	f := setupE(t)
+	f.enableBuyPrep()                                         // PR9 behavior
 	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true) // trading enabled
 	base := baseOf(sym)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
@@ -397,6 +402,7 @@ func TestPassingSignalCreatesBuyCycle(t *testing.T) {
 
 func TestRepeatedSignalDoesNotDuplicateCycle(t *testing.T) {
 	f := setupE(t)
+	f.enableBuyPrep() // PR9 behavior
 	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true)
 	base := baseOf(sym)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
@@ -411,6 +417,7 @@ func TestRepeatedSignalDoesNotDuplicateCycle(t *testing.T) {
 
 func TestRepeatedSignalRefreshesQueuedPrice(t *testing.T) {
 	f := setupE(t)
+	f.enableBuyPrep() // PR9 behavior
 	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true)
 	base := baseOf(sym)
 	f.seedBook(f.exCode, sym, "99", "100", 0)
@@ -485,6 +492,42 @@ func TestSignalOnlyMarketTouchesNoExecutionState(t *testing.T) {
 	}
 	if n := f.exchangeRequestCount(); n != reqBefore {
 		t.Errorf("exchange_requests changed %d -> %d; the trade-engine must not mutate the queue", reqBefore, n)
+	}
+}
+
+// TestSignalOnlyEvenWhenTradingEnabled (PR8 correction) — the STRONG signal-only proof: with
+// enabled_for_signal AND enabled_for_trading AND a PASSING signal, PR8 still writes ONLY
+// comparison_events + signals and creates NO cycle/order/exchange_request/symbol_lock (the
+// engine does not call buyflow). Buy-prep is OFF by default; this fails under the old
+// unconditional prepareBuy behavior.
+func TestSignalOnlyEvenWhenTradingEnabled(t *testing.T) {
+	f := setupE(t)
+	// Deliberately do NOT call f.enableBuyPrep(): PR8 default is signal-only.
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true) // signal AND trading enabled
+	base := baseOf(sym)
+	f.seedBook(f.exCode, sym, "99", "100", 0)
+	f.seedBook("binance", base+"/USDT", "101", "102", 0) // ~100 bps > 50 → signal passes
+	reqBefore := f.exchangeRequestCount()
+
+	f.run(mc)
+
+	if f.comparisonCount(sym) != 1 || f.signalCount(sym) != 1 {
+		t.Fatalf("signal path: comparison=%d signal=%d, want 1/1 (signal must pass)", f.comparisonCount(sym), f.signalCount(sym))
+	}
+	if n := f.cycleCount(mc); n != 0 {
+		t.Errorf("cycles=%d, want 0 (PR8 is signal-only even when trading is enabled)", n)
+	}
+	if n := f.orderCountForMarket(mc); n != 0 {
+		t.Errorf("orders=%d, want 0 (no buyflow in PR8)", n)
+	}
+	if n := f.buyRequestCount(mc); n != 0 {
+		t.Errorf("buy requests=%d, want 0 (no enqueue in PR8)", n)
+	}
+	if n := f.symbolLockCount(sym); n != 0 {
+		t.Errorf("symbol_locks=%d, want 0 (no lock in PR8)", n)
+	}
+	if n := f.exchangeRequestCount(); n != reqBefore {
+		t.Errorf("exchange_requests changed %d -> %d; PR8 must not touch the queue", reqBefore, n)
 	}
 }
 
@@ -628,6 +671,11 @@ func (f *efix) lockCountForMarket(mc configstore.MarketConfig) int {
 func (f *efix) exchangeRequestCount() int {
 	var n int
 	f.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE exchange_id=?", f.exID).Scan(&n)
+	return n
+}
+func (f *efix) symbolLockCount(canonical string) int {
+	var n int
+	f.db.QueryRow("SELECT COUNT(*) FROM symbol_locks WHERE scope=? AND canonical_symbol=?", f.exCode, canonical).Scan(&n)
 	return n
 }
 func (f *efix) lastFeeAdjusted(canonical string) int {
