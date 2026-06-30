@@ -1097,6 +1097,18 @@ additive enhancement for a later PR. Binance order-book WS is implemented.
   (concurrency/timeouts), fees, retention settings, and the active
   `config_version`. `Store.LoadSnapshot` builds it; a missing active version is
   tolerated (`Version = 0`, the "unconfigured" state).
+- **Fees scoped per exchange (PR6 correction)** — defaults live in
+  `DefaultFeesByExchangeID` (keyed by `exchange_id`) and market-specific overrides in
+  `FeesByMarketID` (keyed by `exchange_market_id`). A single map keyed by
+  `exchange_market_id` with `0`="default" was unsafe: every exchange's default
+  collided at key `0` (last write wins), so profit/decision math could use the wrong
+  venue's fee. `Snapshot.FeeFor(exchangeID, exchangeMarketID)` resolves a market
+  override first, then THIS exchange's default — **never** another exchange's default.
+- **Single active version enforced (PR6 correction)** — `ActiveVersion` no longer does
+  `ORDER BY id DESC LIMIT 1`. Zero active → `ErrNoActiveVersion`; exactly one → its id;
+  more than one → `ErrMultipleActiveVersions` (the system refuses to silently pick one,
+  since that could run trading on the wrong config). The activation path keeps the
+  invariant (supersede-then-insert in one tx).
 - **Cache** — a copy-on-write `atomic.Pointer[Snapshot]`. Readers (the trade-engine
   hot path, later) call `cache.Snapshot()` with **no lock and no DB query**
   (rule #4). `cache.Run` reloads off the trading path on an interval; a reload
@@ -1110,6 +1122,9 @@ additive enhancement for a later PR. Binance order-book WS is implemented.
   activates a new version, updates the row, and writes a `config_change_audit`
   row (entity/field/old/new/changed_by/reason/version/time). **Audit rows never
   contain secrets** (credential changes use `exchange_credential_audit`).
+  **Write-path validation happens BEFORE the transaction (PR6 correction):** an
+  invalid value (e.g. a negative `min_spread_bps`) is rejected up front, so it
+  activates no version, mutates no `symbol_config`, and writes no audit row.
 - **Validation** (rule #6) — `ValidateMarket`/`ValidateExchange`/`ValidateSnapshot`
   check value sanity (non-negative spreads/intervals/retries, positive timeouts/
   concurrency, positive `buy_size` when trading is enabled, valid `buy_size_unit`)
@@ -2172,6 +2187,19 @@ venue-free).
 
 ## 19a. Decisions log
 
+- **PR6 (correction) — fee scoping, write validation, single-active enforcement**: default
+  exchange fees are scoped by `exchange_id` (`DefaultFeesByExchangeID`) instead of sharing a
+  single map keyed by `exchange_market_id` with `0`="default" (where every exchange's default
+  overwrote the previous at key 0); `Snapshot.FeeFor(exchangeID, exchangeMarketID)` resolves a
+  market override first, else THIS exchange's default, never another exchange's. The
+  representative write `UpdateMinSpreadBps` now validates before opening the transaction, so an
+  invalid value commits nothing (no version, no symbol_config change, no audit). `ActiveVersion`
+  returns `ErrMultipleActiveVersions` rather than `ORDER BY id DESC LIMIT 1` when the table
+  holds more than one active row. Integration-test seeds carry per-run suffixes (repeat-safe on
+  a reused DB). No DB-level uniqueness constraint was added for active versions (the detect-and-
+  error route was chosen so the "two active" case is still seedable + testable). Branch cut from
+  `pr5-collector-ws-reconnect`; the single PR6 history row is corrected (pre-rebase duplicate gone).
+
 - **PR5 (correction) — collector resilience & publish ordering**: an unexpected WebSocket
   close while the collector context is active is no longer a silent stop — it is logged,
   counted as a health failure (`WSFailureCount`), and reconnected with capped exponential
@@ -2687,7 +2715,7 @@ venue-free).
 | PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
 | PR5 | `pr5-collector-ws-reconnect` | **in review** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. **Correction:** an unexpected WS close while ctx is active reconnects with capped exponential backoff (never silently abandons a target; only ctx-cancel stops it; counted as a health failure + `WSFailureCount`); `market_event` is published ONLY after both `SaveOrderBook` and `SavePrice` succeed; REST `received_at` is stamped after a successful `GetOrderBook`. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only, **ws-reconnect-on-unexpected-close**, **no-publish-when-save-book/price-fails**), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; collector uses only PublicClient; no trading/order/cycle/credential code. |
-| PR6 | `pr6-config-system` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, gated MariaDB full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
+| PR6 | `pr6-config-fee-scope-validation` | **in review** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. **Corrections:** default fees are scoped per exchange (`DefaultFeesByExchangeID` keyed by exchange_id + `FeesByMarketID` keyed by exchange_market_id) with `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (market override → THIS exchange's default, never another's) — replaces the unsafe single map where every default collided at key 0; `UpdateMinSpreadBps` validates BEFORE the tx (negative spread activates no version / mutates no symbol_config / writes no audit); `ActiveVersion` returns `ErrMultipleActiveVersions` instead of silently picking the latest; integration tests use per-run suffixes (repeat-safe). Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, FeeFor scoping/priority (offline), gated fee-scoping/invalid-write-rejected/multiple-active-rejected + repeat-safe full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
 | PR7 | `pr7-exchange-request-queue` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. cmd/order-executor wired with no live clients. Tests: queue sqlmock + gated MariaDB (incl. concurrent claimers), executor classifiers + reflection no-send guard + gated end-to-end with fake clients. Closes the safety core; nothing trades yet. |
 | PR12 | `pr12-startup-reconciler` | **accepted** | `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
 | PR8 | `pr8-trade-engine-signal` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **No order execution, no private exchange calls, no cycle creation, no order creation.** §2a pre-cycle pending-intent: update/remove existing **QUEUED** entry-buy request (FOR UPDATE + QUEUED guard; never touches CLAIMED/IN_FLIGHT; never creates). Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients). Tests: offline spread/quote/targets/no-client + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing data, disabled-for-signal, IRT conversion, fee-adjusted, intent update/remove/dedup, config-stamp). |

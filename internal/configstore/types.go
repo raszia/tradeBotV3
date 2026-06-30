@@ -88,7 +88,7 @@ type ExchangeConfig struct {
 }
 
 // FeeConfig is a fee schedule entry. ExchangeMarketID == 0 means the
-// exchange-wide default.
+// exchange-wide default for ExchangeID (stored in DefaultFeesByExchangeID).
 type FeeConfig struct {
 	ExchangeID       int64
 	ExchangeMarketID int64
@@ -118,8 +118,15 @@ type Snapshot struct {
 	MarketsByID     map[int64]MarketConfig    // keyed by exchange_market_id
 	MarketsBySymbol map[string][]MarketConfig // keyed by canonical symbol (across exchanges)
 	Exchanges       map[string]ExchangeConfig // keyed by exchange code
-	Fees            map[int64]FeeConfig       // keyed by exchange_market_id (0 = exchange default)
-	Retention       map[string]RetentionSetting
+
+	// Fees are split into market-specific overrides and per-exchange defaults so a
+	// default fee is NEVER shared across exchanges. A single map keyed by
+	// exchange_market_id with 0 == "default" would make every exchange's default
+	// collide at key 0 (last write wins). Use FeeFor to resolve the applicable fee.
+	FeesByMarketID          map[int64]FeeConfig // keyed by exchange_market_id (overrides)
+	DefaultFeesByExchangeID map[int64]FeeConfig // keyed by exchange_id (per-exchange default)
+
+	Retention map[string]RetentionSetting
 
 	// LoadedAt is set by the loader (wall clock) for observability; not used for
 	// trading decisions.
@@ -143,6 +150,29 @@ func (s *Snapshot) Market(id int64) (MarketConfig, bool) {
 	return m, ok
 }
 
+// FeeFor resolves the fee that applies to one exchange-market:
+//
+//  1. a market-specific override keyed by exchangeMarketID, if present; else
+//  2. the DEFAULT fee for the SAME exchangeID; else
+//  3. not found (false).
+//
+// It NEVER falls back to another exchange's default — defaults are scoped per
+// exchange. The bool is false when no fee (override or default) is configured.
+func (s *Snapshot) FeeFor(exchangeID, exchangeMarketID int64) (FeeConfig, bool) {
+	if s == nil {
+		return FeeConfig{}, false
+	}
+	if exchangeMarketID != 0 {
+		if fc, ok := s.FeesByMarketID[exchangeMarketID]; ok {
+			return fc, true
+		}
+	}
+	if fc, ok := s.DefaultFeesByExchangeID[exchangeID]; ok {
+		return fc, true
+	}
+	return FeeConfig{}, false
+}
+
 // TradableMarkets returns markets currently enabled_for_trading.
 func (s *Snapshot) TradableMarkets() []MarketConfig {
 	var out []MarketConfig
@@ -160,10 +190,11 @@ func (s *Snapshot) TradableMarkets() []MarketConfig {
 // emptySnapshot returns a usable, empty snapshot (no active config).
 func emptySnapshot() *Snapshot {
 	return &Snapshot{
-		MarketsByID:     map[int64]MarketConfig{},
-		MarketsBySymbol: map[string][]MarketConfig{},
-		Exchanges:       map[string]ExchangeConfig{},
-		Fees:            map[int64]FeeConfig{},
-		Retention:       map[string]RetentionSetting{},
+		MarketsByID:             map[int64]MarketConfig{},
+		MarketsBySymbol:         map[string][]MarketConfig{},
+		Exchanges:               map[string]ExchangeConfig{},
+		FeesByMarketID:          map[int64]FeeConfig{},
+		DefaultFeesByExchangeID: map[int64]FeeConfig{},
+		Retention:               map[string]RetentionSetting{},
 	}
 }

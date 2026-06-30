@@ -303,10 +303,9 @@ func (e *Engine) evaluate(ctx context.Context, snap *configstore.Snapshot, m con
 	}
 
 	// --- Fees: Iranian buy (taker) + sell (maker), per-market or exchange default. ---
-	fee, ok := snap.Fees[m.ExchangeMarketID]
-	if !ok {
-		fee = snap.Fees[0] // exchange-wide default (zero value if none configured)
-	}
+	// FeeFor resolves a market-specific override, else THIS exchange's default (never
+	// another exchange's). Zero-value fee if none is configured for this exchange.
+	fee, _ := snap.FeeFor(m.ExchangeID, m.ExchangeMarketID)
 	res := ComputeSpread(SpreadInputs{
 		IranianAsk: iAsk.Price,
 		BinanceRef: binanceRef,

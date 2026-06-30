@@ -13,6 +13,12 @@ import (
 // loader tolerates this (Snapshot.Version = 0) so the system can run unconfigured.
 var ErrNoActiveVersion = errors.New("configstore: no active config version")
 
+// ErrMultipleActiveVersions means MORE THAN ONE config_versions row has
+// status='active'. That is a corrupt invariant (activation always supersedes the
+// prior active in one transaction), so the system must NOT silently pick one — it
+// stops and surfaces the ambiguity for an operator to resolve.
+var ErrMultipleActiveVersions = errors.New("configstore: multiple active config versions")
+
 // Store is the DB access layer for trading config. It wraps *sql.DB.
 type Store struct {
 	db *sql.DB
@@ -21,18 +27,36 @@ type Store struct {
 // New builds a Store over db.
 func New(db *sql.DB) *Store { return &Store{db: db} }
 
-// ActiveVersion returns the active config version id, or ErrNoActiveVersion.
+// ActiveVersion returns the single active config version id. It does NOT use
+// "ORDER BY id DESC LIMIT 1": if the table somehow holds more than one active
+// version, silently picking the latest could run trading on the wrong config, so
+// instead it returns ErrMultipleActiveVersions. Zero active → ErrNoActiveVersion.
 func (s *Store) ActiveVersion(ctx context.Context) (int64, error) {
-	var id int64
-	err := s.db.QueryRowContext(ctx,
-		"SELECT id FROM config_versions WHERE status = 'active' ORDER BY id DESC LIMIT 1").Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, ErrNoActiveVersion
-	}
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT id FROM config_versions WHERE status = 'active' ORDER BY id")
 	if err != nil {
 		return 0, err
 	}
-	return id, nil
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	switch len(ids) {
+	case 0:
+		return 0, ErrNoActiveVersion
+	case 1:
+		return ids[0], nil
+	default:
+		return 0, fmt.Errorf("%w: ids=%v", ErrMultipleActiveVersions, ids)
+	}
 }
 
 const marketsQuery = `
@@ -244,12 +268,20 @@ func (s *Store) loadFees(ctx context.Context, snap *Snapshot) error {
 		if err := rows.Scan(&exID, &emID, &maker, &taker, &version); err != nil {
 			return err
 		}
-		snap.Fees[emID.Int64] = FeeConfig{ // emID.Int64 == 0 => exchange default
-			ExchangeID:       exID,
-			ExchangeMarketID: emID.Int64,
-			MakerFee:         maker,
-			TakerFee:         taker,
-			ConfigVersion:    version.Int64,
+		fc := FeeConfig{
+			ExchangeID:    exID,
+			MakerFee:      maker,
+			TakerFee:      taker,
+			ConfigVersion: version.Int64,
+		}
+		if emID.Valid {
+			// Market-specific override (exchange_market_id set).
+			fc.ExchangeMarketID = emID.Int64
+			snap.FeesByMarketID[emID.Int64] = fc
+		} else {
+			// Exchange-wide DEFAULT (exchange_market_id IS NULL). Scoped by exchange_id
+			// so two exchanges' defaults never collide / overwrite each other.
+			snap.DefaultFeesByExchangeID[exID] = fc
 		}
 	}
 	return rows.Err()
@@ -319,6 +351,11 @@ func (s *Store) ActivateVersion(ctx context.Context, createdBy, note string) (in
 // records an audit row with old/new values. The dashboard edit forms (PR17) build
 // on this pattern.
 func (s *Store) UpdateMinSpreadBps(ctx context.Context, exchangeMarketID int64, newVal int, changedBy, reason string) (newVersion int64, err error) {
+	// Validate BEFORE opening the transaction so an invalid value (e.g. a negative
+	// spread) activates no version, mutates no symbol_config, and writes no audit row.
+	if newVal < 0 {
+		return 0, invalid("min_spread_bps must be >= 0")
+	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		var oldVal sql.NullInt64
 		if err := tx.QueryRowContext(ctx,
