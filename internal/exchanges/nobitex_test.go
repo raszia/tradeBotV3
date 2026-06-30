@@ -36,6 +36,25 @@ func nobitexPublicTestServer(t *testing.T) *httptest.Server {
 	}))
 }
 
+// TestRialToTomanMultipliersAreExact (PR4 correction) — the Rial→Toman multipliers are built
+// from exact decimal literals (decimal.RequireFromString("0.1")), never decimal.NewFromFloat,
+// and convert money values exactly.
+func TestRialToTomanMultipliersAreExact(t *testing.T) {
+	for name, m := range map[string]decimal.Decimal{
+		"nobitex":  nobitexRialToToman,
+		"ramzinex": ramzinexRialToToman,
+	} {
+		if m.String() != "0.1" {
+			t.Errorf("%s Rial→Toman multiplier = %s, want exactly 0.1", name, m.String())
+		}
+		// An odd rial amount converts to toman with no rounding error.
+		got := decimal.RequireFromString("123456789").Mul(m)
+		if got.String() != "12345678.9" {
+			t.Errorf("%s: 123456789 IRR * 0.1 = %s, want 12345678.9", name, got.String())
+		}
+	}
+}
+
 func TestNobitexGetMarkets(t *testing.T) {
 	srv := nobitexPublicTestServer(t)
 	defer srv.Close()

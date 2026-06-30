@@ -52,7 +52,9 @@ const (
 )
 
 // ramzinexRialToToman converts rial (IRR) prices to toman (IRT): IRR * 0.1 = IRT.
-var ramzinexRialToToman = decimal.NewFromFloat(0.1)
+// Built from an exact decimal literal — never decimal.NewFromFloat — so no money value
+// passes through a float64 (PR4 precision rule).
+var ramzinexRialToToman = decimal.RequireFromString("0.1")
 
 func init() {
 	Register(Registration{

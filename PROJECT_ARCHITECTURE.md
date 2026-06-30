@@ -998,6 +998,18 @@ polling results convert into the **same** `NormalizedOrderEvent`
   headers, JSON/form bodies, and signed URL query params **before** writing
   `api_call_logs`. Adapters never log themselves. (PR4 added migration `008`
   adding `api_call_logs.exchange_code`.)
+- **Bearer/JWT tokens masked (PR4 correction):** the sensitive-key set also covers
+  `access`, `refresh`, `accessToken`, `refreshToken`, `jwt`, `bearer` — so Bitpin's auth
+  response `{"access":…,"refresh":…}` and equivalent token fields never reach
+  `api_call_logs.response_body` in the clear.
+- **Error text is masked too (PR4 correction):** the IO logger routes a transport error
+  through `MaskErrorText` before storing it in `api_call_logs.error` — Go's `*url.Error`
+  embeds the full request URL (with signed query params), and net errors can carry
+  `key=value` secrets, so a raw `err.Error()` is never stored.
+- **No money value passes through `float64` (PR4 correction):** Exir order-book
+  prices/quantities are decoded as `json.Number` and parsed with `decimal.NewFromString`
+  (never `NewFromFloat`); Rial→Toman multipliers are exact `decimal.RequireFromString("0.1")`
+  literals. Price/quantity/balance/fee are decimal end-to-end.
 - **Factory**: each adapter self-registers in `init()` via `Register(...)` with
   its capability matrix + public/private constructors. `NewPublicClient` /
   `NewPrivateClient` build by code; unknown ops return a typed `ErrUnsupported`.
@@ -2144,6 +2156,18 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR4 (correction) — token masking, error-text masking, exact decimals**: the raw-API IO
+  logger now (a) masks bearer/JWT token fields (`access`/`refresh`/`accessToken`/
+  `refreshToken`/`jwt`/`bearer`) in JSON + non-JSON bodies, so Bitpin's `{"access":…,
+  "refresh":…}` auth response cannot leak into `api_call_logs.response_body`; (b) masks the
+  stored error text via `MaskErrorText` (was a raw `err.Error()`, which can embed a signed URL
+  / token) before writing `api_call_logs.error`; and (c) keeps money values off `float64` —
+  Exir order books were already decoded via `json.Number`+`NewFromString` (PR26 hardening),
+  and the two `decimal.NewFromFloat(0.1)` Rial→Toman multipliers (nobitex/ramzinex) are now
+  `decimal.RequireFromString("0.1")`. No exchange-mutating path was added — only masking +
+  decimal-construction changes. Branch cut from `pr3-replay-strict-version` (carries the
+  PR1/PR2/PR3 corrections).
 
 - **PR3 (correction) — strict replay disambiguation**: `applyTransition`'s zero-row branch now
   accepts a replay no-op **only** when the row is in the target state at exactly

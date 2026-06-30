@@ -67,6 +67,39 @@ func TestExirGetOrderBook(t *testing.T) {
 	}
 }
 
+// TestExirGetOrderBookExactPrecision (PR4 correction) proves Exir order-book prices/quantities
+// are preserved EXACTLY — decoded as json.Number and parsed with decimal.NewFromString, never
+// through float64/NewFromFloat (which would corrupt a value like 123456789.12345678).
+func TestExirGetOrderBookExactPrecision(t *testing.T) {
+	const price = "123456789.12345678"
+	const qty = "987654321.87654321"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usdt-irt":{"bids":[[` + price + `,` + qty + `]],"asks":[[` + price + `,` + qty + `]]}}`))
+	}))
+	defer srv.Close()
+
+	pub, err := newExirPublic(ClientConfig{
+		Code: exirCode, BaseURL: srv.URL, HTTPClient: srv.Client(),
+		Symbols: map[string]string{"USDT/IRT": "usdt-irt"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	book, err := pub.GetOrderBook(context.Background(), "USDT/IRT")
+	if err != nil {
+		t.Fatalf("GetOrderBook: %v", err)
+	}
+	if len(book.Bids) != 1 {
+		t.Fatalf("bids = %d, want 1", len(book.Bids))
+	}
+	if got := book.Bids[0].Price.String(); got != price {
+		t.Errorf("price = %s, want EXACTLY %s (float64 would lose precision)", got, price)
+	}
+	if got := book.Bids[0].Quantity.String(); got != qty {
+		t.Errorf("quantity = %s, want EXACTLY %s", got, qty)
+	}
+}
+
 func TestExirDerivedSymbolMatch(t *testing.T) {
 	srv := exirTestServer(t)
 	defer srv.Close()

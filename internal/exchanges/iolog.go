@@ -188,7 +188,7 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if req.Context().Err() != nil {
 			timeout = true
 		}
-		entry.Err = err.Error()
+		entry.Err = MaskErrorText(err.Error()) // never store a raw error: it may embed a signed URL / token
 		entry.Timeout = timeout
 		t.logger.Log(entry)
 		return nil, err

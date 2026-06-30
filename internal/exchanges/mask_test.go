@@ -10,6 +10,9 @@ import (
 var leakValues = []string{
 	"AKIAEXAMPLEKEY123", "supersecretvalue", "passphrase-xyz",
 	"deadbeefsignature", "Bearer-token-abc", "sessioncookieval",
+	// Bitpin auth-token values + error-text secrets (PR4 correction).
+	"ACCESS-TOKEN-1", "REFRESH-TOKEN-1",
+	"SECRET-TOKEN", "SECRET-KEY", "SECRET-SIGNATURE",
 }
 
 func assertNoLeak(t *testing.T, where, out string) {
@@ -123,5 +126,44 @@ func TestMaskCoversAdapterSecretFieldNames(t *testing.T) {
 	body := MaskBody(`{"api_key":"AK-LEAK-123","secret_key":"SK-LEAK-456"}`)
 	if strings.Contains(body, "AK-LEAK-123") || strings.Contains(body, "SK-LEAK-456") {
 		t.Errorf("MaskBody leaked a bitpin auth secret: %s", body)
+	}
+}
+
+// TestMaskBitpinAuthTokens (PR4 correction) — Bitpin's auth endpoint returns
+// {"access":...,"refresh":...}; both are bearer secrets and must be redacted from a logged
+// response body. accessToken/refreshToken/jwt/bearer variants must be too.
+func TestMaskBitpinAuthTokens(t *testing.T) {
+	out := MaskBody(`{"access":"ACCESS-TOKEN-1","refresh":"REFRESH-TOKEN-1"}`)
+	assertNoLeak(t, "MaskBody(bitpin access/refresh)", out)
+
+	out2 := MaskBody(`{"accessToken":"ACCESS-TOKEN-1","refreshToken":"REFRESH-TOKEN-1","jwt":"ACCESS-TOKEN-1","bearer":"REFRESH-TOKEN-1"}`)
+	assertNoLeak(t, "MaskBody(token variants)", out2)
+
+	for _, k := range []string{"access", "refresh", "accessToken", "refreshToken", "jwt", "bearer"} {
+		if !IsSensitiveKey(k) {
+			t.Errorf("IsSensitiveKey(%q) = false — Bitpin token field would leak", k)
+		}
+	}
+	// Non-JSON fallback masks them too (key=value form).
+	assertNoLeak(t, "maskNonJSON(form tokens)", MaskBody(`access=ACCESS-TOKEN-1&refresh=REFRESH-TOKEN-1`))
+}
+
+// TestMaskErrorText (PR4 correction) — a transport error string can embed a signed URL and
+// raw key=value secrets; MaskErrorText must redact them before they reach api_call_logs.error.
+func TestMaskErrorText(t *testing.T) {
+	// Plain key=value fragment (the reviewer's required case).
+	assertNoLeak(t, "MaskErrorText(form)",
+		MaskErrorText("token=SECRET-TOKEN&apiKey=SECRET-KEY&signature=SECRET-SIGNATURE"))
+
+	// A Go transport error embedding a signed URL.
+	urlErr := `Get "https://api.exir.io/v1/order?apiKey=SECRET-KEY&signature=SECRET-SIGNATURE&symbol=BTCIRT": dial tcp: i/o timeout`
+	out := MaskErrorText(urlErr)
+	assertNoLeak(t, "MaskErrorText(signed url)", out)
+	// Non-secret context is preserved (so the log is still useful).
+	if !strings.Contains(out, "BTCIRT") || !strings.Contains(out, "i/o timeout") {
+		t.Errorf("MaskErrorText over-masked useful context: %s", out)
+	}
+	if MaskErrorText("") != "" {
+		t.Error("MaskErrorText(\"\") must stay empty")
 	}
 }

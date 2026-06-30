@@ -91,6 +91,83 @@ func TestLoggingTransportMasksBeforeDBWrite(t *testing.T) {
 	}
 }
 
+// TestLoggingTransportMasksBitpinResponseBody (PR4 correction) — a Bitpin-like auth response
+// {"access":...,"refresh":...} flowing through the IO logger must NOT land in
+// api_call_logs.response_body in the clear.
+func TestLoggingTransportMasksBitpinResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access":"ACCESS-TOKEN-1","refresh":"REFRESH-TOKEN-1"}`))
+	}))
+	defer srv.Close()
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockDB.Close()
+	logger := NewIOLogger(IOLogConfig{Enabled: true, BufSize: 4}, mockDB)
+	client, err := BuildHTTPClient(ClientConfig{Code: "bitpin", HTTPClient: srv.Client()}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectExec("INSERT INTO api_call_logs").
+		WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(), noSecret{"url"},
+			noSecret{"req_hdrs"}, noSecret{"req_body"}, sqlmock.AnyArg(),
+			noSecret{"res_hdrs"}, noSecret{"res_body"}, sqlmock.AnyArg(),
+			noSecret{"error"}, sqlmock.AnyArg(),
+		).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	resp, err := client.Get(srv.URL + "/usr/api/v1/usr/authenticate/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	logger.Close()
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("bitpin access/refresh token masking violated: %v", err)
+	}
+}
+
+// erroringRoundTripper always fails with a fixed error — used to drive the IO logger's
+// error-logging path with an error string that embeds secrets.
+type erroringRoundTripper struct{ err error }
+
+func (e erroringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) { return nil, e.err }
+
+// TestLoggingTransportMasksErrorText (PR4 correction) — when the base transport returns an
+// error whose text contains secrets, api_call_logs.error must be masked.
+func TestLoggingTransportMasksErrorText(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockDB.Close()
+	logger := NewIOLogger(IOLogConfig{Enabled: true, BufSize: 4}, mockDB)
+
+	secretErr := fmt.Errorf("token=SECRET-TOKEN&apiKey=SECRET-KEY&signature=SECRET-SIGNATURE: connection refused")
+	rt := NewLoggingTransport(erroringRoundTripper{err: secretErr}, "testex", logger)
+
+	mock.ExpectExec("INSERT INTO api_call_logs").
+		WithArgs(
+			sqlmock.AnyArg(), sqlmock.AnyArg(), noSecret{"url"},
+			noSecret{"req_hdrs"}, noSecret{"req_body"}, sqlmock.AnyArg(),
+			noSecret{"res_hdrs"}, noSecret{"res_body"}, sqlmock.AnyArg(),
+			noSecret{"error"}, sqlmock.AnyArg(),
+		).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	req, _ := http.NewRequest(http.MethodGet, "https://api.x.io/order", nil)
+	if _, rerr := rt.RoundTrip(req); rerr == nil {
+		t.Fatal("expected the round trip to surface the base error")
+	}
+	logger.Close()
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("error-text masking violated: %v", err)
+	}
+}
+
 func TestIOLoggerNilSafe(t *testing.T) {
 	var l *IOLogger // disabled
 	l.Log(APILogEntry{Exchange: "x"})

@@ -164,7 +164,7 @@ func (c *exirPublic) GetOrderBook(ctx context.Context, symbol string) (domain.Or
 
 	// priceMultiplier 1: Exir already quotes in toman (IRT). BuildOrderBook sorts.
 	book := BuildOrderBook(exirCode, canonical,
-		exirFloatPairsToLevels(ob.Bids), exirFloatPairsToLevels(ob.Asks),
+		exirPairsToLevels(ob.Bids), exirPairsToLevels(ob.Asks),
 		decimal.NewFromInt(1), "rest", updatedAt)
 	return book, nil
 }
@@ -179,7 +179,7 @@ func (c *exirPublic) SubscribeOrderBook(ctx context.Context, symbols []string) (
 
 // --- helpers ---
 
-func exirFloatPairsToLevels(pairs [][]json.Number) []domain.Level {
+func exirPairsToLevels(pairs [][]json.Number) []domain.Level {
 	levels := make([]domain.Level, 0, len(pairs))
 	for _, p := range pairs {
 		if len(p) < 2 {

@@ -73,8 +73,9 @@ const (
 
 // nobitexRialToToman converts Nobitex's RIAL prices to the IRT/toman canonical
 // (rial is 10× toman). Used as the BuildOrderBook priceMultiplier and to convert
-// rial-denominated order/balance amounts to internal IRT.
-var nobitexRialToToman = decimal.NewFromFloat(0.1)
+// rial-denominated order/balance amounts to internal IRT. Built from an exact decimal
+// literal — never decimal.NewFromFloat — so no money value passes through a float64.
+var nobitexRialToToman = decimal.RequireFromString("0.1")
 
 func init() {
 	Register(Registration{

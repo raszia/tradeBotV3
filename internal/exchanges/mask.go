@@ -26,6 +26,10 @@ var sensitiveExact = map[string]bool{
 	"sign": true, "sig": true, "signature": true,
 	"token": true, "auth": true, "authorization": true,
 	"cookie": true, "otp": true, "totp": true, "mfa": true,
+	// Bearer/JWT auth tokens — Bitpin's auth endpoint returns {"access":...,"refresh":...},
+	// and other venues use accessToken/refreshToken/jwt/bearer. All are secrets.
+	"access": true, "refresh": true, "accesstoken": true, "refreshtoken": true,
+	"jwt": true, "bearer": true,
 }
 
 // sensitiveContains matches if the lower-cased name contains any substring.
@@ -157,7 +161,7 @@ func maskJSON(v any) any {
 // sensitiveTokenAlternation is the regex alternation of sensitive key fragments
 // used by both fallback maskers. It includes bare "key"/"sign", so this path
 // over-masks (e.g. "keyword") rather than risk leaking — acceptable for raw logs.
-const sensitiveTokenAlternation = `secret|signature|sign|password|api[_-]?key|apikey|passphrase|authorization|auth|token|otp|totp|cookie|key`
+const sensitiveTokenAlternation = `secret|signature|sign|password|api[_-]?key|apikey|passphrase|authorization|auth|token|access|refresh|jwt|bearer|otp|totp|cookie|key`
 
 var (
 	// jsonPairRe matches "sensitiveKey": "value" (string values) in JSON-ish text
@@ -171,4 +175,21 @@ func maskNonJSON(s string) string {
 	s = jsonPairRe.ReplaceAllString(s, `$1"`+maskPlaceholder+`"`)
 	s = formPairRe.ReplaceAllString(s, `$1=`+maskPlaceholder)
 	return s
+}
+
+// urlInTextRe finds http(s) URLs embedded in free text (e.g. a transport error string).
+var urlInTextRe = regexp.MustCompile(`https?://[^\s"'<>]+`)
+
+// MaskErrorText redacts secrets that can appear in transport/error strings before they are
+// stored (api_call_logs.error). Go's *url.Error / net errors frequently embed the full
+// request URL — including signed query params — and arbitrary "key=value" fragments. We mask
+// any embedded URL's sensitive query params (via MaskURL, which itself falls back to regex
+// masking on a parse error) and then run the same key=value / "key":"value" fallback maskers
+// over the whole string. Never store a raw err.Error() — route it through here first.
+func MaskErrorText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = urlInTextRe.ReplaceAllStringFunc(s, MaskURL)
+	return maskNonJSON(s)
 }
