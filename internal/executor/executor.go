@@ -256,6 +256,21 @@ func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, cl
 		e.failTx(ctx, c.ID, "PLACE_ORDER missing order/cycle context")
 		return
 	}
+	// PR10 #5: validate the intent BEFORE MarkInFlight / PlaceOrder — a malformed or
+	// zero-value price/quantity (or bad side/type/client-id) must never be sent. Since it
+	// was never placed there is no exposure, so resolve it cleanly (request FAILED, order +
+	// cycle FAILED, lock released) via OnPlaceRejected.
+	if verr := intent.Validate(); verr != nil {
+		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
+				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: "invalid buy payload (not sent): " + verr.Error(),
+			})
+		})
+		if txErr != nil && e.log != nil {
+			e.log.Warn("invalid buy payload tx failed (rolled back)", "id", c.ID, "err", txErr)
+		}
+		return
+	}
 	// FINAL live gate (PR20): before any real buy send, the guard must allow it.
 	price := decimalOrZero(intent.IntendedPrice)
 	qty := decimalOrZero(intent.IntendedQuantity)

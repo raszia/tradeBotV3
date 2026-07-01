@@ -1,8 +1,24 @@
 package orders
 
 import (
+	"github.com/shopspring/decimal"
+
 	"v3TradeBot/internal/execution"
 )
+
+// usableAvgPrice returns a usable average fill price (the cost basis) and whether one exists:
+// the venue's reported AvgPrice if positive, else derived as ExecutedQuote / FilledQty when
+// both are positive. A full/partial fill with NO usable price AND no usable executed quote has
+// no cost basis — it must be treated as ambiguous, never recorded as a clean fill (PR10 #7).
+func usableAvgPrice(st execution.OrderStatus) (decimal.Decimal, bool) {
+	if st.AvgPrice.IsPositive() {
+		return st.AvgPrice, true
+	}
+	if st.ExecutedQuote.IsPositive() && st.FilledQty.IsPositive() {
+		return st.ExecutedQuote.Div(st.FilledQty), true
+	}
+	return decimal.Zero, false
+}
 
 // Classification is the conservative verdict on a buy order's final status. It is
 // pure (no DB) so the decision matrix is unit-tested without a database.
@@ -35,16 +51,19 @@ func Classify(st execution.OrderStatus, statusErr error) Classification {
 		if st.RemainingQty.IsPositive() || !st.FilledQty.IsPositive() {
 			return ClassAmbiguous // "filled" but qty doesn't agree
 		}
+		if _, ok := usableAvgPrice(st); !ok {
+			return ClassAmbiguous // full fill but NO usable cost basis (avg price / executed quote)
+		}
 		return ClassFull
 
 	case execution.StateCanceled, execution.StateExpired, execution.StatePartiallyCanceled:
 		if st.FilledQty.IsZero() {
 			return ClassZero // settled with zero fill
 		}
-		if st.FilledQty.IsPositive() && st.AvgPrice.IsPositive() {
-			return ClassPartial // settled with a usable partial fill
+		if _, ok := usableAvgPrice(st); st.FilledQty.IsPositive() && ok {
+			return ClassPartial // settled with a usable partial fill (price reported or derived)
 		}
-		return ClassAmbiguous // some fill but incomplete detail
+		return ClassAmbiguous // some fill but incomplete detail (no usable cost basis)
 
 	case execution.StatePartiallyFilled, execution.StateOpen, execution.StateNew, execution.StateUnknown:
 		return ClassAmbiguous // not resolved after the cancel attempt

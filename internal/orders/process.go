@@ -64,6 +64,15 @@ func OnPlaceAck(ctx context.Context, tx *sql.Tx, q *queue.Queue, p PlaceAckParam
 	if err := advanceOrderTo(ctx, tx, p.OrderID, state.OrderSubmitted, "place_sent", "buy order sent"); err != nil {
 		return err
 	}
+	// PR10 #6: the place succeeded but the ack carries NO usable exchange_order_id. We must
+	// NOT schedule a blind CANCEL_ORDER("")/GET_ORDER("") — the order exists on the venue but
+	// is untrackable by us. Push order+cycle to NEEDS_RECONCILE and KEEP the symbol lock; the
+	// reconciler determines whether it filled/exists. (Lookup/cancel by client_order_id is not
+	// part of the current adapter contract, so we do not rely on an empty exchange id.)
+	if p.Ack.ExchangeOrderID == "" {
+		return MarkNeedsReconcile(ctx, tx, p.OrderID, &p.CycleID,
+			"place ack without a usable exchange_order_id — cannot track/cancel; needs reconcile")
+	}
 	if err := advanceOrderTo(ctx, tx, p.OrderID, state.OrderAcked, "place_ack", "buy order acknowledged by exchange"); err != nil {
 		return err
 	}
@@ -177,7 +186,9 @@ func ProcessFinalStatus(ctx context.Context, tx *sql.Tx, q *queue.Queue, p Final
 	if err := updateOrderAccounting(ctx, tx, p.OrderID, st, class, requested); err != nil {
 		return out, err
 	}
-	if st.FilledQty.IsPositive() && st.AvgPrice.IsPositive() {
+	// A fill row is written only with a USABLE cost basis (reported or derived from executed
+	// quote) — never with a zero/invalid price (PR10 #7).
+	if _, ok := usableAvgPrice(st); st.FilledQty.IsPositive() && ok {
 		if err := upsertAggregateFill(ctx, tx, p.OrderID, p.CycleID, st); err != nil {
 			return out, err
 		}
@@ -292,9 +303,12 @@ func updateOrderAccounting(ctx context.Context, tx *sql.Tx, orderID int64, st ex
 			remaining = decimal.Zero
 		}
 	}
+	// Effective avg price = reported, else derived from executed quote (PR10 #7). quote_spent
+	// prefers the venue's ExecutedQuote, else filled_qty × effective avg.
+	avg, _ := usableAvgPrice(st)
 	quote := st.ExecutedQuote
-	if !quote.IsPositive() && st.FilledQty.IsPositive() && st.AvgPrice.IsPositive() {
-		quote = st.FilledQty.Mul(st.AvgPrice)
+	if !quote.IsPositive() && st.FilledQty.IsPositive() && avg.IsPositive() {
+		quote = st.FilledQty.Mul(avg)
 	}
 	_, err := tx.ExecContext(ctx, `
 UPDATE orders SET
@@ -302,7 +316,7 @@ UPDATE orders SET
   fee_amount = ?, fee_asset = ?, actual_execution_mode = ?, fill_result = ?, last_normalized_status = ?,
   exchange_order_id = COALESCE(NULLIF(?,''), exchange_order_id)
 WHERE id = ?`,
-		st.FilledQty.String(), remaining.String(), decimalOrNull(st.AvgPrice), decimalOrNull(quote),
+		st.FilledQty.String(), remaining.String(), decimalOrNull(avg), decimalOrNull(quote),
 		decimalOrNull(st.Fee), nullStr(st.FeeAsset), actualExecutionMode(st.Liquidity), string(class), string(st.Status),
 		st.ExchangeOrderID, orderID)
 	return err
@@ -312,18 +326,21 @@ WHERE id = ?`,
 // status. With only aggregate data from GET_ORDER we synthesize a deterministic
 // exchange_fill_id so repeated processing does not duplicate the row
 // (UNIQUE(order_id, exchange_fill_id)).
+// upsertAggregateFill must be called only when usableAvgPrice(st) is ok (a positive cost
+// basis exists), so a fill row never carries a zero/invalid price (PR10 #7).
 func upsertAggregateFill(ctx context.Context, tx *sql.Tx, orderID, cycleID int64, st execution.OrderStatus) error {
 	fillID := syntheticFillID(st)
+	avg, _ := usableAvgPrice(st) // caller guarantees ok
 	quote := st.ExecutedQuote
 	if !quote.IsPositive() {
-		quote = st.FilledQty.Mul(st.AvgPrice)
+		quote = st.FilledQty.Mul(avg)
 	}
 	_, err := tx.ExecContext(ctx, `
 INSERT INTO fills (order_id, cycle_id, exchange_fill_id, quantity, price, quote_amount, fee_amount, fee_asset, filled_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
 ON DUPLICATE KEY UPDATE quantity=VALUES(quantity), price=VALUES(price), quote_amount=VALUES(quote_amount),
   fee_amount=VALUES(fee_amount), fee_asset=VALUES(fee_asset)`,
-		orderID, cycleID, fillID, st.FilledQty.String(), st.AvgPrice.String(), decimalOrNull(quote),
+		orderID, cycleID, fillID, st.FilledQty.String(), avg.String(), decimalOrNull(quote),
 		decimalOrNull(st.Fee), nullStr(st.FeeAsset))
 	return err
 }

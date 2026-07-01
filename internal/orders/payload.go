@@ -12,6 +12,8 @@ package orders
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -54,6 +56,35 @@ func ParseBuyIntent(raw json.RawMessage) (BuyIntentPayload, error) {
 	var p BuyIntentPayload
 	err := json.Unmarshal(raw, &p)
 	return p, err
+}
+
+// Validate checks the decoded buy intent is well-formed and SAFE to send, BEFORE the
+// executor marks the request IN_FLIGHT or calls PlaceOrder. A malformed/zero-value intent
+// (e.g. an un-parseable or zero price/quantity, wrong side/type, or empty client id) must
+// NEVER reach the exchange — decimalOrZero would otherwise turn a bad string into a 0-value
+// order. Returns a descriptive error when the intent must not be sent.
+func (p BuyIntentPayload) Validate() error {
+	if !p.SimulatedIOC {
+		return fmt.Errorf("buy intent: simulated_ioc must be true")
+	}
+	if !strings.EqualFold(p.Side, "buy") {
+		return fmt.Errorf("buy intent: side=%q, want buy", p.Side)
+	}
+	if !strings.EqualFold(p.OrderType, "limit") {
+		return fmt.Errorf("buy intent: order_type=%q, want limit", p.OrderType)
+	}
+	price, err := decimal.NewFromString(p.IntendedPrice)
+	if err != nil || !price.IsPositive() {
+		return fmt.Errorf("buy intent: intended_price %q is not a positive number", p.IntendedPrice)
+	}
+	qty, err := decimal.NewFromString(p.IntendedQuantity)
+	if err != nil || !qty.IsPositive() {
+		return fmt.Errorf("buy intent: intended_quantity %q is not a positive number", p.IntendedQuantity)
+	}
+	if strings.TrimSpace(p.LocalClientOrderID) == "" {
+		return fmt.Errorf("buy intent: local_client_order_id is empty")
+	}
+	return nil
 }
 
 // OrderRequest builds the exchange PlaceOrder request from the intent. The internal

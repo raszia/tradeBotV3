@@ -52,6 +52,33 @@ func TestClassifyMatrix(t *testing.T) {
 	}
 }
 
+// TestClassifyFullFillCostBasis (PR10 #7) — a full fill needs a usable cost basis: reported
+// AvgPrice, or one derivable from ExecutedQuote. With neither it is ambiguous, never clean full.
+func TestClassifyFullFillCostBasis(t *testing.T) {
+	full := func(avg, quote string) execution.OrderStatus {
+		return execution.OrderStatus{Status: execution.StateFilled, IntendedQty: d("1"), FilledQty: d("1"),
+			RemainingQty: d("0"), AvgPrice: d(avg), ExecutedQuote: d(quote)}
+	}
+	if got := Classify(full("100", "0"), nil); got != ClassFull {
+		t.Errorf("full fill w/ reported avg = %s, want full", got)
+	}
+	if got := Classify(full("0", "100"), nil); got != ClassFull {
+		t.Errorf("full fill w/ derivable executed quote = %s, want full", got)
+	}
+	if got := Classify(full("0", "0"), nil); got != ClassAmbiguous {
+		t.Errorf("full fill w/ NO cost basis = %s, want ambiguous", got)
+	}
+	if avg, ok := usableAvgPrice(full("0", "50")); !ok || !avg.Equal(d("50")) {
+		t.Errorf("derived avg (qty 1, quote 50) = %v ok=%v, want 50", avg, ok)
+	}
+	// A cancel with a partial fill priced only via executed quote is a usable partial.
+	pc := execution.OrderStatus{Status: execution.StateCanceled, IntendedQty: d("1"), FilledQty: d("0.5"),
+		RemainingQty: d("0.5"), AvgPrice: d("0"), ExecutedQuote: d("50")}
+	if got := Classify(pc, nil); got != ClassPartial {
+		t.Errorf("partial w/ derivable quote = %s, want partial", got)
+	}
+}
+
 func TestReleasesLock(t *testing.T) {
 	// Only a proven zero-fill releases the lock.
 	if !ClassZero.ReleasesLock() {

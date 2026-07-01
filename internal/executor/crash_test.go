@@ -134,7 +134,7 @@ func TestCrashAfterMarkInFlightBeforeResponse(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderSubmitted))
 	it.seedLock(t, cycleID)
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	// Simulate "crashed right after MarkInFlight, before the PlaceOrder call returned".
 	if err := it.q.MarkInFlight(it.ctx, c.ID); err != nil {
 		t.Fatal(err)
@@ -165,7 +165,7 @@ func TestPlaceSucceedsCompletionRollsBackThenSweepReconciles(t *testing.T) {
 	it.seedLock(t, cycleID)
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX1", Status: execution.StateOpen}
 	it.execFault(func() error { return errors.New("injected: completion tx failure after send") })
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1", LocalClientOrderID: "loc"})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	it.exec.process(it.ctx, c)
 
 	// Sent exactly once; completion rolled back → request IN_FLIGHT; order/cycle unchanged.

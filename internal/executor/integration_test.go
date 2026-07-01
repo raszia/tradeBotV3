@@ -248,7 +248,7 @@ func TestPlaceSuccessAcksAndSchedulesCancel(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX123", ClientOrderID: "loc-x", Status: execution.StateOpen}
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc-x", MakerWaitBeforeCancelMs: 2000})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc-x", MakerWaitBeforeCancelMs: 2000})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s != "SUCCEEDED" {
@@ -276,7 +276,7 @@ func TestPlaceDefiniteRejectionFailsCleanly(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
 	it.fake.placeErr = execution.ErrInsufficientBalance
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	it.exec.process(it.ctx, c)
 
 	// Definitely not placed -> no exposure: request FAILED, order + cycle FAILED.
@@ -295,7 +295,7 @@ func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderSubmitted))
 	it.fake.placeErr = execution.ErrAckTimeout // ambiguous: maybe placed, maybe not
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s != "DEAD" {
@@ -318,7 +318,7 @@ func TestMarkInFlightFailureBlocksSend(t *testing.T) {
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuyRequestQueued), string(state.OrderQueued))
 
 	// PLACE: row no longer CLAIMED -> MarkInFlight fails -> no PlaceOrder.
-	cPlace := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	cPlace := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	if _, err := it.db.Exec("UPDATE exchange_requests SET status='QUEUED', claimed_by=NULL, claimed_at=NULL WHERE id=?", cPlace.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestPlaceSuccessRollsBackWhenOrderTransitionInvalid(t *testing.T) {
 	// whole completion tx must roll back -> request NOT marked SUCCEEDED.
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderFilled))
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EX999", Status: execution.StateOpen}
-	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", IntendedQuantity: "1"})
+	c := it.seedPlace(t, orderID, cycleID, orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true, IntendedPrice: "100", IntendedQuantity: "1", LocalClientOrderID: "loc"})
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s == "SUCCEEDED" {
