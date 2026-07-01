@@ -454,16 +454,17 @@ func (e *Engine) evaluate(ctx context.Context, snap *configstore.Snapshot, m con
 		return nil
 	}
 
-	if _, err := e.writeSignal(ctx, m, quote, binanceRef, iAsk.Price, refRate, res, snap.Version); err != nil {
+	signalID, err := e.writeSignal(ctx, m, quote, binanceRef, iAsk.Price, refRate, res, snap.Version)
+	if err != nil {
 		return err
 	}
-	// SIGNAL-ONLY boundary (PR8): the engine stops here. Buy-cycle preparation
-	// (cycle + lock + order + QUEUED request, transactionally via internal/buyflow) is
-	// PR9's responsibility and is gated behind Config.PrepareBuyCycles, which PR8 leaves
-	// FALSE. So in PR8 a passing signal for a trading-enabled market still writes ONLY
-	// comparison_events + signals — no cycles/orders/exchange_requests/symbol_locks.
+	// SIGNAL-ONLY boundary (PR8): the engine writes only comparison_events + signals unless
+	// buy-cycle preparation is explicitly enabled. Buy-cycle preparation (cycle + lock + order
+	// + QUEUED request, transactionally via internal/buyflow) is PR9's responsibility, gated
+	// behind Config.PrepareBuyCycles. PR8 leaves it FALSE (signal-only); PR9 enables it in
+	// cmd/trade-engine. When enabled, the created/refreshed cycle is linked back to signalID.
 	if m.EnabledForTrading && e.cfg.PrepareBuyCycles {
-		return e.prepareBuy(ctx, m, iAsk.Price, binanceRef, refRate, quote, fee, res, snap.Version)
+		return e.prepareBuy(ctx, m, iAsk.Price, binanceRef, refRate, quote, fee, res, snap.Version, signalID)
 	}
 	return nil
 }
@@ -472,7 +473,7 @@ func (e *Engine) evaluate(ctx context.Context, snap *configstore.Snapshot, m con
 // not-yet-sent QUEUED buy when the scope already holds an active cycle (no
 // duplicate). ErrSymbolLocked is the normal "already have an active cycle" path,
 // not an error.
-func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask, binanceRef decimal.Decimal, refRate *decimal.Decimal, quote string, fee configstore.FeeConfig, res SpreadResult, version int64) error {
+func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask, binanceRef decimal.Decimal, refRate *decimal.Decimal, quote string, fee configstore.FeeConfig, res SpreadResult, version, signalID int64) error {
 	sig := buyflow.SignalContext{
 		ConfigVersion:  version,
 		BinancePrice:   binanceRef,
@@ -484,6 +485,7 @@ func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask
 		BuyFeeBps:      roundToInt(feeFractionToBps(fee.TakerFee)),
 		SellFeeBps:     roundToInt(feeFractionToBps(fee.MakerFee)),
 		DryRun:         e.cfg.DryRun,
+		SignalID:       signalID,
 	}
 	// LIVE mode: the live guard gates new buy-cycle creation (kill switch + caps).
 	if e.cfg.LiveGuard != nil {

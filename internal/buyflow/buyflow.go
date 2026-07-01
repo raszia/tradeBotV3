@@ -39,6 +39,10 @@ type SignalContext struct {
 	BuyFeeBps      int
 	SellFeeBps     int
 	DryRun         bool // PR19: stamp the cycle as a dry-run (simulated) cycle
+	// SignalID is the signals row that produced this intent. When non-zero it is linked
+	// to the created/refreshed cycle (signals.cycle_id) IN THE SAME transaction, so the
+	// signal → cycle audit trail is complete. Zero means "do not link" (e.g. tests).
+	SignalID int64
 }
 
 // CreateResult reports the rows created by CreateBuyCycle.
@@ -73,8 +77,14 @@ func CreateBuyCycle(ctx context.Context, store *db.Store, q *queue.Queue, m conf
 			return err
 		}
 
-		// 2. Pure maker/taker decision + resolve the base quantity.
+		// 2. Pure maker/taker decision + resolve the base quantity. Reject a non-positive
+		//    price or quantity here so a bad intent is NEVER persisted/enqueued (it could
+		//    otherwise be sent blindly). Final market-rule snapping (tick/step/min) is the
+		//    executor's job before send (see §2a / the market-rule boundary note).
 		dec := Decide(m.Maker, ask, prior)
+		if !dec.LimitPrice.IsPositive() {
+			return fmt.Errorf("buyflow: non-positive limit price %s (ask=%s offset=%dbps)", dec.LimitPrice, ask, dec.OffsetBps)
+		}
 		qty := resolveQuantity(m.BuySize, m.BuySizeUnit, dec.LimitPrice)
 		if !qty.IsPositive() {
 			return fmt.Errorf("buyflow: non-positive quantity (buy_size=%s unit=%s)", m.BuySize, m.BuySizeUnit)
@@ -87,6 +97,11 @@ func CreateBuyCycle(ctx context.Context, store *db.Store, q *queue.Queue, m conf
 			return err
 		}
 		out.CycleID = cycleID
+
+		// 3b. Link the originating signal to this cycle (audit trail) in the same tx.
+		if err := linkSignalToCycle(ctx, tx, sig.SignalID, cycleID); err != nil {
+			return err
+		}
 
 		// 4. Acquire the symbol lock — THE one-active-intent gate. Duplicate scope ⇒
 		//    ErrSymbolLocked ⇒ the whole tx rolls back (no orphan cycle).
@@ -162,9 +177,12 @@ func RefreshActiveCycleBuy(ctx context.Context, store *db.Store, m configstore.M
 			localCOID               string
 			expired                 sql.NullBool
 		)
-		// Lock the active cycle's QUEUED buy request (FOR UPDATE) so a concurrent
-		// claimer cannot grab it between the SELECT and the UPDATEs. Also read the
-		// current attempt and whether the opportunity window has expired.
+		// Select + FOR UPDATE lock the active cycle's buy intent ONLY when the WHOLE
+		// execution state is still queued and active — lock ACTIVE, cycle
+		// BUY_REQUEST_QUEUED, order QUEUED, request QUEUED. If ANY has moved on (request
+		// CLAIMED/IN_FLIGHT, order/cycle advanced, lock released) no row matches and we do
+		// NOT refresh (a claimer may already be sending it). FOR UPDATE locks the joined
+		// rows so nothing changes between here and the guarded UPDATEs below.
 		err := tx.QueryRowContext(ctx, `
 SELECT er.id, o.id, c.id, c.maker_attempt_number, o.local_client_order_id,
        (c.opportunity_window_started_at < NOW(6) - INTERVAL ? SECOND)
@@ -172,12 +190,13 @@ FROM symbol_locks sl
 JOIN cycles c  ON c.id = sl.cycle_id
 JOIN orders o  ON o.cycle_id = c.id AND o.role = 'entry_buy'
 JOIN exchange_requests er ON er.order_id = o.id AND er.request_type = 'PLACE_ORDER'
-WHERE sl.state = 'ACTIVE' AND sl.scope = ? AND sl.canonical_symbol = ? AND er.status = 'QUEUED'
+WHERE sl.state = 'ACTIVE' AND sl.scope = ? AND sl.canonical_symbol = ?
+  AND c.state = 'BUY_REQUEST_QUEUED' AND o.state = 'QUEUED' AND er.status = 'QUEUED'
 ORDER BY er.id DESC
 LIMIT 1
 FOR UPDATE`, window, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &cycleID, &curAttempt, &localCOID, &expired)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil // nothing unsent to refresh
+			return nil // nothing fully-queued to refresh (guarded out)
 		}
 		if err != nil {
 			return err
@@ -193,32 +212,79 @@ FOR UPDATE`, window, m.ExchangeCode, m.CanonicalSymbol).Scan(&reqID, &orderID, &
 		}
 		dec := Decide(m.Maker, ask, prior)
 		qty := resolveQuantity(m.BuySize, m.BuySizeUnit, dec.LimitPrice)
+		// Never refresh into a non-positive price/quantity (misconfig) — leave the prior
+		// valid intent in place rather than persist something unsendable.
+		if !dec.LimitPrice.IsPositive() || !qty.IsPositive() {
+			return nil
+		}
 
-		// Update the cycle's mode/attempt (and reset the window anchor if it expired).
-		if _, err := tx.ExecContext(ctx, `
-UPDATE cycles SET intended_execution_mode = ?, maker_attempt_number = ?,
+		// The cycle, order, and request must describe the SAME current intent, so all three
+		// are refreshed together (one tx). Each UPDATE is guarded on its expected state and
+		// its RowsAffected verified — a 0-row update means the state changed under us and
+		// rolls the whole refresh back.
+		//
+		// (a) Cycle: refresh the FULL signal snapshot (not just mode/attempt) so the cycle
+		//     audit matches the latest signal that superseded the intent.
+		res, err := tx.ExecContext(ctx, `
+UPDATE cycles SET
+  signal_time = NOW(6),
+  binance_price_at_signal = ?, iranian_price_at_signal = ?,
+  spread_bps = ?, fee_adjusted_spread_bps = ?, buy_size = ?, config_version = ?,
+  intended_execution_mode = ?, maker_attempt_number = ?,
   opportunity_window_started_at = CASE WHEN ? THEN NOW(6) ELSE opportunity_window_started_at END
-WHERE id = ?`, string(dec.Mode), dec.AttemptNumber, windowExpired, cycleID); err != nil {
+WHERE id = ? AND state = 'BUY_REQUEST_QUEUED'`,
+			sig.BinancePrice.String(), sig.IranianPrice.String(),
+			sig.SpreadBps, sig.FeeAdjustedBps, qty.String(), nullID(sig.ConfigVersion),
+			string(dec.Mode), dec.AttemptNumber, windowExpired, cycleID)
+		if err != nil {
 			return err
 		}
-		// Update the still-QUEUED order's price + mode fields (not a state change).
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE orders SET limit_price = ?, quantity = ?, ask_price_at_decision = ?, intended_execution_mode = ?, maker_attempt_number = ?, maker_offset_bps = ? WHERE id = ?",
-			dec.LimitPrice.String(), qty.String(), ask.String(), string(dec.Mode), dec.AttemptNumber, dec.OffsetBps, orderID); err != nil {
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("buyflow: cycle %d not BUY_REQUEST_QUEUED at refresh (rows=%d)", cycleID, n)
+		}
+
+		// (b) Order: refresh price/qty/mode (not a state change), guarded on QUEUED.
+		res, err = tx.ExecContext(ctx,
+			"UPDATE orders SET limit_price = ?, quantity = ?, ask_price_at_decision = ?, intended_execution_mode = ?, maker_attempt_number = ?, maker_offset_bps = ? WHERE id = ? AND state = 'QUEUED'",
+			dec.LimitPrice.String(), qty.String(), ask.String(), string(dec.Mode), dec.AttemptNumber, dec.OffsetBps, orderID)
+		if err != nil {
 			return err
 		}
-		// Rebuild the payload and update the request, guarded on status='QUEUED'.
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("buyflow: order %d not QUEUED at refresh (rows=%d)", orderID, n)
+		}
+
+		// (c) Request payload, guarded on status='QUEUED'.
 		payload := buildPayload(m, dec, qty, ask, sig, localCOID)
-		res, err := tx.ExecContext(ctx,
+		res, err = tx.ExecContext(ctx,
 			"UPDATE exchange_requests SET payload = ? WHERE id = ? AND status = 'QUEUED'", payload, reqID)
 		if err != nil {
 			return err
 		}
-		n, _ := res.RowsAffected()
-		refreshed = n > 0
+		if n, _ := res.RowsAffected(); n != 1 {
+			return fmt.Errorf("buyflow: request %d not QUEUED at refresh (rows=%d)", reqID, n)
+		}
+
+		// (d) Link the superseding signal to this same cycle (audit).
+		if err := linkSignalToCycle(ctx, tx, sig.SignalID, cycleID); err != nil {
+			return err
+		}
+		refreshed = true
 		return nil
 	})
 	return refreshed, err
+}
+
+// linkSignalToCycle stamps signals.cycle_id for the originating signal (best-effort audit
+// link) within the caller's tx. A zero signalID is a no-op. It only fills a NULL cycle_id so
+// a re-run never repoints an already-linked signal.
+func linkSignalToCycle(ctx context.Context, tx *sql.Tx, signalID, cycleID int64) error {
+	if signalID == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		"UPDATE signals SET cycle_id = ? WHERE id = ? AND cycle_id IS NULL", cycleID, signalID)
+	return err
 }
 
 // ---- helpers ----

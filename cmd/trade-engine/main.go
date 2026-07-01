@@ -1,9 +1,11 @@
 // Command trade-engine consumes market events and market data, computes the
-// (owner-defined) spread/signal, and writes ONLY comparison_events / signals. It is
-// SIGNAL-ONLY in PR8: it NEVER calls an exchange API (no private clients, no
-// PlaceOrder/CancelOrder) and does NOT create or refresh cycles, orders,
-// exchange_requests, symbol locks, or pending buy intents. Buy-cycle preparation
-// (engine.Config.PrepareBuyCycles) stays DISABLED here until PR9 reviews and enables it.
+// (owner-defined) spread/signal, and writes comparison_events / signals. It NEVER calls
+// an exchange API (no private clients, no PlaceOrder/CancelOrder) — the order-executor
+// is the only sender. In PR9 buy-cycle preparation is ENABLED
+// (engine.Config.PrepareBuyCycles = true): on a passing signal for a trading-enabled
+// market it prepares the buy transactionally via internal/buyflow (cycle + symbol lock +
+// order + QUEUED PLACE_ORDER request) and links the signal to the created cycle. Buyflow
+// stays gated behind that flag (the engine library defaults it false — PR8's boundary).
 package main
 
 import (
@@ -48,10 +50,12 @@ func main() {
 		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
 			DryRun:    base.Cfg.Execution.IsDryRun(),
 			LiveGuard: liveGuard,
-			// PR8 BOUNDARY: the binary stays signal-only — it writes only comparison_events +
-			// signals. Buy-cycle preparation (cycles/orders/exchange_requests/symbol_locks via
-			// buyflow) is DISABLED here and is enabled in PR9. Do NOT set this true in PR8.
-			PrepareBuyCycles: false,
+			// PR9: buy-cycle preparation is ENABLED. On a passing signal for a trading-enabled
+			// market the engine prepares the buy transactionally via internal/buyflow (cycle +
+			// symbol lock + order + QUEUED PLACE_ORDER request). The engine still never calls an
+			// exchange; the order-executor remains the only sender. The buyflow path stays gated
+			// behind this flag (the engine library defaults it FALSE — PR8's signal-only boundary).
+			PrepareBuyCycles: true,
 		})
 		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
 		// Startup live-safety summary (no secrets).

@@ -105,15 +105,18 @@ func TestMutatingExchangeCallsConfinedToExecutor(t *testing.T) {
 }
 
 func TestNoDirectStateUpdates(t *testing.T) {
-	// Direct `UPDATE cycles|orders ... SET ... state` outside internal/state means a
-	// transition bypassed the state machine (CAS + event row).
-	re := regexp.MustCompile(`(?i)UPDATE\s+(cycles|orders)\b[^"';]*SET[^"';]*\bstate\b`)
+	// A transition that bypasses the state machine (CAS + event row) ASSIGNS the state
+	// column: `SET state = …` (state first) or `…, state = …` (state later in the SET
+	// list). We must NOT flag a state GUARD in the WHERE clause (`… AND state = 'QUEUED'`) —
+	// guarding an UPDATE on the expected current state is exactly the safe, required pattern
+	// (queue terminal guards, buyflow refresh guards). So match only assignments.
+	re := regexp.MustCompile(`(?i)UPDATE\s+(cycles|orders)\b[^"';]*(SET\s+state\s*=|,\s*state\s*=)`)
 	for _, l := range scan(t) {
 		if isComment(l.text) || strings.HasPrefix(l.path, "internal/state/") {
 			continue
 		}
 		if re.MatchString(l.text) {
-			t.Errorf("%s:%d updates cycles/orders state directly (must go through internal/state): %s", l.path, l.num, strings.TrimSpace(l.text))
+			t.Errorf("%s:%d ASSIGNS cycles/orders state directly (must go through internal/state): %s", l.path, l.num, strings.TrimSpace(l.text))
 		}
 	}
 }
@@ -159,24 +162,8 @@ func TestReadOnlyServiceMainsHoldNoPrivateClient(t *testing.T) {
 	}
 }
 
-// TestTradeEngineSignalOnlyInPR8 (PR8) asserts the trade-engine binary stays SIGNAL-ONLY: it
-// must NOT enable buy-cycle preparation. Setting PrepareBuyCycles: true (which lets the engine
-// create/refresh cycles/orders/exchange_requests/symbol_locks via buyflow) belongs to PR9, so
-// the PR8 binary wiring must leave it disabled.
-func TestTradeEngineSignalOnlyInPR8(t *testing.T) {
-	re := regexp.MustCompile(`PrepareBuyCycles\s*:\s*true`)
-	found := false
-	for _, l := range scan(t) {
-		if isComment(l.text) {
-			continue
-		}
-		if strings.HasPrefix(l.path, "cmd/trade-engine/") && re.MatchString(l.text) {
-			found = true
-			t.Errorf("%s:%d cmd/trade-engine enables PrepareBuyCycles; PR8 must be signal-only (enable it in PR9): %s",
-				l.path, l.num, strings.TrimSpace(l.text))
-		}
-	}
-	if found {
-		t.Log("the trade-engine binary must keep PrepareBuyCycles disabled in PR8")
-	}
-}
+// NOTE: PR8's "trade-engine binary must NOT set PrepareBuyCycles: true" invariant was removed
+// in PR9 — PR9 intentionally enables buy-cycle preparation in cmd/trade-engine. The engine
+// library still defaults PrepareBuyCycles to false, so buyflow remains gated behind the flag;
+// TestSignalOnlyEvenWhenTradingEnabled (internal/engine) covers the library default (flag off
+// ⇒ a passing signal for a trading-enabled market still creates no cycle/order/request/lock).

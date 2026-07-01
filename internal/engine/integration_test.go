@@ -398,6 +398,14 @@ func TestPassingSignalCreatesBuyCycle(t *testing.T) {
 	if lockN != 1 {
 		t.Errorf("active locks = %d, want 1", lockN)
 	}
+	// PR9 #8: the signal that created the cycle is linked to it (signals.cycle_id = cycle.id).
+	var cycleID int64
+	f.db.QueryRow("SELECT id FROM cycles WHERE exchange_market_id=?", mc.ExchangeMarketID).Scan(&cycleID)
+	var linked sql.NullInt64
+	f.db.QueryRow("SELECT cycle_id FROM signals WHERE canonical_symbol=? ORDER BY id DESC LIMIT 1", sym).Scan(&linked)
+	if !linked.Valid || linked.Int64 != cycleID {
+		t.Errorf("signals.cycle_id = %v, want linked to created cycle %d", linked, cycleID)
+	}
 }
 
 func TestRepeatedSignalDoesNotDuplicateCycle(t *testing.T) {

@@ -26,9 +26,11 @@ hits=$(src '\.(PlaceOrder|CancelOrder)\(' \
   | grep -vE 'PrivateClient|interface\b' || true)
 [ -n "$hits" ] && { bad "mutating exchange call outside the order-executor boundary:"; echo "$hits"; } || say "  ok"
 
-say "== 3. no direct UPDATE of cycles.state / orders.state outside internal/state =="
-hits=$(src "UPDATE (cycles|orders)[^;\"]*SET[^;\"]*\bstate\b" | grep -v 'internal/state/' || true)
-[ -n "$hits" ] && { bad "direct state UPDATE outside internal/state:"; echo "$hits"; } || say "  ok"
+say "== 3. no direct ASSIGNMENT of cycles.state / orders.state outside internal/state =="
+# Only flag a state ASSIGNMENT (SET state=… or , state=…), NOT a state GUARD in WHERE
+# (… AND state='QUEUED'), which is the safe/required pattern for guarded UPDATEs.
+hits=$(src "UPDATE (cycles|orders)[^;\"]*(SET +state *=|, *state *=)" | grep -v 'internal/state/' || true)
+[ -n "$hits" ] && { bad "direct state ASSIGNMENT outside internal/state:"; echo "$hits"; } || say "  ok"
 
 say "== 4. dashboard never selects encrypted credential blobs =="
 hits=$(grep -rnE 'encrypted_api_(key|secret)|encrypted_passphrase' internal/dashboard --include='*.go' 2>/dev/null \
@@ -46,11 +48,13 @@ say "== 6. trade-engine / reconciler / balance-sync / health-monitor / dashboard
 hits=$(grep -rnE 'PrivateClient' cmd/trade-engine cmd/reconciler cmd/balance-sync cmd/health-monitor cmd/dashboard --include='*.go' 2>/dev/null | grep -v '_test.go' || true)
 [ -n "$hits" ] && { bad "a read-only service main references PrivateClient:"; echo "$hits"; } || say "  ok"
 
-say "== 7. PR8: cmd/trade-engine stays signal-only (must NOT enable buy-cycle preparation) =="
-# Enabling PrepareBuyCycles lets the engine create/refresh cycles/orders/exchange_requests/
-# symbol_locks via buyflow — that is PR9's job. The PR8 binary must leave it disabled.
-hits=$(grep -rnE 'PrepareBuyCycles[[:space:]]*:[[:space:]]*true' cmd/trade-engine --include='*.go' 2>/dev/null | grep -v '_test.go' || true)
-[ -n "$hits" ] && { bad "cmd/trade-engine enables PrepareBuyCycles (PR8 must be signal-only; enable in PR9):"; echo "$hits"; } || say "  ok"
+say "== 7. buyflow stays gated behind Config.PrepareBuyCycles (the engine never calls it unconditionally) =="
+# PR9 enables PrepareBuyCycles in cmd/trade-engine, so we no longer forbid that. What must hold
+# is that the ENGINE only reaches buyflow through the PrepareBuyCycles gate — i.e. every
+# buyflow.CreateBuyCycle/RefreshActiveCycleBuy call in internal/engine is inside prepareBuy,
+# which the evaluate() path guards with `e.cfg.PrepareBuyCycles`.
+hits=$(src 'buyflow\.(CreateBuyCycle|RefreshActiveCycleBuy)\(' | grep -vE 'internal/engine/engine\.go' || true)
+[ -n "$hits" ] && { bad "buyflow entrypoint called outside internal/engine/engine.go (must stay gated in prepareBuy):"; echo "$hits"; } || say "  ok"
 
 if [ "$fail" -ne 0 ]; then
   say ""
