@@ -206,12 +206,7 @@ func (e *Executor) process(ctx context.Context, c queue.Claimed) {
 		list, err := client.GetOpenOrders(sendCtx, p.Symbol)
 		e.handleReadOnly(ctx, c, mustJSON(list), err)
 	case queue.TypePlaceOrder:
-		// Buy = simulated IOC; sell = resting. Routed by the payload side.
-		if orders.PayloadSide(c.Payload) == "sell" {
-			e.handleSellPlace(ctx, sendCtx, c, client)
-		} else {
-			e.handlePlace(ctx, sendCtx, c, client)
-		}
+		e.dispatchPlace(ctx, sendCtx, c, client)
 	case queue.TypeCancelOrder:
 		var fp orders.FollowupPayload
 		_ = json.Unmarshal(c.Payload, &fp)
@@ -243,32 +238,93 @@ func (e *Executor) handleReadOnly(ctx context.Context, c queue.Claimed, resp jso
 	e.failTx(ctx, c.ID, sendErr.Error())
 }
 
-// handlePlace processes a PLACE_ORDER. It marks IN_FLIGHT (committed) BEFORE
+// dispatchPlace routes a PLACE_ORDER to the buy or sell handler using the DATABASE ORDER as
+// the source of truth (its role), NEVER the untrusted payload.side text (PR10 #2). A payload
+// that lies about its side therefore cannot bypass the intended handler/validation: a buy DB
+// order always goes to the buy handler, whose Validate() then rejects `side != buy`.
+func (e *Executor) dispatchPlace(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
+	if c.OrderID == nil || c.CycleID == nil {
+		// No DB order to consult or resolve — request-only failure.
+		e.failTx(ctx, c.ID, "PLACE_ORDER missing order/cycle context")
+		return
+	}
+	role, err := e.orderRole(ctx, *c.OrderID)
+	if err != nil {
+		// Cannot read the DB order — do NOT guess a handler. Fail the request (a missing
+		// order row cannot be transitioned; the reconciler/operator investigates).
+		e.failTx(ctx, c.ID, "PLACE_ORDER: cannot read order role: "+err.Error())
+		return
+	}
+	switch role {
+	case "entry_buy":
+		e.handlePlace(ctx, sendCtx, c, client)
+	case "exit_sell":
+		e.handleSellPlace(ctx, sendCtx, c, client)
+	default:
+		e.failTx(ctx, c.ID, "PLACE_ORDER: unroutable order role "+role)
+	}
+}
+
+// orderRole reads the trusted role (entry_buy | exit_sell) of the DB order.
+func (e *Executor) orderRole(ctx context.Context, orderID int64) (string, error) {
+	var role string
+	err := e.store.DB().QueryRowContext(ctx, "SELECT role FROM orders WHERE id=?", orderID).Scan(&role)
+	return role, err
+}
+
+// rejectBuyCleanly resolves a buy PLACE_ORDER that must not be sent (undecodable/invalid
+// payload) through the official rejection path: request FAILED, order + cycle FAILED, symbol
+// lock released — no direct state-table writes, and never leaves order/cycle/lock stranded.
+func (e *Executor) rejectBuyCleanly(ctx context.Context, c queue.Claimed, cause string) {
+	txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
+			RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: cause,
+		})
+	})
+	if txErr != nil && e.log != nil {
+		e.log.Warn("clean buy rejection tx failed (rolled back)", "id", c.ID, "err", txErr)
+	}
+}
+
+// rejectSellToReconcile handles a sell PLACE_ORDER that must not be sent (undecodable/invalid
+// payload). A sell has existing inventory, so unlike a buy it is NOT failed+released: the
+// request is FAILED and the order + cycle go to NEEDS_RECONCILE with the lock HELD (via the
+// official state path), for an operator/reconciler to resolve the inventory. Nothing is sent.
+func (e *Executor) rejectSellToReconcile(ctx context.Context, c queue.Claimed, cause string) {
+	txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
+		if err := e.q.MarkFailed(ctx, tx, c.ID, cause); err != nil {
+			return err
+		}
+		return orders.MarkNeedsReconcile(ctx, tx, *c.OrderID, c.CycleID, cause)
+	})
+	if txErr != nil && e.log != nil {
+		e.log.Warn("sell reject-to-reconcile tx failed (rolled back)", "id", c.ID, "err", txErr)
+	}
+}
+
+// handlePlace processes a buy PLACE_ORDER. It marks IN_FLIGHT (committed) BEFORE
 // sending so a crash is recoverable, then records the outcome conservatively and
 // (on success) schedules the simulated-IOC cancel via internal/orders.
 func (e *Executor) handlePlace(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
-	intent, err := orders.ParseBuyIntent(c.Payload)
-	if err != nil {
-		e.failTx(ctx, c.ID, "bad PLACE_ORDER payload: "+err.Error())
-		return
-	}
+	// The dispatcher guarantees order/cycle context (it routed here by the DB order role),
+	// but re-guard defensively: without it we can only fail the request.
 	if c.OrderID == nil || c.CycleID == nil {
 		e.failTx(ctx, c.ID, "PLACE_ORDER missing order/cycle context")
 		return
 	}
-	// PR10 #5: validate the intent BEFORE MarkInFlight / PlaceOrder — a malformed or
-	// zero-value price/quantity (or bad side/type/client-id) must never be sent. Since it
-	// was never placed there is no exposure, so resolve it cleanly (request FAILED, order +
-	// cycle FAILED, lock released) via OnPlaceRejected.
+	// PR10 #1/#5: a payload that cannot be DECODED, or an intent that fails validation
+	// (bad/zero price/qty, wrong side/type/non-IOC, empty client id), must NEVER be sent
+	// AND must not strand the order/cycle/lock. Both resolve cleanly via OnPlaceRejected
+	// (request FAILED, order + cycle FAILED, lock released) — nothing was placed, so there
+	// is no exposure. This is also what defends a wrong-side payload on a buy order: the DB
+	// role routed it here, and Validate() rejects `side != buy`.
+	intent, err := orders.ParseBuyIntent(c.Payload)
+	if err != nil {
+		e.rejectBuyCleanly(ctx, c, "undecodable buy PLACE_ORDER payload: "+err.Error())
+		return
+	}
 	if verr := intent.Validate(); verr != nil {
-		txErr := e.store.WithTx(ctx, func(tx *sql.Tx) error {
-			return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
-				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: "invalid buy payload (not sent): " + verr.Error(),
-			})
-		})
-		if txErr != nil && e.log != nil {
-			e.log.Warn("invalid buy payload tx failed (rolled back)", "id", c.ID, "err", txErr)
-		}
+		e.rejectBuyCleanly(ctx, c, "invalid buy payload (not sent): "+verr.Error())
 		return
 	}
 	// FINAL live gate (PR20): before any real buy send, the guard must allow it.
@@ -407,13 +463,22 @@ func (e *Executor) handleFinalStatus(ctx, sendCtx context.Context, c queue.Claim
 // the ack via orders.OnSellPlaceAck. Same conservative classification as the buy:
 // definite rejection → clean fail; ambiguous → DEAD + NEEDS_RECONCILE, never re-sent.
 func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed, client exchanges.PrivateClient) {
-	intent, err := orders.ParseSellIntent(c.Payload)
-	if err != nil {
-		e.failTx(ctx, c.ID, "bad sell PLACE_ORDER payload: "+err.Error())
-		return
-	}
 	if c.OrderID == nil || c.CycleID == nil {
 		e.failTx(ctx, c.ID, "sell PLACE_ORDER missing order/cycle context")
+		return
+	}
+	// PR10 #2: a sell payload that cannot be decoded or fails validation (bad side/type/
+	// zero price/qty/empty client id) must NEVER be sent. Unlike a buy rejection, a sell has
+	// existing inventory to protect, so it is NOT cleanly failed+released — the request is
+	// FAILED and the order/cycle go to NEEDS_RECONCILE with the lock HELD (an operator/
+	// reconciler resolves the inventory). This also defends a wrong-side payload on a sell order.
+	intent, err := orders.ParseSellIntent(c.Payload)
+	if err != nil {
+		e.rejectSellToReconcile(ctx, c, "undecodable sell PLACE_ORDER payload: "+err.Error())
+		return
+	}
+	if verr := intent.Validate(); verr != nil {
+		e.rejectSellToReconcile(ctx, c, "invalid sell payload (not sent): "+verr.Error())
 		return
 	}
 	price := decimalOrZero(intent.Price)

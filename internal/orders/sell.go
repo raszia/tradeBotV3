@@ -47,6 +47,30 @@ func ParseSellIntent(raw json.RawMessage) (SellIntentPayload, error) {
 	return p, err
 }
 
+// Validate checks a sell intent is well-formed and SAFE to send (the sell analogue of
+// BuyIntentPayload.Validate — PR10 #2): a malformed/zero-value sell must never reach the
+// exchange. side=sell, order_type=limit, price>0, quantity>0, non-empty client id.
+func (p SellIntentPayload) Validate() error {
+	if !strings.EqualFold(p.Side, "sell") {
+		return fmt.Errorf("sell intent: side=%q, want sell", p.Side)
+	}
+	if !strings.EqualFold(p.OrderType, "limit") {
+		return fmt.Errorf("sell intent: order_type=%q, want limit", p.OrderType)
+	}
+	price, err := decimal.NewFromString(p.Price)
+	if err != nil || !price.IsPositive() {
+		return fmt.Errorf("sell intent: price %q is not a positive number", p.Price)
+	}
+	qty, err := decimal.NewFromString(p.Quantity)
+	if err != nil || !qty.IsPositive() {
+		return fmt.Errorf("sell intent: quantity %q is not a positive number", p.Quantity)
+	}
+	if strings.TrimSpace(p.LocalClientOrderID) == "" {
+		return fmt.Errorf("sell intent: local_client_order_id is empty")
+	}
+	return nil
+}
+
 // OrderRequest builds the exchange PlaceOrder for the resting sell (limit, no TIF).
 func (p SellIntentPayload) OrderRequest(symbol string) execution.OrderRequest {
 	return execution.OrderRequest{
@@ -60,15 +84,9 @@ func (p SellIntentPayload) OrderRequest(symbol string) execution.OrderRequest {
 	}
 }
 
-// PayloadSide peeks the "side" of a PLACE_ORDER payload so the executor can route
-// buy (simulated IOC) vs sell (resting) without unmarshalling the whole thing.
-func PayloadSide(raw json.RawMessage) string {
-	var p struct {
-		Side string `json:"side"`
-	}
-	_ = json.Unmarshal(raw, &p)
-	return p.Side
-}
+// NOTE: buy/sell PLACE_ORDER routing is done from the DB order role (executor.dispatchPlace),
+// NOT from the payload's "side" text — a payload must never be trusted to pick the handler
+// (PR10 #2). The former PayloadSide helper was removed to prevent that unsafe pattern.
 
 // SellPlaceAckParams is the input to OnSellPlaceAck.
 type SellPlaceAckParams struct {

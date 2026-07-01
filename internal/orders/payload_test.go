@@ -36,3 +36,26 @@ func TestBuyIntentValidate(t *testing.T) {
 		}
 	}
 }
+
+// TestSellIntentValidate (PR10 #2) — the sell handler's equivalent pre-send validation.
+func TestSellIntentValidate(t *testing.T) {
+	valid := SellIntentPayload{Side: "sell", OrderType: "limit", Price: "110", Quantity: "1", LocalClientOrderID: "c1-sell"}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid sell intent rejected: %v", err)
+	}
+	bad := map[string]func(*SellIntentPayload){
+		"wrong side":        func(p *SellIntentPayload) { p.Side = "buy" },
+		"wrong order type":  func(p *SellIntentPayload) { p.OrderType = "market" },
+		"unparseable price": func(p *SellIntentPayload) { p.Price = "x" },
+		"zero price":        func(p *SellIntentPayload) { p.Price = "0" },
+		"zero qty":          func(p *SellIntentPayload) { p.Quantity = "0" },
+		"empty client id":   func(p *SellIntentPayload) { p.LocalClientOrderID = "" },
+	}
+	for name, mutate := range bad {
+		p := valid
+		mutate(&p)
+		if err := p.Validate(); err == nil {
+			t.Errorf("%s: Validate() = nil, want an error", name)
+		}
+	}
+}

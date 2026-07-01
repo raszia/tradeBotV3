@@ -34,13 +34,17 @@ func TestInvalidBuyPayloadNotSent(t *testing.T) {
 		name   string
 		mutate func(*orders.BuyIntentPayload)
 	}{
-		// All keep side=buy so the request routes to the buy handler; side/order_type/
-		// simulated_ioc are covered by the offline Validate() unit test (orders package).
+		// Routing is by the DB order role (entry_buy), so even a payload that lies about its
+		// side reaches the buy handler and is rejected by Validate() — it can NOT slip into
+		// the sell handler (PR10 #2).
 		{"invalid-price", func(p *orders.BuyIntentPayload) { p.IntendedPrice = "abc" }},
 		{"zero-price", func(p *orders.BuyIntentPayload) { p.IntendedPrice = "0" }},
 		{"invalid-quantity", func(p *orders.BuyIntentPayload) { p.IntendedQuantity = "not-a-number" }},
 		{"zero-quantity", func(p *orders.BuyIntentPayload) { p.IntendedQuantity = "0" }},
 		{"empty-client-id", func(p *orders.BuyIntentPayload) { p.LocalClientOrderID = "" }},
+		{"wrong-side-payload", func(p *orders.BuyIntentPayload) { p.Side = "sell" }},         // #2 A
+		{"simulated-ioc-false", func(p *orders.BuyIntentPayload) { p.SimulatedIOC = false }}, // #2 B
+		{"wrong-order-type", func(p *orders.BuyIntentPayload) { p.OrderType = "market" }},    // #2 C
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,6 +71,64 @@ func TestInvalidBuyPayloadNotSent(t *testing.T) {
 				t.Errorf("lock=%s, want RELEASED (no exposure — nothing was placed)", it.lockStateByCycle(cyc))
 			}
 		})
+	}
+}
+
+// TestMalformedBuyPayloadRejectedCleanly (PR10 #1) — a buy PLACE_ORDER whose payload cannot be
+// DECODED must not merely fail the request: it is rejected cleanly (request+order+cycle FAILED,
+// lock RELEASED), never leaving the order/cycle/lock stuck. Routing is still by DB order role.
+func TestMalformedBuyPayloadRejectedCleanly(t *testing.T) {
+	it := setup(t)
+	it.iocExec(t)
+	cyc, ord, req := it.seedBuyCycle(t, "0.5")
+	// Valid JSON (the column is JSON NOT NULL) but undecodable into BuyIntentPayload:
+	// intended_price is a string field but given an object.
+	if _, err := it.db.Exec("UPDATE exchange_requests SET payload=? WHERE id=?", `{"side":"buy","intended_price":{"x":1}}`, req); err != nil {
+		t.Fatal(err)
+	}
+	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "SHOULD-NOT-BE-SENT"}
+
+	it.drive(3)
+
+	if got := atomic.LoadInt32(&it.fake.placeCount); got != 0 {
+		t.Errorf("placeCount=%d, want 0 (undecodable payload must NOT be sent)", got)
+	}
+	if s := reqStatus(t, it.db, req); s != "FAILED" {
+		t.Errorf("request status=%s, want FAILED", s)
+	}
+	if it.orderState(ord) != "FAILED" || it.cycleState(cyc) != "FAILED" {
+		t.Errorf("order/cycle=%s/%s, want FAILED/FAILED (not left stuck)", it.orderState(ord), it.cycleState(cyc))
+	}
+	if it.lockStateByCycle(cyc) != "RELEASED" {
+		t.Errorf("lock=%s, want RELEASED (no exposure — nothing was placed)", it.lockStateByCycle(cyc))
+	}
+}
+
+// TestBuyOrderWithSellPayloadNotRoutedToSell (PR10 #2) — a DB entry-buy order whose payload
+// lies (side=sell) is routed to the BUY handler by DB role and rejected by Validate(); it must
+// NOT reach the sell handler, and no order is sent.
+func TestBuyOrderWithSellPayloadNotRoutedToSell(t *testing.T) {
+	it := setup(t)
+	it.iocExec(t)
+	cyc, ord, req := it.seedBuyCycle(t, "0.5") // DB order role = entry_buy
+	p := validIntent("loc-wrong-side")
+	p.Side = "sell" // payload lies about side
+	it.setPayload(t, req, p)
+	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "SHOULD-NOT-BE-SENT"}
+
+	it.drive(3)
+
+	if got := atomic.LoadInt32(&it.fake.placeCount); got != 0 {
+		t.Errorf("placeCount=%d, want 0 (wrong-side payload must not be sent)", got)
+	}
+	if s := reqStatus(t, it.db, req); s != "FAILED" {
+		t.Errorf("request status=%s, want FAILED", s)
+	}
+	if it.orderState(ord) != "FAILED" || it.cycleState(cyc) != "FAILED" {
+		t.Errorf("order/cycle=%s/%s, want FAILED/FAILED (buy handler rejected the sell payload)", it.orderState(ord), it.cycleState(cyc))
+	}
+	if it.lockStateByCycle(cyc) != "RELEASED" {
+		t.Errorf("lock=%s, want RELEASED", it.lockStateByCycle(cyc))
 	}
 }
 
