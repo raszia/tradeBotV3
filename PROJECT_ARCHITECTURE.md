@@ -1113,6 +1113,13 @@ yet exposed by the v3 adapters, so that resolution path always falls through to
 cycle `NEEDS_RECONCILE` (lock kept); some order still active → Continue (resume,
 lock kept); all orders terminal **with any fill** → `NEEDS_RECONCILE` (exposure
 pending PR10 accounting); all orders terminal **with zero fill** → **SafeClose**.
+**Terminal-order classification before safe-close (PR12 #2).** A terminal order is
+only a *clean* zero-fill if it is `CANCELLED`/`EXPIRED` with zero fill — an
+**already-stored `REJECTED` or `FAILED`** order (even with zero fill) is an execution
+anomaly and forces the cycle to `NEEDS_RECONCILE` (lock held), never a safe-close.
+This covers a `REJECTED` order persisted in the DB from a prior run — not just a
+`REJECTED` status observed live — and is especially important for a sell (the buy leg
+may hold inventory).
 
 **Terminal-state decision for clean zero-fill (owner rule).** A zero-fill,
 zero-exposure attempt is **not a failure** — it is a clean no-fill/abandon. So
@@ -2464,6 +2471,14 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR12 (correction, round 2) — already-stored REJECTED/FAILED orders block safe-close**: the
+  live-status REJECTED fix (round 1) still let an order ALREADY persisted as `REJECTED` (zero
+  fill) through — `reconcileCycle` skipped terminal orders, so it looked like a clean zero-fill
+  terminal and the cycle safe-closed + released the lock. Now the terminal-order scan flags a
+  stored `REJECTED` or `FAILED` order → cycle `NEEDS_RECONCILE`, lock held (never safe-close);
+  clean `CANCELLED`/`EXPIRED` zero-fill terminals stay eligible (gated by the active-request
+  check). Tests: TestStoredRejectedOrderNotSafeClosed (buy) + TestStoredSellRejectedNotSafeClosed.
 
 - **PR12 (correction) — reconciler REJECTED, active-request safe-close guard, no silent illegal
   transitions**: three startup-reconciler holes. (#2) `decideKnownOrder` advanced a `REJECTED`

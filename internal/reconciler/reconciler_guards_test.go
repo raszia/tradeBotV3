@@ -79,6 +79,50 @@ func TestSellRejectedKeepsLock(t *testing.T) {
 	}
 }
 
+// TestStoredRejectedOrderNotSafeClosed (PR12 #2, already-stored case) — an order ALREADY in the
+// DB as REJECTED with zero fill (no active request) must NOT be treated as a harmless terminal
+// zero-fill and safe-closed: cycle → NEEDS_RECONCILE, lock ACTIVE.
+func TestStoredRejectedOrderNotSafeClosed(t *testing.T) {
+	f := setupR(t)
+	cyc, _ := f.seedCycleOrder(t, state.CycleBuySubmitted, state.OrderRejected, "") // stored REJECTED, zero fill
+	lock := f.seedLock(t, cyc)
+
+	rep, err := f.rec.ReconcileStartup(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cycState(t, f.db, cyc) == "CANCELLED" {
+		t.Fatal("cycle must NOT become CANCELLED for a stored REJECTED order")
+	}
+	if cycState(t, f.db, cyc) != "NEEDS_RECONCILE" {
+		t.Errorf("cycle=%s, want NEEDS_RECONCILE", cycState(t, f.db, cyc))
+	}
+	if lockState(t, f.db, lock) != "ACTIVE" {
+		t.Errorf("lock=%s, want ACTIVE (must not be released)", lockState(t, f.db, lock))
+	}
+	if rep.SafeClosed != 0 {
+		t.Errorf("SafeClosed=%d, want 0 (a stored REJECTED order must block safe-close)", rep.SafeClosed)
+	}
+}
+
+// TestStoredSellRejectedNotSafeClosed (PR12 #2, sell already-stored) — a resting SELL cycle whose
+// exit_sell order is stored REJECTED (zero fill) must keep the lock (buy inventory) →
+// NEEDS_RECONCILE, lock ACTIVE.
+func TestStoredSellRejectedNotSafeClosed(t *testing.T) {
+	f := setupR(t)
+	cyc, _, lock := f.seedSell(t, state.CycleSellSubmitted, state.OrderRejected, "")
+
+	if _, err := f.rec.ReconcileStartup(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if cycState(t, f.db, cyc) != "NEEDS_RECONCILE" {
+		t.Errorf("cycle=%s, want NEEDS_RECONCILE", cycState(t, f.db, cyc))
+	}
+	if lockState(t, f.db, lock) != "ACTIVE" {
+		t.Errorf("lock=%s, want ACTIVE (sell rejection must keep the lock — buy inventory)", lockState(t, f.db, lock))
+	}
+}
+
 // TestSafeCloseRefusedWithActiveRequest (PR12 #3) — a cycle that looks zero-fill terminal but
 // still has an ACTIVE exchange_request must NOT be safe-closed and its lock must NOT be
 // released; it goes to NEEDS_RECONCILE.

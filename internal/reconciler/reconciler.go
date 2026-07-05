@@ -206,6 +206,14 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 			if o.FilledQty.IsPositive() {
 				anyFill = true
 			}
+			// PR12 #2 (already-stored case): a terminal REJECTED or FAILED order is an
+			// execution anomaly, NOT a clean zero-fill cancel — it must NEVER let the cycle
+			// safe-close / release the lock (especially a sell, whose buy leg may hold
+			// inventory). Force NEEDS_RECONCILE. Clean CANCELLED/EXPIRED zero-fill terminals
+			// remain eligible for safe-close (gated by the active-request check in #3).
+			if o.State == state.OrderRejected || o.State == state.OrderFailed {
+				anyNeedsReconcile = true
+			}
 			continue
 		}
 		if o.State == state.OrderNeedsReconcile {
