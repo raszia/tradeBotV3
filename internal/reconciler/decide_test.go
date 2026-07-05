@@ -25,7 +25,6 @@ func TestDecideKnownOrderClearTerminals(t *testing.T) {
 		{"filled", state.OrderSubmitted, st(execution.StateFilled, "1"), AdvanceTerminal, state.OrderFilled},
 		// CANCELLED is only legal from CANCEL_PENDING (the cancel we requested).
 		{"canceled zero-fill", state.OrderCancelPending, st(execution.StateCanceled, "0"), AdvanceTerminal, state.OrderCancelled},
-		{"rejected", state.OrderSubmitted, st(execution.StateRejected, "0"), AdvanceTerminal, state.OrderRejected},
 		{"expired zero-fill", state.OrderSubmitted, st(execution.StateExpired, "0"), AdvanceTerminal, state.OrderExpired},
 	}
 	for _, c := range cases {
@@ -49,6 +48,14 @@ func TestDecideKnownOrderAmbiguousAndExposure(t *testing.T) {
 	}
 	if out := decideKnownOrder(state.OrderSubmitted, st(execution.StateUnknown, "0"), nil); out.Decision != NeedsReconcile {
 		t.Errorf("unknown = %s, want needs_reconcile", out.Decision)
+	}
+	// PR12 #2: REJECTED is an execution anomaly, NOT a clean zero-fill cancel — never a clean
+	// terminal advance (which could safe-close + release the lock); always needs reconcile.
+	if out := decideKnownOrder(state.OrderSubmitted, st(execution.StateRejected, "0"), nil); out.Decision != NeedsReconcile {
+		t.Errorf("rejected zero-fill = %s, want needs_reconcile (not a clean cancel)", out.Decision)
+	}
+	if out := decideKnownOrder(state.OrderSubmitted, st(execution.StateRejected, "0.5"), nil); out.Decision != NeedsReconcile {
+		t.Errorf("rejected with fill = %s, want needs_reconcile", out.Decision)
 	}
 }
 

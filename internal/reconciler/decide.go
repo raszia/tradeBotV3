@@ -64,7 +64,13 @@ func decideKnownOrder(dbState state.OrderState, st execution.OrderStatus, status
 		return OrderOutcome{Decision: NeedsReconcile,
 			Reason: "partially canceled — filled inventory pending accounting (PR10)"}
 	case execution.StateRejected:
-		return advanceOrNoop(dbState, state.OrderRejected, "exchange reports REJECTED")
+		// REJECTED is NOT a clean zero-fill cancel — the venue REFUSED the order, an execution
+		// anomaly. It must NOT advance to a terminal state that could trigger a safe-close +
+		// lock release: for a sell the buy leg may already hold inventory (lock must stay
+		// held), and for a buy silently closing it would hide the rejection. Always
+		// NeedsReconcile — reconciliation/operator decides the side-appropriate next action.
+		return OrderOutcome{Decision: NeedsReconcile,
+			Reason: "exchange reports REJECTED — execution anomaly, never a clean cancel; needs reconcile"}
 	case execution.StateExpired:
 		if st.FilledQty.IsPositive() {
 			return OrderOutcome{Decision: NeedsReconcile,

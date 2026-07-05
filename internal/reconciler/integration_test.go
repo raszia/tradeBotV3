@@ -334,7 +334,7 @@ func TestApplyOrderOutcomeRollsBackOnStaleVersion(t *testing.T) {
 	_, ord := f.seedCycleOrder(t, state.CycleBuySubmitted, state.OrderSubmitted, "")
 
 	// Stale version (99) -> CAS fails -> whole tx rolls back, attach reverted.
-	err := f.rec.applyOrderOutcome(f.ctx, orderRow{ID: ord, State: state.OrderSubmitted, Version: 99},
+	_, err := f.rec.applyOrderOutcome(f.ctx, orderRow{ID: ord, State: state.OrderSubmitted, Version: 99},
 		OrderOutcome{Decision: AdvanceTerminal, TargetState: state.OrderFilled, AttachExchangeOrderID: "SHOULD-NOT-PERSIST"})
 	if err == nil {
 		t.Fatal("expected stale-version error")

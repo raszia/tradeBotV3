@@ -216,8 +216,16 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 		r.logDecision(ctx, "order_reconcile", string(outcome.Decision), c.ID, o.ID, outcome.Reason, nil)
 		switch outcome.Decision {
 		case AdvanceTerminal:
-			if err := r.applyOrderOutcome(ctx, o, outcome); err != nil {
+			diverted, err := r.applyOrderOutcome(ctx, o, outcome)
+			if err != nil {
 				// tx rolled back; treat as still-uncertain this pass.
+				r.logDecision(ctx, "order_reconcile", "advance_failed", c.ID, o.ID, "advance apply failed: "+err.Error(), nil)
+				anyNeedsReconcile = true
+				continue
+			}
+			if diverted {
+				// The intended terminal advance was illegal → order was diverted to
+				// NEEDS_RECONCILE. Do NOT report it as a successful advance.
 				anyNeedsReconcile = true
 				continue
 			}
@@ -225,7 +233,9 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 				anyFill = true
 			}
 		case NeedsReconcile:
-			_ = r.applyOrderOutcome(ctx, o, outcome)
+			if _, err := r.applyOrderOutcome(ctx, o, outcome); err != nil {
+				r.logDecision(ctx, "order_reconcile", "reconcile_apply_failed", c.ID, o.ID, err.Error(), nil)
+			}
 			anyNeedsReconcile = true
 		case Continue:
 			anyActive = true
@@ -262,10 +272,10 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 		// to close. A clean no-fill is CANCELLED (not FAILED); the lock is released
 		// in the SAME transaction. If CANCELLED isn't legal from the current state,
 		// flag NEEDS_RECONCILE — never force FAILED for a clean no-fill.
-		if r.safeClose(ctx, c) {
+		if err := r.safeClose(ctx, c); err == nil {
 			rep.SafeClosed++
 		} else {
-			r.markCycleNeedsReconcile(ctx, c, "zero-fill but CANCELLED not legal from "+string(c.State)+"; operator review")
+			r.markCycleNeedsReconcile(ctx, c, "zero-fill but not safe to close ("+err.Error()+"); operator review")
 			rep.NeedsReconcile++
 		}
 	}
@@ -321,33 +331,43 @@ func (r *Reconciler) reconcileOrder(ctx context.Context, c cycleRow, o orderRow)
 		Reason: "exchange_order_id unknown and cannot positively identify; not resending"}
 }
 
-// applyOrderOutcome applies an order transition (and optional exchange-order-id
-// attach) atomically via the state machine. On any failure the whole tx rolls
-// back (rule #10/#13).
-func (r *Reconciler) applyOrderOutcome(ctx context.Context, o orderRow, outcome OrderOutcome) error {
+// applyOrderOutcome applies an order transition (and optional exchange-order-id attach)
+// atomically via the state machine. It NEVER silently skips an illegal transition (PR12 #4):
+// if the intended target is not a legal transition from the order's current state, it DIVERTS
+// the order to NEEDS_RECONCILE (returning diverted=true) rather than returning nil as if it
+// succeeded — so the reconciliation report never claims an advance that did not happen. On any
+// tx failure the whole tx rolls back and err is returned. `diverted` is also true when the
+// intended target was already NEEDS_RECONCILE.
+func (r *Reconciler) applyOrderOutcome(ctx context.Context, o orderRow, outcome OrderOutcome) (diverted bool, err error) {
 	target := outcome.TargetState
 	if outcome.Decision == NeedsReconcile {
 		target = state.OrderNeedsReconcile
 	}
-	if o.State == target {
-		return nil // idempotent
+	if o.State == target || state.IsTerminalOrder(o.State) {
+		return target == state.OrderNeedsReconcile, nil // idempotent / nothing to do
 	}
+	et, reason := "reconcile", outcome.Reason
 	if state.ValidateOrderTransition(o.State, target) != nil {
-		return nil // can't legally transition (e.g. already terminal) — skip
+		// The intended transition is illegal from the current state. Do NOT silently skip —
+		// divert the order to NEEDS_RECONCILE so it is never left in a stale state while the
+		// report implies success. NEEDS_RECONCILE is reachable from any non-terminal state.
+		target, et, reason, diverted = state.OrderNeedsReconcile, "reconcile_illegal",
+			"intended "+string(outcome.TargetState)+" illegal from "+string(o.State)+" — diverted to needs_reconcile", true
 	}
-	return r.store.WithTx(ctx, func(tx *sql.Tx) error {
+	txErr := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 		if outcome.AttachExchangeOrderID != "" {
 			if _, err := tx.ExecContext(ctx, "UPDATE orders SET exchange_order_id=? WHERE id=?",
 				outcome.AttachExchangeOrderID, o.ID); err != nil {
 				return err
 			}
 		}
-		_, err := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
+		_, e := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
 			OrderID: o.ID, From: o.State, To: target, Version: o.Version,
-			EventType: "reconcile", Reason: outcome.Reason,
+			EventType: et, Reason: reason,
 		})
-		return err
+		return e
 	})
+	return diverted, txErr
 }
 
 // markCycleNeedsReconcile transitions the cycle to NEEDS_RECONCILE (if legal).
@@ -375,17 +395,27 @@ func (r *Reconciler) markCycleNeedsReconcile(ctx context.Context, c cycleRow, re
 // it NEEDS_RECONCILE instead — never FAILED for a clean no-fill).
 var errCannotSafeClose = errors.New("reconciler: cannot safe-close (cancel not legal from current state)")
 
+// errActiveRequests signals that the cycle still has an active exchange_request
+// (QUEUED/CLAIMED/IN_FLIGHT/RETRY_SCHEDULED), so it is NOT safe to close / release the
+// lock — the executor may still act on that request. The caller flags NEEDS_RECONCILE.
+var errActiveRequests = errors.New("reconciler: cannot safe-close (active exchange_request(s) exist)")
+
 // safeCloseReason documents the terminal-state decision for a clean no-fill
 // recovery (rule from the owner): a zero-fill, zero-exposure attempt is NOT a
 // failure — it is a clean abandon, so the cycle goes to CANCELLED, not FAILED.
 const safeCloseReason = "SIMULATED_IOC_ZERO_FILL: all orders terminal with zero fill — no exposure (clean no-fill abandon)"
 
-// safeClose closes a zero-exposure / zero-fill cycle to CANCELLED (a clean
-// no-fill, NOT a failure) and releases its lock in ONE transaction. Returns false
-// if the close could not be applied (CANCELLED illegal from the current state, or
-// a tx error) — the caller then flags NEEDS_RECONCILE, never FAILED. Reads the
-// cycle state/version fresh inside the tx for a correct CAS.
-func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
+// safeClose closes a zero-exposure / zero-fill cycle to CANCELLED (a clean no-fill, NOT a
+// failure) and releases its lock in ONE transaction. Returns nil on success; a non-nil error
+// (the cycle then stays open and the caller flags NEEDS_RECONCILE, never FAILED) when:
+//   - the cycle still has an ACTIVE exchange_request (errActiveRequests) — the executor may
+//     still act on it, so closing + releasing the lock would race a live send;
+//   - CANCELLED is illegal from the current state (errCannotSafeClose);
+//   - any tx/DB error.
+//
+// Reads state/version + the active-request count fresh INSIDE the tx (atomic with the close),
+// so a request enqueued concurrently cannot slip past the check.
+func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) error {
 	err := r.store.WithTx(ctx, func(tx *sql.Tx) error {
 		var curState string
 		var version int64
@@ -396,6 +426,18 @@ func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
 		from := state.CycleState(curState)
 		if state.IsTerminalCycle(from) {
 			return nil // already closed by someone else
+		}
+		// PR12 #3: never safe-close / release the lock while an exchange_request is still
+		// active for this cycle (QUEUED/CLAIMED/IN_FLIGHT/RETRY_SCHEDULED) — the executor
+		// could still send it. Leave the cycle for later reconciliation.
+		var active int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM exchange_requests WHERE cycle_id=? AND status IN ('QUEUED','CLAIMED','IN_FLIGHT','RETRY_SCHEDULED')",
+			c.ID).Scan(&active); err != nil {
+			return err
+		}
+		if active > 0 {
+			return errActiveRequests
 		}
 		if state.ValidateCycleTransition(from, state.CycleCancelled) != nil {
 			return errCannotSafeClose
@@ -416,11 +458,12 @@ func (r *Reconciler) safeClose(ctx context.Context, c cycleRow) bool {
 		}
 		return nil
 	})
-	if errors.Is(err, errCannotSafeClose) {
-		return false
+	if err == nil {
+		r.logDecision(ctx, "cycle_reconcile", "safe_close_no_fill", c.ID, 0, safeCloseReason, nil)
+	} else {
+		r.logDecision(ctx, "cycle_reconcile", "safe_close_refused", c.ID, 0, err.Error(), nil)
 	}
-	r.logDecision(ctx, "cycle_reconcile", "safe_close_no_fill", c.ID, 0, safeCloseReason, errStr(err))
-	return err == nil
+	return err
 }
 
 // logDecision persists a reconciler decision to app_logs (no secrets). This is how
