@@ -174,6 +174,13 @@ func RepriceSell(ctx context.Context, store *db.Store, q *queue.Queue, m configs
 		if !ok {
 			return ErrNoRestingSell
 		}
+		// PR11 #7: a resting sell with no usable exchange_order_id cannot be cancelled — never
+		// enqueue CancelOrder(""). Push order+cycle to NEEDS_RECONCILE and KEEP the lock; the
+		// reconciler determines the real exchange state. (No blind cancel.)
+		if exoid == "" {
+			return orders.MarkNeedsReconcile(ctx, tx, ordID, &cycleID,
+				"resting sell has no exchange_order_id — cannot reprice/cancel; needs reconcile")
+		}
 
 		if _, err := state.ApplyCycleTransition(ctx, tx, state.CycleTransition{CycleID: cycleID, From: cyState, To: state.CycleSellRepricePending, Version: cyVer, Reason: "repricing exit sell"}); err != nil {
 			return err

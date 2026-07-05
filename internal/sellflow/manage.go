@@ -162,6 +162,15 @@ func (mgr *Manager) ensurePoll(ctx context.Context, cycleID int64) error {
 	if err != nil {
 		return err
 	}
+	// PR11: never poll with an empty exchange_order_id (no blind GetOrder("")). A resting sell
+	// with no usable id is untrackable → NEEDS_RECONCILE, lock held (OnSellPlaceAck normally
+	// prevents this reaching a resting state; this is defense-in-depth).
+	if exoid == "" {
+		return mgr.store.WithTx(ctx, func(tx *sql.Tx) error {
+			return orders.MarkNeedsReconcile(ctx, tx, orderID, &cycleID,
+				"resting sell has no exchange_order_id — cannot poll status; needs reconcile")
+		})
+	}
 	_ = mgr.store.DB().QueryRowContext(ctx, "SELECT canonical_symbol FROM cycles WHERE id=?", cycleID).Scan(&symbol)
 	payload, _ := json.Marshal(orders.FollowupPayload{ExchangeOrderID: exoid, Purpose: orders.PurposeSellStatus, CycleID: cycleID})
 	return mgr.store.WithTx(ctx, func(tx *sql.Tx) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -115,6 +116,14 @@ func OnSellPlaceAck(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellPlace
 	if err := advanceOrderTo(ctx, tx, p.OrderID, state.OrderSubmitted, "sell_sent", "sell order sent"); err != nil {
 		return err
 	}
+	// PR11 #4: the sell was placed but the ack carries no usable exchange_order_id. A resting
+	// sell we cannot identify cannot be polled/repriced/cancelled — never schedule a blind
+	// GetOrder("")/CancelOrder(""). Push order+cycle to NEEDS_RECONCILE and KEEP the lock
+	// (inventory + an untrackable resting order); the reconciler determines the real state.
+	if p.Ack.ExchangeOrderID == "" {
+		return MarkNeedsReconcile(ctx, tx, p.OrderID, &p.CycleID,
+			"sell ack without a usable exchange_order_id — cannot track/cancel; needs reconcile")
+	}
 	if err := advanceOrderTo(ctx, tx, p.OrderID, state.OrderAcked, "sell_ack", "sell order acknowledged"); err != nil {
 		return err
 	}
@@ -182,23 +191,30 @@ func ProcessSellStatus(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellSt
 	var out SellOutcome
 	out.OrderFilled = st.FilledQty
 
-	// Ambiguous status / fetch error -> NEEDS_RECONCILE, lock held, no guess.
+	// Ambiguous status / fetch error -> NEEDS_RECONCILE, lock held, no guess. PR11 #5: a
+	// positive fill with NO usable cost basis (neither AvgPrice nor derivable ExecutedQuote)
+	// is also ambiguous — we must not record a fill or close a cycle with a zero/invalid
+	// sell price (accounting/PnL needs real proceeds).
+	_, avgOK := usableAvgPrice(st)
 	if p.StatusErr != nil || st.Status == execution.StateRejected || st.Status == execution.StateUnknown ||
-		(st.Status == execution.StateFilled && (st.RemainingQty.IsPositive() || !st.FilledQty.IsPositive())) {
+		(st.Status == execution.StateFilled && (st.RemainingQty.IsPositive() || !st.FilledQty.IsPositive())) ||
+		(st.FilledQty.IsPositive() && !avgOK) {
 		out.Ambiguous = true
-		if err := resolveOrderTo(ctx, tx, p.OrderID, state.OrderNeedsReconcile, "needs_reconcile", "ambiguous sell status"); err != nil {
+		if err := resolveOrderTo(ctx, tx, p.OrderID, state.OrderNeedsReconcile, "needs_reconcile", "ambiguous sell status / no cost basis"); err != nil {
 			return out, err
 		}
-		if err := resolveCycleTo(ctx, tx, p.CycleID, state.CycleNeedsReconcile, "needs_reconcile", "ambiguous sell status"); err != nil {
+		if err := resolveCycleTo(ctx, tx, p.CycleID, state.CycleNeedsReconcile, "needs_reconcile", "ambiguous sell status / no cost basis"); err != nil {
 			return out, err
 		}
 		return out, q.MarkSucceeded(ctx, tx, p.RequestID, p.RawResp)
 	}
 
-	// 1. Record this order's fills + accounting.
+	// 1. Record this order's fills + accounting. Past the guard above, any positive fill has
+	//    a usable cost basis (avgOK). The avg price is reported or derived (ExecutedQuote /
+	//    FilledQty) inside updateOrderAccounting / upsertAggregateFill.
 	requested := sellOrderQty(ctx, tx, p.OrderID)
 	orderClass := ClassZero
-	if st.FilledQty.IsPositive() && st.AvgPrice.IsPositive() {
+	if st.FilledQty.IsPositive() {
 		if !requested.IsZero() && st.FilledQty.GreaterThanOrEqual(requested) {
 			orderClass = ClassFull
 		} else {
@@ -208,7 +224,7 @@ func ProcessSellStatus(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellSt
 	if err := updateOrderAccounting(ctx, tx, p.OrderID, st, orderClass, requested); err != nil {
 		return out, err
 	}
-	if st.FilledQty.IsPositive() && st.AvgPrice.IsPositive() {
+	if st.FilledQty.IsPositive() {
 		if err := upsertAggregateFill(ctx, tx, p.OrderID, p.CycleID, st); err != nil {
 			return out, err
 		}
@@ -242,6 +258,19 @@ func ProcessSellStatus(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellSt
 		return out, err
 	}
 	if inventory.IsPositive() && sold.GreaterThanOrEqual(inventory) {
+		// Fully exited by quantity — but only CLOSE if the close accounting is complete/valid
+		// (PR11 #6). If the buy/sell fill data is missing/zero/inconsistent, do NOT close/PnL:
+		// divert to NEEDS_RECONCILE with the lock HELD for an operator/reconciler.
+		if accErr := checkCloseAccounting(ctx, tx, p.CycleID); accErr != nil {
+			out.Ambiguous = true
+			if err := resolveOrderTo(ctx, tx, p.OrderID, state.OrderNeedsReconcile, "needs_reconcile", "sell complete but close accounting invalid"); err != nil {
+				return out, err
+			}
+			if err := resolveCycleTo(ctx, tx, p.CycleID, state.CycleNeedsReconcile, "needs_reconcile", "sell complete but close accounting invalid: "+accErr.Error()); err != nil {
+				return out, err
+			}
+			return out, q.MarkSucceeded(ctx, tx, p.RequestID, p.RawResp)
+		}
 		// Fully exited -> close + PnL + release lock.
 		if err := resolveCycleTo(ctx, tx, p.CycleID, state.CycleSellFilled, "sell_filled", "exit sell complete"); err != nil {
 			return out, err
@@ -285,48 +314,99 @@ func closeCycleWithPnL(ctx context.Context, tx *sql.Tx, cycleID int64, scope, re
 	return false, nil
 }
 
-// writeCloseAccounting computes exit/PnL accounting from the recorded buy + sell order
-// fills and stamps it onto the cycle (sold qty, avg sell, sell quote/fee, net qty,
-// realized_quote, close reason, closed_at). realized_quote nets ONLY quote-denominated
-// fees (non-quote fees are stored raw). It writes no state transition and contacts no
-// exchange — shared by the automatic close and the operator resolution close.
-func writeCloseAccounting(ctx context.Context, tx *sql.Tx, cycleID int64, reason string) error {
-	var (
-		canonical                   string
-		buyQty, buyQuote, buyFee    decimal.Decimal
-		buyFeeAsset                 sql.NullString
-		sellQty, sellQuote, sellFee decimal.Decimal
-		sellFeeAsset                sql.NullString
-	)
-	// Buy side (entry_buy order).
-	_ = tx.QueryRowContext(ctx, `
+// ErrIncompleteCloseAccounting means a cycle cannot be closed with valid PnL because the
+// buy/sell fill accounting is missing, zero, inconsistent, or a query failed. The caller must
+// NOT close the cycle — it returns the error (operator path) or diverts to NEEDS_RECONCILE
+// (automatic path). Never close a cycle with a zero/invalid cost basis or proceeds.
+var ErrIncompleteCloseAccounting = errors.New("orders: incomplete/invalid close accounting")
+
+// closeAccounting is the buy + sell fill totals needed to close a cycle with PnL.
+type closeAccounting struct {
+	canonical                   string
+	buyQty, buyQuote, buyFee    decimal.Decimal
+	buyFeeAsset                 sql.NullString
+	sellQty, sellQuote, sellFee decimal.Decimal
+	sellFeeAsset                sql.NullString
+}
+
+// loadCloseAccounting reads the buy/sell accounting, CHECKING every query error (a missing
+// entry_buy order or a DB error becomes ErrIncompleteCloseAccounting — never silently zero).
+func loadCloseAccounting(ctx context.Context, tx *sql.Tx, cycleID int64) (closeAccounting, error) {
+	var a closeAccounting
+	if err := tx.QueryRowContext(ctx, `
 SELECT c.canonical_symbol, COALESCE(o.filled_quantity,0), COALESCE(o.quote_spent,0), COALESCE(o.fee_amount,0), o.fee_asset
 FROM cycles c JOIN orders o ON o.cycle_id=c.id AND o.role='entry_buy'
-WHERE c.id=? LIMIT 1`, cycleID).Scan(&canonical, &buyQty, &buyQuote, &buyFee, &buyFeeAsset)
-	// Sell side (sum across exit_sell orders).
-	_ = tx.QueryRowContext(ctx, `
+WHERE c.id=? LIMIT 1`, cycleID).Scan(&a.canonical, &a.buyQty, &a.buyQuote, &a.buyFee, &a.buyFeeAsset); err != nil {
+		return a, fmt.Errorf("%w: buy accounting (cycle %d): %v", ErrIncompleteCloseAccounting, cycleID, err)
+	}
+	if err := tx.QueryRowContext(ctx, `
 SELECT COALESCE(SUM(filled_quantity),0), COALESCE(SUM(quote_spent),0), COALESCE(SUM(fee_amount),0), MAX(fee_asset)
-FROM orders WHERE cycle_id=? AND role='exit_sell'`, cycleID).Scan(&sellQty, &sellQuote, &sellFee, &sellFeeAsset)
+FROM orders WHERE cycle_id=? AND role='exit_sell'`, cycleID).Scan(&a.sellQty, &a.sellQuote, &a.sellFee, &a.sellFeeAsset); err != nil {
+		return a, fmt.Errorf("%w: sell accounting (cycle %d): %v", ErrIncompleteCloseAccounting, cycleID, err)
+	}
+	return a, nil
+}
 
-	quoteUnit := quoteOf(canonical)
-	avgSell := decimal.Zero
-	if sellQty.IsPositive() {
-		avgSell = sellQuote.Div(sellQty)
+// validate rejects a close whose accounting is missing/zero/inconsistent. Both sides must have
+// a positive filled quantity and positive quote, and the sold quantity must match the bought
+// quantity within a small tolerance (the close trigger is sold >= bought; guard runaway
+// over-sell). PnL is only computed from real data.
+func (a closeAccounting) validate() error {
+	if !a.buyQty.IsPositive() || !a.buyQuote.IsPositive() {
+		return fmt.Errorf("%w: buy qty/quote not positive (qty=%s quote=%s)", ErrIncompleteCloseAccounting, a.buyQty, a.buyQuote)
 	}
-	realized := sellQuote.Sub(buyQuote)
-	if buyFeeAsset.Valid && strings.EqualFold(buyFeeAsset.String, quoteUnit) {
-		realized = realized.Sub(buyFee)
+	if !a.sellQty.IsPositive() || !a.sellQuote.IsPositive() {
+		return fmt.Errorf("%w: sell qty/quote not positive (qty=%s quote=%s)", ErrIncompleteCloseAccounting, a.sellQty, a.sellQuote)
 	}
-	if sellFeeAsset.Valid && strings.EqualFold(sellFeeAsset.String, quoteUnit) {
-		realized = realized.Sub(sellFee)
+	if a.sellQty.GreaterThan(a.buyQty.Mul(closeQtyTolerance)) {
+		return fmt.Errorf("%w: sold qty %s exceeds bought %s beyond tolerance", ErrIncompleteCloseAccounting, a.sellQty, a.buyQty)
 	}
-	net := buyQty.Sub(sellQty)
+	return nil
+}
 
-	_, err := tx.ExecContext(ctx, `
+// closeQtyTolerance caps how far sold may exceed bought (1%) before a close is treated as
+// inconsistent (→ NEEDS_RECONCILE) rather than a clean exit.
+var closeQtyTolerance = decimal.RequireFromString("1.01")
+
+// checkCloseAccounting loads + validates the close accounting; ErrIncompleteCloseAccounting
+// when the cycle must NOT be closed as if all is well.
+func checkCloseAccounting(ctx context.Context, tx *sql.Tx, cycleID int64) error {
+	a, err := loadCloseAccounting(ctx, tx, cycleID)
+	if err != nil {
+		return err
+	}
+	return a.validate()
+}
+
+// writeCloseAccounting computes exit/PnL accounting from the recorded buy + sell order fills
+// and stamps it onto the cycle. It VALIDATES the accounting first (ErrIncompleteCloseAccounting
+// on missing/zero/inconsistent data — never closes with a bad cost basis/proceeds).
+// realized_quote nets ONLY quote-denominated fees (non-quote fees are stored raw). It writes no
+// state transition and contacts no exchange — shared by the automatic + operator-resolution close.
+func writeCloseAccounting(ctx context.Context, tx *sql.Tx, cycleID int64, reason string) error {
+	a, err := loadCloseAccounting(ctx, tx, cycleID)
+	if err != nil {
+		return err
+	}
+	if err := a.validate(); err != nil {
+		return err
+	}
+	quoteUnit := quoteOf(a.canonical)
+	avgSell := a.sellQuote.Div(a.sellQty) // sellQty positive (validated)
+	realized := a.sellQuote.Sub(a.buyQuote)
+	if a.buyFeeAsset.Valid && strings.EqualFold(a.buyFeeAsset.String, quoteUnit) {
+		realized = realized.Sub(a.buyFee)
+	}
+	if a.sellFeeAsset.Valid && strings.EqualFold(a.sellFeeAsset.String, quoteUnit) {
+		realized = realized.Sub(a.sellFee)
+	}
+	net := a.buyQty.Sub(a.sellQty)
+
+	_, err = tx.ExecContext(ctx, `
 UPDATE cycles SET sold_quantity=?, avg_sell_price=?, sell_quote=?, sell_fee=?, sell_fee_asset=?,
   net_quantity=?, realized_quote=?, close_reason=?, closed_at=NOW(6)
 WHERE id=?`,
-		sellQty.String(), decimalOrNull(avgSell), decimalOrNull(sellQuote), decimalOrNull(sellFee), sellFeeAsset,
+		a.sellQty.String(), decimalOrNull(avgSell), decimalOrNull(a.sellQuote), decimalOrNull(a.sellFee), a.sellFeeAsset,
 		net.String(), realized.String(), reason, cycleID)
 	return err
 }

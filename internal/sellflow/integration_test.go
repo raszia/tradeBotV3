@@ -274,6 +274,38 @@ func TestRepriceIntervalGate(t *testing.T) {
 	}
 }
 
+// TestRepriceEmptyExchangeOrderIDReconciles (PR11 #7) — a resting sell with no usable
+// exchange_order_id must not enqueue a blind CANCEL_ORDER(""): order+cycle → NEEDS_RECONCILE,
+// lock preserved, no cancel queued.
+func TestRepriceEmptyExchangeOrderIDReconciles(t *testing.T) {
+	f := setupS(t)
+	m := f.market(30, "0.01", "0", "0", "0")
+	cyc := f.seedCycleBuy(m, "SELL_SUBMITTED", "0.5", "50")
+	lock := f.seedLock(cyc)
+	f.seedRestingSell(m, cyc, "ACKED", "") // empty exchange_order_id
+	f.mustExec("UPDATE cycles SET last_reprice_at = NOW(6) - INTERVAL 1 HOUR WHERE id=?", cyc)
+
+	if err := RepriceSell(f.ctx, f.store, f.q, m, cyc, 500); err != nil {
+		t.Fatalf("RepriceSell = %v, want nil (resolved via reconcile, not an error)", err)
+	}
+	var cancels int
+	f.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE cycle_id=? AND request_type='CANCEL_ORDER'", cyc).Scan(&cancels)
+	if cancels != 0 {
+		t.Errorf("cancel requests=%d, want 0 (no blind cancel with empty exchange_order_id)", cancels)
+	}
+	if _, st, _, _, _ := f.sellOrder(cyc); st != "NEEDS_RECONCILE" {
+		t.Errorf("sell order=%s, want NEEDS_RECONCILE", st)
+	}
+	if f.cycleState(cyc) != "NEEDS_RECONCILE" {
+		t.Errorf("cycle=%s, want NEEDS_RECONCILE", f.cycleState(cyc))
+	}
+	var lockSt string
+	f.db.QueryRow("SELECT state FROM symbol_locks WHERE id=?", lock).Scan(&lockSt)
+	if lockSt != "ACTIVE" {
+		t.Errorf("lock=%s, want ACTIVE (preserved)", lockSt)
+	}
+}
+
 func TestRepriceBlockedByInFlightOp(t *testing.T) {
 	f := setupS(t)
 	m := f.market(30, "0.01", "0", "0", "0")

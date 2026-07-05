@@ -75,9 +75,11 @@ func (f *rfix) seed(buyQty, buyFilled string, withSell bool, sellQty, sellFilled
 	m := f.lastID(f.exec("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", symbol, b, qa))
 	f.emID = f.lastID(f.exec("INSERT INTO exchange_markets (exchange_id, market_id, exchange_symbol, canonical_symbol) VALUES (?, ?, ?, ?)", f.exID, m, u("ES"), symbol))
 	f.cycID = f.lastID(f.exec("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state, version) VALUES (?, ?, ?, 'NEEDS_RECONCILE', 3)", f.emID, f.exID, symbol))
+	// A filled buy always spent quote (quote_spent = filled × price@10); a valid cost basis
+	// is required to close a cycle with PnL (PR11 #6). A zero-fill buy stays quote_spent 0.
 	f.buyID = f.lastID(f.exec(
-		"INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, version, quantity, filled_quantity, limit_price) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'NEEDS_RECONCILE', 2, ?, ?, '10')",
-		f.cycID, f.exID, f.emID, u("bo"), buyQty, buyFilled))
+		"INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, version, quantity, filled_quantity, quote_spent, avg_fill_price, limit_price) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'NEEDS_RECONCILE', 2, ?, ?, ?*10, '10', '10')",
+		f.cycID, f.exID, f.emID, u("bo"), buyQty, buyFilled, buyFilled))
 	if withSell {
 		f.sellID = f.lastID(f.exec(
 			"INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, version, quantity, filled_quantity, limit_price) VALUES (?, ?, ?, 'sell', 'exit_sell', ?, 'NEEDS_RECONCILE', 2, ?, ?, '11')",
