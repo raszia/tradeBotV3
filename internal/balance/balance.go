@@ -38,8 +38,16 @@ type BalanceClient interface {
 
 // Config tunes the syncer. Defaults are filled by New.
 type Config struct {
-	// Interval is the poll cadence (default 30s).
+	// Interval is the DEFAULT poll cadence (default 30s), used for any exchange without a
+	// per-exchange override.
 	Interval time.Duration
+	// IntervalFor optionally returns a PER-EXCHANGE poll interval (0 → use Interval). It lets
+	// a rate-limited venue be polled LESS often so we respect its rate limits and do not
+	// over-poll; wired from the exchange's configured rate limit. Never below MinInterval.
+	IntervalFor func(exchangeCode string) time.Duration
+	// MinInterval floors every effective interval so a misconfiguration can never over-poll a
+	// venue (default 1s).
+	MinInterval time.Duration
 	// Timeout bounds each exchange's GetBalances call (default 5s).
 	Timeout time.Duration
 	// MaxConcurrent bounds how many exchanges are polled at once (default 4) — never
@@ -51,6 +59,9 @@ func (c *Config) withDefaults() {
 	if c.Interval <= 0 {
 		c.Interval = 30 * time.Second
 	}
+	if c.MinInterval <= 0 {
+		c.MinInterval = time.Second
+	}
 	if c.Timeout <= 0 {
 		c.Timeout = 5 * time.Second
 	}
@@ -61,12 +72,13 @@ func (c *Config) withDefaults() {
 
 // Syncer polls a set of read-only balance clients into the balance tables.
 type Syncer struct {
-	store   *db.Store
-	clients map[string]BalanceClient // exchange code -> read-only client
-	exIDs   map[string]int64         // exchange code -> id
-	clk     clock.Clock
-	log     *slog.Logger
-	cfg     Config
+	store      *db.Store
+	clients    map[string]BalanceClient // exchange code -> read-only client
+	exIDs      map[string]int64         // exchange code -> id
+	lastPolled map[string]time.Time     // exchange code -> last poll time (per-exchange cadence)
+	clk        clock.Clock
+	log        *slog.Logger
+	cfg        Config
 }
 
 // New builds a Syncer. With no clients it has nothing to poll and idles safely.
@@ -81,27 +93,88 @@ func New(store *db.Store, clients map[string]BalanceClient, clk clock.Clock, log
 	if clients == nil {
 		clients = map[string]BalanceClient{}
 	}
-	return &Syncer{store: store, clients: clients, exIDs: map[string]int64{}, clk: clk, log: log, cfg: cfg}
+	return &Syncer{store: store, clients: clients, exIDs: map[string]int64{}, lastPolled: map[string]time.Time{}, clk: clk, log: log, cfg: cfg}
 }
 
-// Run resolves exchange ids then polls every Interval until ctx is cancelled. It is
-// safe to start with no clients (it simply idles).
+// effectiveInterval is the poll cadence for one exchange: its per-exchange override (from
+// IntervalFor) or the default Interval, floored at MinInterval so a misconfig can never
+// over-poll. A rate-limited venue is polled LESS often by returning a larger interval.
+func (s *Syncer) effectiveInterval(code string) time.Duration {
+	d := s.cfg.Interval
+	if s.cfg.IntervalFor != nil {
+		if v := s.cfg.IntervalFor(code); v > 0 {
+			d = v
+		}
+	}
+	if d < s.cfg.MinInterval {
+		d = s.cfg.MinInterval
+	}
+	return d
+}
+
+// baseTick is the finest cadence the run loop needs to wake at — the smallest effective
+// interval across the exchanges (so no exchange is polled later than its own interval).
+func (s *Syncer) baseTick() time.Duration {
+	tick := s.cfg.Interval
+	for code := range s.clients {
+		if d := s.effectiveInterval(code); d < tick {
+			tick = d
+		}
+	}
+	if tick < s.cfg.MinInterval {
+		tick = s.cfg.MinInterval
+	}
+	return tick
+}
+
+// dueCodes returns the exchanges whose per-exchange interval has elapsed since their last
+// poll (all are due on the first pass). Runs only on the Run goroutine, so lastPolled needs
+// no lock.
+func (s *Syncer) dueCodes(now time.Time) []string {
+	var due []string
+	for code := range s.clients {
+		last, seen := s.lastPolled[code]
+		if !seen || now.Sub(last) >= s.effectiveInterval(code) {
+			due = append(due, code)
+		}
+	}
+	return due
+}
+
+// Run resolves exchange ids then polls each exchange on ITS OWN cadence (per-exchange
+// interval, floored at MinInterval) until ctx is cancelled — a rate-limited venue is polled
+// less often and none is over-polled. Safe to start with no clients (it simply idles).
 func (s *Syncer) Run(ctx context.Context) error {
 	if err := s.resolveExchangeIDs(ctx); err != nil {
 		return err
 	}
-	s.log.Info("balance-sync starting", "exchanges", len(s.clients), "interval", s.cfg.Interval)
-	t := time.NewTicker(s.cfg.Interval)
+	tick := s.baseTick()
+	s.log.Info("balance-sync starting", "exchanges", len(s.clients), "default_interval", s.cfg.Interval, "base_tick", tick)
+	t := time.NewTicker(tick)
 	defer t.Stop()
-	s.SyncAll(ctx) // initial pass so balances are recorded promptly
+	s.syncDue(ctx) // initial pass — every exchange is due
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			s.SyncAll(ctx)
+			s.syncDue(ctx)
 		}
 	}
+}
+
+// syncDue polls the exchanges whose per-exchange interval has elapsed, then stamps their
+// last-poll time. Called only from Run's goroutine.
+func (s *Syncer) syncDue(ctx context.Context) {
+	now := s.clk.Now()
+	due := s.dueCodes(now)
+	if len(due) == 0 {
+		return
+	}
+	for _, code := range due {
+		s.lastPolled[code] = now
+	}
+	s.syncCodes(ctx, due)
 }
 
 func (s *Syncer) resolveExchangeIDs(ctx context.Context) error {
@@ -119,17 +192,28 @@ func (s *Syncer) resolveExchangeIDs(ctx context.Context) error {
 	return nil
 }
 
-// SyncAll polls every exchange concurrently (bounded by MaxConcurrent). A single
+// SyncAll polls EVERY exchange once (concurrently, bounded by MaxConcurrent). Used for the
+// one-shot initial pass and by tests; the periodic loop uses syncDue (per-exchange cadence).
+func (s *Syncer) SyncAll(ctx context.Context) {
+	codes := make([]string, 0, len(s.clients))
+	for code := range s.clients {
+		codes = append(codes, code)
+	}
+	s.syncCodes(ctx, codes)
+}
+
+// syncCodes polls the given exchanges concurrently (bounded by MaxConcurrent). A single
 // exchange's failure is logged and isolated — it never affects the others, and never
 // wipes/zeros the failing exchange's already-recorded balances.
-func (s *Syncer) SyncAll(ctx context.Context) {
+func (s *Syncer) syncCodes(ctx context.Context, codes []string) {
 	sem := make(chan struct{}, s.cfg.MaxConcurrent)
 	var wg sync.WaitGroup
-	for code, client := range s.clients {
+	for _, code := range codes {
 		exID, ok := s.exIDs[code]
 		if !ok {
 			continue
 		}
+		client := s.clients[code]
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(code string, exID int64, client BalanceClient) {

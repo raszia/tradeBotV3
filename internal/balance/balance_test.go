@@ -93,6 +93,74 @@ func TestStartupNoClientsIsSafe(t *testing.T) {
 	}
 }
 
+// TestPerExchangeCadence verifies rate-limit-aware, per-exchange balance polling: each
+// exchange is polled on its own interval (floored at MinInterval so a misconfig can never
+// over-poll), and an exchange not yet due is skipped. Pure scheduling — no DB needed.
+func TestPerExchangeCadence(t *testing.T) {
+	t0 := time.Date(2026, 7, 5, 0, 0, 0, 0, time.UTC)
+	ivals := map[string]time.Duration{
+		"fast": 2 * time.Second,
+		"slow": 60 * time.Second,
+		"tiny": 200 * time.Millisecond, // below MinInterval → floored
+	}
+	s := New(nil, map[string]BalanceClient{
+		"fast": &fakeBal{code: "fast"}, "slow": &fakeBal{code: "slow"},
+		"tiny": &fakeBal{code: "tiny"}, "def": &fakeBal{code: "def"},
+	}, clock.NewManual(t0), nil, Config{
+		Interval: 10 * time.Second, MinInterval: time.Second,
+		IntervalFor: func(code string) time.Duration { return ivals[code] },
+	})
+
+	// Per-exchange interval, default fallback, and MinInterval floor.
+	for code, want := range map[string]time.Duration{
+		"fast": 2 * time.Second, "slow": 60 * time.Second,
+		"tiny": time.Second /* floored */, "def": 10 * time.Second, /* default */
+	} {
+		if got := s.effectiveInterval(code); got != want {
+			t.Errorf("effectiveInterval(%s)=%v, want %v", code, got, want)
+		}
+	}
+	// baseTick = smallest effective interval (tiny floored to 1s).
+	if got := s.baseTick(); got != time.Second {
+		t.Errorf("baseTick=%v, want 1s", got)
+	}
+
+	has := func(now time.Time, want ...string) {
+		t.Helper()
+		got := map[string]bool{}
+		for _, c := range s.dueCodes(now) {
+			got[c] = true
+		}
+		set := map[string]bool{}
+		for _, w := range want {
+			set[w] = true
+			if !got[w] {
+				t.Errorf("at %v: %s should be due", now.Sub(t0), w)
+			}
+		}
+		for c := range got {
+			if !set[c] {
+				t.Errorf("at %v: %s should NOT be due", now.Sub(t0), c)
+			}
+		}
+	}
+
+	// t0: everything is due (never polled).
+	has(t0, "fast", "slow", "tiny", "def")
+	// Simulate polling all at t0.
+	for c := range s.clients {
+		s.lastPolled[c] = t0
+	}
+	// +1s: only tiny (floored to 1s) is due.
+	has(t0.Add(time.Second), "tiny")
+	// +2s: tiny + fast.
+	has(t0.Add(2*time.Second), "tiny", "fast")
+	// +10s: tiny + fast + def (not slow).
+	has(t0.Add(10*time.Second), "tiny", "fast", "def")
+	// +60s: everything, including slow.
+	has(t0.Add(60*time.Second), "fast", "slow", "tiny", "def")
+}
+
 // ---- gated ----
 
 var bseq int

@@ -948,6 +948,114 @@ the supported path); per-venue individual fills (one aggregate fill row per stat
 multi-leg / cross-asset fee conversion for `realized_quote`; the operator exit from
 `NEEDS_RECONCILE`.
 
+## 10d. Ambiguous mutating-outcome handling & order-result reading (order-lifecycle safety)
+
+The whole point of the state machine + queue + reconciler is to survive **ambiguous
+exchange outcomes**. Iranian venues have **no native IOC**, so the buy is a *simulated
+IOC* (place → wait → cancel → read final status), and **a fill can materialise after our
+HTTP call returns or times out**. The cardinal rule everywhere:
+
+> **`PlaceOrder` / `CancelOrder` are AMBIGUOUS unless the exchange response is definitive.
+> An ambiguous mutating call is NEVER blindly retried; the symbol lock stays HELD while
+> ambiguity exists; reconciliation owns the final decision.**
+
+**Outcome classification (`executor.isDefiniteRejection`, conservative).** Only clear
+client-side rejections are "definite": `ErrInsufficientBalance`, `ErrAuthFailed`, or a
+normalized `CatBadRequest`/`CatAuth`/`CatInsufficientBalance`. **Timeout, network reset,
+5xx, and any unknown error are AMBIGUOUS** (not "the order was not created").
+
+**Ambiguous `PlaceOrder`.** `handlePlace`/`handleSellPlace`: on a definite rejection →
+clean fail (buy: `OnPlaceRejected` = FAILED + lock released; sell: FAILED + order/cycle
+NEEDS_RECONCILE, lock held). On an **ambiguous** error → `deadReconcile`: the request is
+`DEAD`, the order **and** cycle go to `NEEDS_RECONCILE`, the lock is **held**, and the
+mutating request is **never re-sent**. The order may exist on the venue even though our
+request failed — so before any *future* placement the **reconciler** looks it up (below),
+never a blind re-`PlaceOrder`. `MarkInFlight` is committed **before** the send, so a crash
+mid-send leaves a recoverable `IN_FLIGHT` marker.
+
+**Ambiguous `CancelOrder`.** `handleCancel`/`handleSellCancel`: a clean cancel **or** a
+definite rejection (e.g. "already gone/filled") both resolve via the **authoritative final
+`GET_ORDER`** (the cancel may have raced a fill — we never assume terminal from a cancel
+ack). Only an **ambiguous** cancel (timeout/network) → `deadReconcile` → `NEEDS_RECONCILE`,
+lock held; the reconciler then reads the real status. (This mirrors the reference system,
+where cancel returns 200/success *before* the order leaves "open", so a status re-read is
+mandatory.)
+
+**No blind retry of mutating requests (queue).** `SweepStuck`: a stale **`CLAIMED`**
+request (claimed but never `IN_FLIGHT` → never sent) is safely re-queued even if mutating;
+a stale **`IN_FLIGHT`** read-only request is rescheduled; a stale **`IN_FLIGHT` mutating**
+request is `deadMutatingStuck` = `DEAD` + order `NEEDS_RECONCILE`, **never re-sent**.
+`ScheduleRetry` refuses a mutating request outright (dead-letters it) as defense-in-depth.
+
+**Reconciliation owns the final decision — lookup by exchange id, then client id, never
+re-send (`internal/reconciler`).** For an order with ambiguity, the reconciler fetches the
+real state read-only:
+- `GetOrder(exchange_order_id)` when it is known;
+- else, **for venues that accept a client order id** (`Capabilities.ClientOrderID &&
+  FetchByOrderID`), `GetOrder(local_client_order_id)` — **lookup by `client_order_id`** —
+  and it back-fills the discovered `exchange_order_id`;
+- else (cannot positively identify) → `NEEDS_RECONCILE`, **not** a re-send.
+Its decision table is conservative: open/partial → *Continue* (resume from persisted state,
+idempotent via the queue); filled-and-clean → advance; canceled/expired with **zero** fill
+→ terminal; **any fill it cannot fully account for, a missing order, or a fetch error →
+`NEEDS_RECONCILE` with the lock held** (a missing order is **never** proof of zero fill).
+The reconciler holds a `ReadOnlyClient` that structurally lacks `PlaceOrder`/`CancelOrder`,
+so it can never mutate.
+
+**Order-result reading is capability-aware: private WS *or* REST polling → one normalized
+path.** `exchanges.Capabilities.OrderUpdatesWS` declares whether a venue has a private
+order-update WebSocket. `execution.NormalizedOrderEvent` (built by `EventFromStatus` for a
+REST `GetOrder` result and `EventFromAck` for a place ack) is the **single normalized shape**
+both a WS stream and REST polling converge on, so the same fill/status processing
+(`ProcessFinalStatus`/`ProcessSellStatus`) serves either source. **Every Iranian adapter in
+this system is REST-poll-only today** (`SubscribeOrderUpdates` returns `Unsupported`;
+`OrderUpdatesWS=false`) — order status comes from the scheduled `GET_ORDER` follow-ups —
+so no WS consumer is wired (wiring a dead stream would be misleading). The reference system
+shows the intended split for venues that *do* have it: **Nobitex & Bitpin** race a private
+order WS (Centrifugo) against REST `GetOrder` and **fall back to polling** on WS timeout;
+**Wallex is REST-only**. When such a venue is added here, its adapter sets `OrderUpdatesWS`
+and a small consumer feeds `SubscribeOrderUpdates` → `NormalizedOrderEvent` into the *same*
+processing path — REST polling remains the always-available fallback; the system never relies
+on WS alone.
+
+**Wallet snapshots, settlement lag & the inventory source of truth.** Matched quantity comes
+from **order status + recorded fills**, never a wallet snapshot: the sell sizes and closes on
+`orders.filled_quantity` (`bought − sold`), and PnL from `quote_spent`/proceeds — so a wallet
+balance that lags after a cancel/partial fill can never mis-size the next leg. Wallet
+snapshots are **confirmation**, not the primary source: `balance-sync` (§11a) periodically
+records `wallet_balances_current` + `wallet_balance_history` (per `exchange_id`, timestamped,
+hash-deduped), and the operator-reconcile tool runs an **advisory balance cross-check**
+(exchange-reported base balance vs the resolution's implied held quantity). Because all
+venues report balances over REST only (no balance WebSocket — same as the reference), a
+snapshot can trail the order state briefly; the lock stays **held** through the sell, so the
+system never releases a scope on unsettled inventory. (The reference additionally gates each
+live leg on a ~5s balance-freshness window and refreshes balances after each trade — a
+follow-up here.)
+
+**Rate-limit-aware, per-exchange polling.** `balance-sync` polls **each exchange on its own
+cadence** (`Config.IntervalFor(code)`, floored by `Config.MinInterval` so a misconfig can
+never over-poll); an exchange not yet due is skipped, so a rate-limited venue is polled less
+often without starving the others. Adapter-level rate limits surface as
+`execution.ErrRateLimited`/`CatRateLimit`, which the executor treats as retryable-with-backoff
+for read-only calls and never as a definite outcome for a mutating call. (The reference uses
+per-endpoint token spacing for Nobitex/Wallex and a shared 60-req/min budget for Bitpin, and
+honors server-issued 429 back-off — the model this system's per-exchange cadence + rate-limit
+classification is built to accommodate.)
+
+**Lock behavior summary (while an outcome or settlement is unknown).**
+
+| Situation | Order/cycle | Symbol lock |
+|---|---|---|
+| Definite `PlaceOrder` success | proceed to scheduled next step | held |
+| Definite buy rejection (never placed) | FAILED (`OnPlaceRejected`) | **released** (no exposure) |
+| Definite sell rejection / bad sell payload | request FAILED, order/cycle NEEDS_RECONCILE | **held** (inventory) |
+| **Ambiguous** `PlaceOrder` (timeout/network) | request DEAD, order+cycle NEEDS_RECONCILE, never re-sent | **held** |
+| **Ambiguous** `CancelOrder` | NEEDS_RECONCILE (reconciler reads real status) | **held** |
+| Cancel clean/definite | resolve via authoritative `GET_ORDER` | per final status |
+| Proven zero fill after cancel | CANCELLED | **released** |
+| Partial / full fill | continue / close on valid cost basis | **held** until full exit closes |
+| Fill with no usable cost basis / missing order | NEEDS_RECONCILE | **held** |
+
 ## 11. Reconciler (implemented in PR12 — `internal/reconciler`)
 
 The reconciler makes the system safe after restart/timeout/partial-fill/
@@ -1062,6 +1170,16 @@ are touched. An asset that **stops appearing** is **not** deleted or zeroed; its
 `wallet_balances_current` row survives and its `last_seen_at` simply goes stale, which
 lets later reconciliation/dashboard flag it. A balance becomes zero only when the
 venue response explicitly reports zero.
+
+**Per-exchange, rate-limit-aware cadence (PR11 lifecycle-safety follow-up).** Each
+exchange is polled on **its own interval** — `Config.IntervalFor(code)` (0 → the default
+`Interval`), floored by `Config.MinInterval` so a misconfiguration can never over-poll. The
+run loop wakes at the finest effective interval and **skips any exchange not yet due**
+(tracked per exchange), so a rate-limited venue is polled *less often* without slowing the
+others (mirrors the reference's per-exchange `balance_poll_interval` + skip-not-due). All
+venues are REST-only (no balance WebSocket). These snapshots feed reconciliation and the
+advisory balance cross-check (§10d) — they are inventory **confirmation**, never the primary
+matched-quantity source (order fills are).
 
 **Startup / secrets.** Real authenticated balance clients need decrypted credentials
 (a later PR); until then the binary wires **no clients** and idles safely (no panic,
@@ -2323,6 +2441,24 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR11 (order-lifecycle safety) — ambiguous mutating outcomes, capability-aware order
+  reads, per-exchange balance cadence**: audited the order lifecycle against the reference
+  system (iranArb) and confirmed the safety core was already implemented + tested — ambiguous
+  `PlaceOrder`/`CancelOrder` (timeout/network) → `deadReconcile` (DEAD + order/cycle
+  NEEDS_RECONCILE, lock held, **never re-sent**); definite-rejection classification is
+  conservative; the sweeper dead-letters stuck mutating requests and `ScheduleRetry` refuses
+  them; the reconciler is read-only and looks orders up by `exchange_order_id` **then by
+  `local_client_order_id`** (client-order-id lookup for capable venues) before ever
+  contemplating a re-place, defaulting to NEEDS_RECONCILE on any doubt; order-result reading is
+  capability-aware (`Capabilities.OrderUpdatesWS` + `NormalizedOrderEvent` unify WS and REST;
+  all current venues are REST-poll-only so no dead WS consumer is wired); the sell sizes/closes
+  on `orders.filled_quantity` (order fills are the matched-quantity source, wallet snapshots are
+  confirmation). One concrete gap fixed: **balance-sync now polls per-exchange on its own
+  rate-limit-aware cadence** (`Config.IntervalFor` + `MinInterval` floor + skip-not-yet-due),
+  matching the reference's per-exchange `balance_poll_interval`; default-config behaviour is
+  unchanged (all every `Interval`). Documented the whole model in a new §10d + updated §11a. No
+  new mutating exchange path; executor remains the only sender.
 
 - **PR11 (correction) — sell-side pre-send validation, empty-id safety, cost-basis + PnL
   guards**: brought the sell path to the buy path's safety level. Sell `PLACE_ORDER` routes by
