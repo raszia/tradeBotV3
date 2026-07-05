@@ -34,9 +34,11 @@ type fakeClient struct {
 	balErr    error
 	getStatus execution.OrderStatus
 	getErr    error
-	// send counters (PR26 crash/rollback tests assert no blind resend).
+	// send counters (PR26 crash/rollback tests assert no blind resend; PR11 empty-id tests
+	// assert no CancelOrder("")/GetOrder("")).
 	placeCount  int32
 	cancelCount int32
+	getCount    int32
 }
 
 func (f *fakeClient) Name() string { return f.code }
@@ -58,6 +60,7 @@ func (f *fakeClient) CancelOrder(context.Context, string) error {
 	return f.cancelErr
 }
 func (f *fakeClient) GetOrder(context.Context, string) (execution.OrderStatus, error) {
+	atomic.AddInt32(&f.getCount, 1)
 	return f.getStatus, f.getErr
 }
 func (f *fakeClient) GetOpenOrders(context.Context, string) ([]execution.OrderStatus, error) {

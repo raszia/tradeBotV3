@@ -400,6 +400,12 @@ func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, c
 		e.failTx(ctx, c.ID, "bad CANCEL_ORDER payload: "+err.Error())
 		return
 	}
+	// FINAL SAFETY BOUNDARY (PR11): never call CancelOrder(""). With order/cycle context →
+	// DEAD + NEEDS_RECONCILE (lock held); otherwise a request-only failure. Not sent.
+	if fp.ExchangeOrderID == "" {
+		e.deadReconcile(ctx, c, "CANCEL_ORDER has empty exchange_order_id — not sent; needs reconcile")
+		return
+	}
 	if !e.liveGateCancel(ctx, c) {
 		return
 	}
@@ -440,6 +446,12 @@ func (e *Executor) handleCancel(ctx, sendCtx context.Context, c queue.Claimed, c
 // reschedules the read; ErrOrderUnknown / a missing order is NOT proof of zero fill
 // — it is processed as ambiguous → NEEDS_RECONCILE.
 func (e *Executor) handleFinalStatus(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
+	// FINAL SAFETY BOUNDARY (PR11): never call GetOrder("") — not fetched → DEAD +
+	// NEEDS_RECONCILE (lock held).
+	if fp.ExchangeOrderID == "" {
+		e.deadReconcile(ctx, c, "GET_ORDER has empty exchange_order_id — not fetched; needs reconcile")
+		return
+	}
 	st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
 	if err != nil && !errors.Is(err, execution.ErrOrderUnknown) && isRetryable(err) {
 		if _, sErr := e.q.ScheduleRetry(ctx, c.ID, err.Error()); sErr != nil && e.log != nil {
@@ -502,8 +514,11 @@ func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed
 		return
 	}
 	if isDefiniteRejection(err) {
+		// A definite SELL rejection is NOT a buy rejection: we still hold inventory from the
+		// buy leg, so DO NOT release the lock / FAIL the cycle. Request FAILED, order + cycle
+		// NEEDS_RECONCILE, lock HELD (OnSellPlaceRejected). Reconciliation decides the next step.
 		_ = e.store.WithTx(ctx, func(tx *sql.Tx) error {
-			return orders.OnPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
+			return orders.OnSellPlaceRejected(ctx, tx, e.q, orders.PlaceRejectedParams{
 				RequestID: c.ID, OrderID: *c.OrderID, CycleID: *c.CycleID, Cause: "sell place rejected: " + err.Error(),
 			})
 		})
@@ -517,6 +532,13 @@ func (e *Executor) handleSellPlace(ctx, sendCtx context.Context, c queue.Claimed
 func (e *Executor) handleSellCancel(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
 	if c.OrderID == nil || c.CycleID == nil {
 		e.failTx(ctx, c.ID, "sell CANCEL_ORDER missing order/cycle context")
+		return
+	}
+	// FINAL SAFETY BOUNDARY (PR11): never call CancelOrder("") — an empty exchange_order_id is
+	// unusable. Do not send, do not MarkInFlight: request FAILED, order+cycle NEEDS_RECONCILE,
+	// lock HELD (inventory). Reconciliation determines the real exchange state.
+	if fp.ExchangeOrderID == "" {
+		e.rejectSellToReconcile(ctx, c, "sell CANCEL_ORDER has empty exchange_order_id — not sent; needs reconcile")
 		return
 	}
 	if !e.liveGateCancel(ctx, c) {
@@ -549,6 +571,16 @@ func (e *Executor) handleSellCancel(ctx, sendCtx context.Context, c queue.Claime
 // orders.ProcessSellStatus. Transient errors reschedule; a missing order / definitive
 // error is processed as ambiguous → NEEDS_RECONCILE.
 func (e *Executor) handleSellStatus(ctx, sendCtx context.Context, c queue.Claimed, fp orders.FollowupPayload, client exchanges.PrivateClient) {
+	if c.OrderID == nil || c.CycleID == nil {
+		e.failTx(ctx, c.ID, "sell GET_ORDER missing order/cycle context")
+		return
+	}
+	// FINAL SAFETY BOUNDARY (PR11): never call GetOrder("") — an empty exchange_order_id is
+	// unusable. Do not send: request FAILED, order+cycle NEEDS_RECONCILE, lock HELD.
+	if fp.ExchangeOrderID == "" {
+		e.rejectSellToReconcile(ctx, c, "sell GET_ORDER has empty exchange_order_id — not sent; needs reconcile")
+		return
+	}
 	st, err := client.GetOrder(sendCtx, fp.ExchangeOrderID)
 	if err != nil && !errors.Is(err, execution.ErrOrderUnknown) && isRetryable(err) {
 		if _, sErr := e.q.ScheduleRetry(ctx, c.ID, err.Error()); sErr != nil && e.log != nil {

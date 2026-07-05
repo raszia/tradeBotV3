@@ -897,7 +897,15 @@ refuses (`ErrSellExists`) when an active sell order already exists for the cycle
 #2/§10b), and its payload is **validated before send** (`SellIntentPayload.Validate`:
 `side=sell`, `order_type=limit`, `price>0`, `quantity>0`, non-empty client id — PR11 #3).
 An undecodable/invalid sell is NOT sent: request `FAILED`, order+cycle `NEEDS_RECONCILE`,
-**lock held** (inventory exists — conservative, never failed+released like a buy). A valid
+**lock held** (inventory exists — conservative, never failed+released like a buy). A
+**definite venue rejection of a sell** (insufficient balance, bad request, auth) is likewise
+NOT the buy path: `OnSellPlaceRejected` marks the request `FAILED` and order+cycle
+`NEEDS_RECONCILE` with the **lock HELD** — because the buy leg already acquired inventory that
+may still be held, so the scope must not be freed (a buy rejection releases the lock only
+because no inventory was acquired). **Executor as the final boundary:** before ANY sell
+`CancelOrder`/`GetOrder` (and buy cancel/final-status) the executor refuses an empty
+`exchange_order_id` — it never calls `CancelOrder("")`/`GetOrder("")`; the request is
+terminal (`FAILED`/`DEAD`) and order+cycle go to `NEEDS_RECONCILE` with the **lock held**. A valid
 sell goes to `OnSellPlaceAck`: order `→ACKED`, cycle `→SELL_SUBMITTED`, and — unlike the buy
 IOC — **no auto-cancel** is scheduled (it rests). **If the sell ack has no usable
 `ExchangeOrderID`** (PR11 #4), the resting sell is untrackable, so order+cycle go to
@@ -1048,7 +1056,8 @@ classification is built to accommodate.)
 |---|---|---|
 | Definite `PlaceOrder` success | proceed to scheduled next step | held |
 | Definite buy rejection (never placed) | FAILED (`OnPlaceRejected`) | **released** (no exposure) |
-| Definite sell rejection / bad sell payload | request FAILED, order/cycle NEEDS_RECONCILE | **held** (inventory) |
+| Definite **sell** rejection (`OnSellPlaceRejected`) / bad sell payload | request FAILED, order/cycle NEEDS_RECONCILE | **held** (inventory unresolved) |
+| Sell follow-up (`CANCEL_ORDER`/`GET_ORDER`) with empty `exchange_order_id` | not sent; request FAILED, order/cycle NEEDS_RECONCILE | **held** |
 | **Ambiguous** `PlaceOrder` (timeout/network) | request DEAD, order+cycle NEEDS_RECONCILE, never re-sent | **held** |
 | **Ambiguous** `CancelOrder` | NEEDS_RECONCILE (reconciler reads real status) | **held** |
 | Cancel clean/definite | resolve via authoritative `GET_ORDER` | per final status |
@@ -2441,6 +2450,18 @@ and the operator-driven first end-to-end live order against a venue (rule #3 kee
 venue-free).
 
 ## 19a. Decisions log
+
+- **PR11 (correction) — sell rejection keeps the lock + executor empty-id boundary**: two
+  sell-side holes. (1) A DEFINITE sell rejection reused the BUY rejection path
+  (`OnPlaceRejected` → cycle FAILED + **lock released**), which is unsafe because the buy leg
+  already holds inventory — a freed scope could start a new cycle over live exposure. New
+  `OnSellPlaceRejected`: request FAILED, order+cycle NEEDS_RECONCILE, **lock HELD**;
+  `handleSellPlace` uses it. (2) Made the executor the FINAL safety boundary against
+  `CancelOrder("")`/`GetOrder("")`: `handleSellCancel`/`handleSellStatus` (and, defense-in-depth,
+  the buy `handleCancel`/`handleFinalStatus`) refuse an empty `exchange_order_id` before any
+  exchange call → request terminal, order+cycle NEEDS_RECONCILE, lock held. Tests:
+  TestSellDefiniteRejectionKeepsLock, TestSellCancelEmptyExchangeOrderIDReconciles (cancelCount
+  0), TestSellStatusEmptyExchangeOrderIDReconciles (getCount 0) — all assert lock ACTIVE.
 
 - **PR11 (order-lifecycle safety) — ambiguous mutating outcomes, capability-aware order
   reads, per-exchange balance cadence**: audited the order lifecycle against the reference

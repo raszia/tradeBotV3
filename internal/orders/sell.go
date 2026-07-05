@@ -130,6 +130,19 @@ func OnSellPlaceAck(ctx context.Context, tx *sql.Tx, q *queue.Queue, p SellPlace
 	return advanceCycleTo(ctx, tx, p.CycleID, state.CycleSellSubmitted, "sell_submitted", "sell resting on the book")
 }
 
+// OnSellPlaceRejected cleanly resolves a DEFINITELY-rejected SELL place. Unlike a buy
+// rejection (OnPlaceRejected — no inventory, so cycle FAILED + lock released), a sell holds
+// EXISTING inventory from the buy leg: the order was refused but we may still hold the asset,
+// so the symbol lock must NOT be released and the cycle must NOT be FAILED. The request is
+// FAILED and the order + cycle go to NEEDS_RECONCILE with the lock HELD; reconciliation decides
+// the next action. No blind retry (the request is terminal; a new sell is the reconciler's call).
+func OnSellPlaceRejected(ctx context.Context, tx *sql.Tx, q *queue.Queue, p PlaceRejectedParams) error {
+	if err := q.MarkFailed(ctx, tx, p.RequestID, p.Cause); err != nil {
+		return err
+	}
+	return MarkNeedsReconcile(ctx, tx, p.OrderID, &p.CycleID, p.Cause)
+}
+
 // SellCancelParams is the input to OnSellCancelResult.
 type SellCancelParams struct {
 	RequestID       int64
