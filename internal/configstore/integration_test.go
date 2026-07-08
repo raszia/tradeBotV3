@@ -72,7 +72,7 @@ func TestConfigStoreIntegration(t *testing.T) {
 		(exchange_id, market_id, exchange_symbol, canonical_symbol, enabled_for_collection, enabled_for_signal, enabled_for_trading, enabled_for_sell_manage)
 		VALUES (?, ?, ?, ?, 1, 1, 1, 1)`, exID, mktID, exSym, canonical))
 	exec("INSERT INTO symbol_configs (exchange_market_id, min_spread_bps, buy_size, buy_size_unit, sell_offset_bps, reprice_interval_seconds, order_timeout_ms, max_retries, retry_backoff_ms) VALUES (?, 40, '0.5', 'quote', 20, 5, 3000, 3, 500)", emID)
-	exec("INSERT INTO exchange_configs (exchange_id, max_concurrent_requests, request_timeout_ms) VALUES (?, 2, 5000)", exID)
+	exec("INSERT INTO exchange_configs (exchange_id, max_concurrent_requests, request_timeout_ms, balance_poll_interval_seconds) VALUES (?, 2, 5000, 45)", exID)
 	exec("INSERT INTO retention_settings (table_name, retention_days, enabled) VALUES (?, 7, 1)", "api_call_logs_"+exCode)
 
 	s := New(db)
@@ -85,6 +85,9 @@ func TestConfigStoreIntegration(t *testing.T) {
 	mc, ok := snap.Market(emID)
 	if !ok || !mc.HasSymbolConfig || mc.MinSpreadBps != 40 || mc.ExchangeCode != exCode {
 		t.Fatalf("loaded market = %+v ok=%v", mc, ok)
+	}
+	if ec, ok := snap.Exchanges[exCode]; !ok || ec.BalancePollIntervalSeconds != 45 {
+		t.Errorf("exchange config balance_poll_interval_seconds = %+v (ok=%v), want 45", ec, ok)
 	}
 	if !mc.EnabledForTrading {
 		t.Error("market should be enabled_for_trading")

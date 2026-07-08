@@ -14,9 +14,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"v3TradeBot/internal/balance"
 	"v3TradeBot/internal/clock"
+	"v3TradeBot/internal/configstore"
 	"v3TradeBot/internal/credentials"
 	"v3TradeBot/internal/db"
 	"v3TradeBot/internal/exchanges"
@@ -42,7 +44,26 @@ func main() {
 				clients[code] = client // *exchanges client satisfies BalanceClient (narrowed)
 			}
 		}
-		syncer := balance.New(store, clients, clock.NewSystem(), base.Log, balance.Config{})
+		// Per-exchange balance cadence (PR13): read each exchange's balance_poll_interval_seconds
+		// from the DB config once at boot and feed it to the syncer via IntervalFor. 0/absent →
+		// the syncer's default Interval; MinInterval floors it so a misconfig can't over-poll.
+		// So different venues (e.g. Nobitex 30s, Bitpin 60s, Wallex 45s) poll on their own cadence.
+		intervalFor := func(string) time.Duration { return 0 }
+		if snap, serr := configstore.New(store.DB()).LoadSnapshot(ctx); serr == nil {
+			perEx := map[string]time.Duration{}
+			for code, ec := range snap.Exchanges {
+				if ec.BalancePollIntervalSeconds > 0 {
+					perEx[code] = time.Duration(ec.BalancePollIntervalSeconds) * time.Second
+				}
+			}
+			intervalFor = func(code string) time.Duration { return perEx[code] }
+		} else {
+			base.Log.Warn("balance-sync: could not load per-exchange intervals; using the default for all", "err", serr)
+		}
+
+		syncer := balance.New(store, clients, clock.NewSystem(), base.Log, balance.Config{
+			IntervalFor: intervalFor,
+		})
 		base.Log.Info("balance-sync booted", "clients", len(clients))
 		return syncer.Run(ctx) // idles when there are no clients; blocks until shutdown
 	})

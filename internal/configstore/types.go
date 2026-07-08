@@ -84,7 +84,10 @@ type ExchangeConfig struct {
 	MaxRetries            int
 	RetryBackoffMs        int
 	RateLimitPerSec       int
-	ConfigVersion         int64
+	// BalancePollIntervalSeconds is this exchange's balance-sync cadence (0 = use the syncer
+	// default). A rate-limited venue can be polled less often; see balance.Config.IntervalFor.
+	BalancePollIntervalSeconds int
+	ConfigVersion              int64
 }
 
 // FeeConfig is a fee schedule entry. ExchangeMarketID == 0 means the

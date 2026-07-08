@@ -73,7 +73,8 @@ LEFT JOIN symbol_configs sc ON sc.exchange_market_id = em.id`
 
 const exchangeConfigsQuery = `
 SELECT ec.exchange_id, e.code, ec.max_concurrent_requests, ec.request_timeout_ms,
-       ec.max_retries, ec.retry_backoff_ms, ec.rate_limit_per_sec, ec.config_version
+       ec.max_retries, ec.retry_backoff_ms, ec.rate_limit_per_sec,
+       ec.balance_poll_interval_seconds, ec.config_version
 FROM exchange_configs ec
 JOIN exchanges e ON e.id = ec.exchange_id`
 
@@ -200,24 +201,25 @@ func (s *Store) loadExchangeConfigs(ctx context.Context, snap *Snapshot) error {
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			exID                                       int64
-			code                                       string
-			maxConc                                    int
-			reqTimeout, maxRetries, backoff, rateLimit sql.NullInt64
-			version                                    sql.NullInt64
+			exID                                                    int64
+			code                                                    string
+			maxConc                                                 int
+			reqTimeout, maxRetries, backoff, rateLimit, balanceIntv sql.NullInt64
+			version                                                 sql.NullInt64
 		)
-		if err := rows.Scan(&exID, &code, &maxConc, &reqTimeout, &maxRetries, &backoff, &rateLimit, &version); err != nil {
+		if err := rows.Scan(&exID, &code, &maxConc, &reqTimeout, &maxRetries, &backoff, &rateLimit, &balanceIntv, &version); err != nil {
 			return err
 		}
 		snap.Exchanges[code] = ExchangeConfig{
-			ExchangeID:            exID,
-			ExchangeCode:          code,
-			MaxConcurrentRequests: maxConc,
-			RequestTimeoutMs:      int(reqTimeout.Int64),
-			MaxRetries:            int(maxRetries.Int64),
-			RetryBackoffMs:        int(backoff.Int64),
-			RateLimitPerSec:       int(rateLimit.Int64),
-			ConfigVersion:         version.Int64,
+			ExchangeID:                 exID,
+			ExchangeCode:               code,
+			MaxConcurrentRequests:      maxConc,
+			RequestTimeoutMs:           int(reqTimeout.Int64),
+			MaxRetries:                 int(maxRetries.Int64),
+			RetryBackoffMs:             int(backoff.Int64),
+			RateLimitPerSec:            int(rateLimit.Int64),
+			BalancePollIntervalSeconds: int(balanceIntv.Int64),
+			ConfigVersion:              version.Int64,
 		}
 	}
 	return rows.Err()

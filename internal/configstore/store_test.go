@@ -93,14 +93,14 @@ func TestLoadExchangeConfigsAndRetention(t *testing.T) {
 	s := New(mockDB)
 
 	mock.ExpectQuery("FROM exchange_configs").WillReturnRows(
-		sqlmock.NewRows([]string{"exchange_id", "code", "max_concurrent_requests", "request_timeout_ms", "max_retries", "retry_backoff_ms", "rate_limit_per_sec", "config_version"}).
-			AddRow(int64(3), "nobitex", 2, int64(5000), int64(4), int64(250), int64(10), int64(7)))
+		sqlmock.NewRows([]string{"exchange_id", "code", "max_concurrent_requests", "request_timeout_ms", "max_retries", "retry_backoff_ms", "rate_limit_per_sec", "balance_poll_interval_seconds", "config_version"}).
+			AddRow(int64(3), "nobitex", 2, int64(5000), int64(4), int64(250), int64(10), int64(30), int64(7)))
 	snap := emptySnapshot()
 	if err := s.loadExchangeConfigs(context.Background(), snap); err != nil {
 		t.Fatal(err)
 	}
 	ec := snap.Exchanges["nobitex"]
-	if ec.MaxConcurrentRequests != 2 || ec.RequestTimeoutMs != 5000 || ec.RateLimitPerSec != 10 {
+	if ec.MaxConcurrentRequests != 2 || ec.RequestTimeoutMs != 5000 || ec.RateLimitPerSec != 10 || ec.BalancePollIntervalSeconds != 30 {
 		t.Errorf("exchange config = %+v", ec)
 	}
 

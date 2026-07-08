@@ -93,6 +93,23 @@ func TestStartupNoClientsIsSafe(t *testing.T) {
 	}
 }
 
+// TestEffectiveIntervalFloor (PR13 #3 B) — a per-exchange interval below MinInterval is floored
+// to MinInterval, so a misconfiguration can never over-poll a venue.
+func TestEffectiveIntervalFloor(t *testing.T) {
+	s := New(nil, map[string]BalanceClient{"ex": &fakeBal{code: "ex"}}, clock.NewSystem(), nil, Config{
+		Interval: 60 * time.Second, MinInterval: 20 * time.Second,
+		IntervalFor: func(string) time.Duration { return 5 * time.Second }, // below the floor
+	})
+	if got := s.effectiveInterval("ex"); got != 20*time.Second {
+		t.Errorf("effectiveInterval = %v, want 20s (5s override floored by MinInterval 20s)", got)
+	}
+	// No override → the global default.
+	s2 := New(nil, map[string]BalanceClient{"ex": &fakeBal{code: "ex"}}, clock.NewSystem(), nil, Config{Interval: 60 * time.Second})
+	if got := s2.effectiveInterval("ex"); got != 60*time.Second {
+		t.Errorf("effectiveInterval (no override) = %v, want the global default 60s", got)
+	}
+}
+
 // TestPerExchangeCadence verifies rate-limit-aware, per-exchange balance polling: each
 // exchange is polled on its own interval (floored at MinInterval so a misconfig can never
 // over-poll), and an exchange not yet due is skipped. Pure scheduling — no DB needed.
