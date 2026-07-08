@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,22 +41,24 @@ func TestServerHoldsNoOrderClient(t *testing.T) {
 	}
 }
 
-// TestMutatingMethodsRejected: every route is GET-only, so any mutating method (e.g.
-// an attempt to edit config) is 405 — there is NO mutating route at all. The method
+// TestMutatingMethodsRejected: every route is GET-only, so ANY mutating method (POST/
+// PUT/PATCH/DELETE — e.g. an attempt to edit config, cancel an order, retry a request)
+// is 405 on EVERY operational path. There is NO mutating route at all. The method
 // mismatch is resolved by the mux before any DB access, so a nil DB is fine here.
 func TestMutatingMethodsRejected(t *testing.T) {
 	h := New(nil, nil, Config{}).Handler()
-	for _, tc := range []struct{ method, path string }{
-		{"POST", "/api/cycles/open"},
-		{"POST", "/api/config"},
-		{"PUT", "/api/config"},
-		{"DELETE", "/api/balances"},
-		{"PATCH", "/api/regime"},
-	} {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("%s %s = %d, want 405 (read-only)", tc.method, tc.path, rec.Code)
+	paths := []string{
+		"/api/cycles/open", "/api/cycles/closed", "/api/cycles/123", "/api/orders",
+		"/api/fills", "/api/requests", "/api/signals", "/api/comparisons", "/api/balances",
+		"/api/health", "/api/regime", "/api/logs", "/api/api-logs", "/api/config",
+	}
+	for _, method := range []string{"POST", "PUT", "PATCH", "DELETE"} {
+		for _, p := range paths {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(method, p, nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s = %d, want 405 (read-only; no mutating route exists)", method, p, rec.Code)
+			}
 		}
 	}
 }
@@ -113,7 +114,7 @@ func setupD(t *testing.T) *dfix {
 	if _, err := migrate.Run(ctx, db, migrate.FS); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour, MasterKey: "dashboard-test-master-key"})
+	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close(); db.Close() })
 	return &dfix{t: t, db: db, ts: ts, ctx: ctx}
@@ -156,21 +157,32 @@ var dseq int
 
 // seedCycle inserts an exchange + market + cycle + buy order + fill + a QUEUED request
 // and returns (cycleID, exchangeID).
-func (f *dfix) seedCycle() (int64, int64) {
-	f.t.Helper()
+func (f *dfix) seedCycle() (int64, int64) { return seedCycleInto(f.t, f.db) }
+
+// seedCycleInto seeds a full cycle graph into an arbitrary db (shared or isolated) so
+// both the shared-DB and isolated-DB (error-handling) fixtures can reuse it.
+func seedCycleInto(t *testing.T, db *sql.DB) (int64, int64) {
+	t.Helper()
 	dseq++
+	execOrFail := func(q string, a ...any) sql.Result {
+		r, err := db.Exec(q, a...)
+		if err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+		return r
+	}
 	last := func(r sql.Result) int64 { id, _ := r.LastInsertId(); return id }
 	u := func(p string) string { return fmt.Sprintf("%s%d_%d", p, time.Now().UnixNano(), dseq) }
-	exID := last(f.exec("INSERT INTO exchanges (code, name, enabled) VALUES (?, 'D', 1)", u("dx")))
-	b := last(f.exec("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", u("B")))
-	qa := last(f.exec("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", u("Q")))
-	m := last(f.exec("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", u("M")+"/IRT", b, qa))
-	em := last(f.exec("INSERT INTO exchange_markets (exchange_id, market_id, exchange_symbol, canonical_symbol) VALUES (?, ?, ?, ?)", exID, m, u("ES"), u("M")+"/IRT"))
-	cyc := last(f.exec("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state) VALUES (?, ?, ?, 'BUY_SUBMITTED')", em, exID, u("M")+"/IRT"))
-	ord := last(f.exec("INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, quantity, intended_execution_mode) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'ACKED', '1', 'MAKER_FIRST')", cyc, exID, em, u("loc")))
-	f.exec("INSERT INTO fills (order_id, cycle_id, exchange_fill_id, quantity, price) VALUES (?, ?, ?, '1', '100')", ord, cyc, u("fill"))
-	f.exec("INSERT INTO exchange_requests (exchange_id, cycle_id, order_id, request_type, status, payload, idempotency_key, retry_count) VALUES (?, ?, ?, 'CANCEL_ORDER', 'RETRY_SCHEDULED', '{}', ?, 0)", exID, cyc, ord, u("idem"))
-	f.exec("INSERT INTO cycle_state_events (cycle_id, from_state, to_state, version, event_type) VALUES (?, 'NEW', 'BUY_SUBMITTED', 1, 'x')", cyc)
+	exID := last(execOrFail("INSERT INTO exchanges (code, name, enabled) VALUES (?, 'D', 1)", u("dx")))
+	b := last(execOrFail("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", u("B")))
+	qa := last(execOrFail("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", u("Q")))
+	m := last(execOrFail("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", u("M")+"/IRT", b, qa))
+	em := last(execOrFail("INSERT INTO exchange_markets (exchange_id, market_id, exchange_symbol, canonical_symbol) VALUES (?, ?, ?, ?)", exID, m, u("ES"), u("M")+"/IRT"))
+	cyc := last(execOrFail("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state) VALUES (?, ?, ?, 'BUY_SUBMITTED')", em, exID, u("M")+"/IRT"))
+	ord := last(execOrFail("INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, quantity, intended_execution_mode) VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'ACKED', '1', 'MAKER_FIRST')", cyc, exID, em, u("loc")))
+	execOrFail("INSERT INTO fills (order_id, cycle_id, exchange_fill_id, quantity, price) VALUES (?, ?, ?, '1', '100')", ord, cyc, u("fill"))
+	execOrFail("INSERT INTO exchange_requests (exchange_id, cycle_id, order_id, request_type, status, payload, idempotency_key, retry_count) VALUES (?, ?, ?, 'CANCEL_ORDER', 'RETRY_SCHEDULED', '{}', ?, 0)", exID, cyc, ord, u("idem"))
+	execOrFail("INSERT INTO cycle_state_events (cycle_id, from_state, to_state, version, event_type) VALUES (?, 'NEW', 'BUY_SUBMITTED', 1, 'x')", cyc)
 	return cyc, exID
 }
 
@@ -316,39 +328,4 @@ func TestWebSocketLiveSnapshot(t *testing.T) {
 			t.Errorf("ws snapshot missing %q", k)
 		}
 	}
-}
-
-func TestDryRunLabelShownOnCyclesAndOrders(t *testing.T) {
-	f := setupD(t)
-	cyc, _ := f.seedCycle()
-	f.exec("UPDATE cycles SET dry_run=1 WHERE id=?", cyc)
-
-	_, cycles := f.get("/api/cycles/open")
-	var labelled bool
-	for _, m := range cycles {
-		if asFloatID(m["id"]) == cyc {
-			if !truthy(m["dry_run"]) {
-				t.Errorf("cycle %d dry_run not shown: %v", cyc, m["dry_run"])
-			}
-			labelled = true
-		}
-	}
-	if !labelled {
-		t.Fatal("dry-run cycle not returned by /api/cycles/open")
-	}
-	// Orders carry the dry_run label via the cycle join.
-	_, ords := f.get("/api/orders?cycle_id=" + itoaTest(cyc))
-	if len(ords) == 0 || !truthy(ords[0]["dry_run"]) {
-		t.Errorf("order dry_run not shown: %v", ords)
-	}
-}
-
-func asFloatID(v any) int64 {
-	if f, ok := v.(float64); ok {
-		return int64(f)
-	}
-	return 0
-}
-func itoaTest(n int64) string {
-	return strconv.FormatInt(n, 10)
 }

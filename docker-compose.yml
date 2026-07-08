@@ -86,8 +86,16 @@ services:
   dashboard:
     <<: *svc
     entrypoint: ["/usr/local/bin/dashboard"]
+    # SECURITY: the PR16 dashboard is READ-ONLY but UNAUTHENTICATED. The HOST port is
+    # published loopback-only (127.0.0.1) so it is NOT reachable from an untrusted network.
+    # Do NOT change this to "8080:8080" (all host interfaces) unless a trusted/authenticated
+    # boundary — a VPN or an auth reverse proxy — sits in front.
+    # NOTE: for this loopback host-publish to reach the container, the mounted config.toml
+    # must set [dashboard] listen_addr = "0.0.0.0:8080" (bind all CONTAINER interfaces).
+    # That is safe here because the HOST only exposes 127.0.0.1 — for a bare-metal (non-
+    # container) run, keep listen_addr = "127.0.0.1:8080" instead.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
 volumes:
   mariadb-data:

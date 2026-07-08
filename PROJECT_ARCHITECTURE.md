@@ -189,7 +189,7 @@ the dashboard) must not affect the others. Each lives under `cmd/`.
 | `reconciler` | Startup + periodic reconciliation; recover cycles/locks; mark unclear cases `NEEDS_RECONCILE`. | read-only (GET_*) |
 | `balance-sync` | Continuously poll balances → current + history (hash dedup). | read-only |
 | `health-monitor` | Track per-exchange REST/WS/latency/error/auth/rate-limit health. | probes |
-| `dashboard` | HTTP initial load + WebSocket live updates; config editing. **No trading control.** Separate binary. | no |
+| `dashboard` | **PR16:** strictly read-only HTTP views + snapshot-only WebSocket (same-origin). **PR17:** authenticated + audited config editing / operator actions. **No trading control.** Separate binary. | no |
 | `retention-worker` | Batched/partition-aware cleanup of high-volume tables. | no |
 | `migrate` | Apply embedded migrations and exit. The only normal-ops schema writer. | no |
 
@@ -223,7 +223,7 @@ internal/
   balance/     balance sync + hash dedup                                    [PR13]
   health/      exchange health tracking                                     [PR14]
   regime/      market-regime baskets + calculation                          [PR15]
-  dashboard/   HTTP + WebSocket + config editing                            [PR16/PR17]
+  dashboard/   read-only HTTP + WebSocket views [PR16]; config editing       [PR17]
 configs/       bootstrap TOML example (trading config lives in the DB)
 ```
 
@@ -1455,10 +1455,22 @@ load plus a WebSocket for live updates. **PR16 is strictly read-only.** It runs 
 own binary (restarting it never affects collector/trade-engine/order-executor/
 reconciler/balance-sync/health-monitor/regime), and it **cannot trade by
 construction**: the `Server` holds **only** a `*sql.DB` (no exchange client, no queue;
-a reflection test asserts this), and **every route is GET-only** — any POST/PUT/DELETE/
-PATCH (e.g. an attempt to edit config) is `405`, because there is no mutating route at
-all. It never places/cancels orders, creates cycles/orders, mutates the queue, or
-edits config.
+a reflection test asserts this), and **every route is GET-only** — any POST/PUT/PATCH/
+DELETE (e.g. an attempt to edit config, cancel an order, or retry a request) is `405`,
+because there is no mutating route at all. It never places/cancels orders, creates
+cycles/orders, and never mutates cycles/orders/queue/locks/config.
+
+**Config editing is PR17 scope, not PR16.** PR16 only *displays* config read-only.
+Config editing / operator actions are a **separate later PR (PR17)** and must be
+implemented there with explicit safety controls (auth/authz, versioning, audit,
+validation). No editing route, auth layer, or mutating handler ships in PR16.
+
+**DB errors never become a partial 200.** The composite endpoints (`/api/cycles/{id}`
+and `/api/config`) run several sub-queries; **every** sub-query is error-checked and any
+failure returns `500`. A failed query is never silently swallowed into a `200` with
+partial data — an operator must never misread "no orders" / "no logs" / "empty config"
+as fact when the query actually failed. (Only `sql.ErrNoRows` for the cycle lookup is a
+`404`.)
 
 **Endpoints (all GET, read-only SELECTs, JSON):** `/api/cycles/open`,
 `/api/cycles/closed`, `/api/cycles/{id}` (detail), `/api/orders`, `/api/fills`,
@@ -1468,15 +1480,36 @@ edits config.
 endpoints take `?limit=` (defaulted + hard-capped). Missing data returns an empty
 array (never a panic).
 
-**WebSocket live updates.** `/ws` pushes a SAFE periodic snapshot (open cycles, health,
-regime, balances) every `WSInterval`; it only SELECTs and sends — it takes **no**
-commands from the socket (live updates never control trading). The loop ends on client
-disconnect or server shutdown.
+**WebSocket is snapshot-only, same-origin, and error-safe.** `/ws` pushes a SAFE periodic
+snapshot (open cycles, health, regime, balances) every `WSInterval`; it only SELECTs and
+sends. Three guards:
+- **Snapshot-only / command-free.** Incoming client messages are **drained and ignored**
+  (no command handler for cancel/retry/config-edit/mutate — a test sends such messages and
+  asserts nothing mutates and the socket keeps delivering snapshots). Live updates never
+  control trading.
+- **Same-origin only.** The upgrader's `CheckOrigin` (`sameOriginOnly`) permits an upgrade
+  only when the request `Origin` host equals the request `Host` (case-insensitive), so a
+  foreign website opened in the operator's browser cannot connect and read operational data
+  (rejected with `403`) — important when the dashboard listens on `0.0.0.0`. A request with
+  **no `Origin` header is allowed** (browsers always send `Origin` on a WS handshake, so a
+  missing one is a non-browser client — curl/health-probe/native tooling — not the
+  cross-site threat); a malformed/opaque (`null`) origin is rejected. A configurable
+  allowlist + full auth are PR17 scope.
+- **No partial snapshots.** `snapshot()` error-checks **every** query; if any fails it does
+  NOT send a healthy-looking snapshot with empty sections — it sends a generic
+  `{"type":"snapshot_error","error":"dashboard snapshot unavailable"}` (raw DB details are
+  logged server-side, never sent to the browser) and keeps the connection so a transient
+  failure recovers on the next tick. `stale` is normalized to a boolean, matching HTTP
+  `/api/balances`.
 
-**No secrets.** The dashboard never reads the credentials table. The `api-logs` view
-re-masks (defence in depth) the already-masked-at-storage headers/bodies/url — the
-values of sensitive keys (authorization/api-key/secret/signature/token/…) are redacted
-so no secret reaches the browser.
+The loop ends on client disconnect or server shutdown.
+
+**No secrets — both log views masked.** The dashboard never reads the credentials table.
+BOTH the `api-logs` view AND the `app_logs` view (`/api/logs` and the cycle-detail
+`logs`) re-mask, defence in depth, the already-masked-at-storage content — the values of
+sensitive keys (authorization/bearer/api-key/secret/client-secret/api-secret/signature/
+access-token/refresh-token/token/password/passphrase/cookie/…) are redacted so no secret
+reaches the browser even if one was written to `app_logs` upstream.
 
 **Cycle detail (`/api/cycles/{id}`)** composes the cycle row + its orders, fills,
 exchange requests, cycle/order state events, symbol locks, and related app_logs — so it
@@ -1509,8 +1542,20 @@ keeps its last value and is simply flagged stale, never shown as zero.
 per-timeframe scores, per-symbol contributions, stale_reason, and config version
 (history via `/api/...` history queries later).
 
-**Auth.** An auth layer is a documented placeholder (the WS upgrader currently accepts
-any origin for local operator use); real auth lands with the config-editing PR.
+**Auth & network exposure.** PR16 ships **no user authentication** (it is strictly
+read-only); the WebSocket is restricted to **same-origin** connections (see above) as a
+baseline browser safeguard. **Read-only does NOT mean safe for public exposure** — anyone
+who can reach the port can read all operational data, and same-origin does not stop
+`curl`/scripts/port-scanners/non-browser clients (or requests with no `Origin`). Therefore
+the dashboard must be **bound to localhost** (`configs/production.example.toml` and
+`config.example.toml` ship `listen_addr = "127.0.0.1:8080"`; the docker-compose host port
+is published loopback-only as `127.0.0.1:8080:8080`) and exposed only behind a **trusted
+VPN or an authenticated reverse proxy** — never published directly to an untrusted network.
+A test (`config.TestProductionExampleDashboardIsLoopbackOnly`) asserts the shipped examples
+never bind the unauthenticated dashboard to `0.0.0.0`/a public interface. The WebSocket also
+sets a small inbound frame read limit (it accepts no commands). Full dashboard
+authentication/authorization + a configurable WS-origin allowlist land with the
+config-editing PR (**PR17**). See DEPLOY.md §3a.
 
 ## 14a. Dashboard config editing (implemented in PR17 — `internal/dashboard` + `internal/configstore`/`internal/regime` admin)
 
@@ -2982,20 +3027,54 @@ venue-free).
 - **PR17 — WS origin allowlist** (`AllowedWSOrigins`) added; the WS remains command-free
   (read-only), so it can't be a config-editing vector.
 
+- **PR16 correction — rebased onto accepted PR15 `1996b07`** (branch
+  `pr16-dashboard-readonly-errors`); PR14/PR15 fixes and the invariant scripts are
+  preserved (full gated sweep green). PR16 is reconstructed as the STRICTLY read-only
+  dashboard — the config-editing / auth / live / preflight / session / credential-admin
+  handlers are **removed from PR16** and belong to their own later PRs (config editing =
+  PR17, with explicit safety controls), so PR16's `Handler()` registers only GET routes.
 - **PR16 — dashboard is read-only by construction**: the `Server` holds only a
   `*sql.DB` (no exchange client/queue — reflection guard) and registers GET-only routes,
-  so any mutating method is 405 and there is no config-editing path (that's PR17).
+  so any POST/PUT/PATCH/DELETE is 405 and there is no mutating/config-editing path at all.
+- **PR16 correction — DB errors never become a partial 200**: `/api/cycles/{id}` and
+  `/api/config` error-check EVERY sub-query (orders/fills/requests/events/locks/logs, and
+  markets/exchanges/fees/regime/version) and return 500 on any failure — never a 200 with
+  partial data. Only the cycle-lookup ErrNoRows is a 404.
 - **PR16 — generic `jsonRows`** turns read-only SELECTs into JSON (decimals/JSON/text →
   strings, ints → numbers, NULL → null), so endpoints are thin SELECTs; lists take a
   defaulted + hard-capped `?limit=`; missing data → empty array (no panic).
-- **PR16 — secrets never reach the browser**: credentials table never read; the
-  `api-logs` view re-masks (defence in depth) the already-masked headers/bodies/url.
+- **PR16 correction — secrets never reach the browser (both log views masked)**:
+  credentials table never read; BOTH the `api-logs` AND `app_logs` views (incl.
+  cycle-detail logs) re-mask (defence in depth) sensitive key/values — a secret can't
+  reach the browser even if one was written to app_logs upstream.
 - **PR16 — queue display uses `step_kind`** (RETRY_SCHEDULED + retry_count 0 →
   scheduled_next_step, >0 → retry) so a planned simulated-IOC/reprice step isn't shown
   as a failed retry; balances expose a clean `stale` boolean (value never zeroed on
   absence); cycle detail carries a `fee_note` (realized_quote nets quote fees only).
-- **PR16 — WebSocket is push-only**: it sends a safe periodic snapshot and takes no
-  commands from the socket (live updates never control trading).
+- **PR16 — WebSocket is snapshot-only**: it sends a safe periodic snapshot and takes no
+  commands from the socket — incoming messages are drained and ignored (no command
+  handler exists), so live updates never control trading.
+- **PR16 correction — WebSocket is same-origin only**: `CheckOrigin` (`sameOriginOnly`)
+  no longer returns `true` unconditionally — a foreign `Origin` is rejected (403) so a
+  cross-site page in the operator's browser can't read the live snapshot (matters on
+  `0.0.0.0`); a missing `Origin` (non-browser client) is allowed and documented; a
+  malformed/opaque origin is rejected. Configurable allowlist + auth are PR17.
+- **PR16 correction — WebSocket snapshot never sends partial data**: `snapshot()` returns
+  an error and every query is checked; on any failure the socket sends a generic
+  `snapshot_error` event (raw DB details logged, not exposed) instead of a normal snapshot
+  with silently-empty sections — the same "no partial success" rule as the HTTP endpoints.
+  `stale` is a boolean, consistent with HTTP `/api/balances`.
+- **PR16 correction — doc.go/architecture no longer claim PR16 edits config**: the package
+  doc and the dashboard binary row state PR16 is strictly read-only and config editing /
+  operator actions are PR17 (with explicit auth/authz/audit/validation).
+- **PR16 correction — read-only ≠ safe to expose (deployment security)**: the PR16 dashboard
+  is UNAUTHENTICATED, so `production.example.toml`/`config.example.toml` bind it to
+  `127.0.0.1:8080` (not `0.0.0.0`), the docker-compose host port is published loopback-only
+  (`127.0.0.1:8080:8080`), and the misleading "auth is via DB-stored bearer tokens" comment
+  is removed. DEPLOY.md §3a + RUNBOOK.md document: keep it on localhost / behind a VPN or
+  authenticated reverse proxy; never expose port 8080 to an untrusted network. Bearer tokens
+  gate only the PR17+ mutating endpoints. `config.TestProductionExampleDashboardIsLoopbackOnly`
+  enforces the loopback default; the WS also sets a bounded inbound frame read limit.
 
 - **PR15 — regime reads Binance ONLY from Redis** (never a direct Binance call); a
   structural test asserts the Calculator holds no order client. It reads basket config
@@ -3290,7 +3369,7 @@ venue-free).
 | PR13 | `pr13-balance-sync-per-exchange` | **in review** | Cut from accepted PR12 (`pr12-reconciler-safeclose-guards`, `ac3abdb`); PR10–PR12 fixes preserved (DB-role dispatch, buy/sell validation, empty-id safety, cost-basis ambiguity, sell-rejection-keeps-lock, reconciler safe-close guards incl. stored REJECTED/FAILED — full sweep green). **Corrections:** (a) `balance-sync` is NOT a skeleton — `cmd/balance-sync` wires real DB-decrypted read-only credential clients (idles safely without a master key); (b) **per-exchange, rate-limit-aware cadence wired end-to-end** — `balance.Config.IntervalFor` + `MinInterval` floor + per-exchange due-tracking, driven from the DB via new `exchange_configs.balance_poll_interval_seconds` (migration 026 + `configstore.ExchangeConfig.BalancePollIntervalSeconds`), so venues poll on their own cadence (default for all when unset). `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
 | PR14 | `pr14-health-monitor-readonly-private` | **in review** | Cut from accepted PR13 (`pr13-balance-sync-per-exchange`, `3b110ed`); PR11–PR13 fixes preserved (sell-rejection-keeps-lock, executor empty-id boundary, reconciler safe-close guards incl. stored REJECTED/FAILED, per-exchange balance cadence, real read-only balance clients, failed-sync-doesn't-zero, missing-asset-not-zeroed) and invariant scripts (`scripts/check-critical-invariants.sh`, `scripts/local-dryrun-check.sh`) intact — full sweep green. **Correction (#3):** **private health is wired read-only (Option A)**, consistent with PR13 balance-sync — `cmd/health-monitor` builds the authenticated probe via `Builder.BuildPrivate` → `Provider.ProbePrivateHealth(code, BalanceReader)`; the narrow read-only `BalanceReader` makes place/cancel unreachable (tested `credentials.TestProbePrivateHealthIsReadOnly`); an exchange with no active credential / no master key falls back to public-only with `private_status` UNKNOWN — a **deliberate safe fallback, not an accidental omission**; stale/contradictory "private accidentally missing / wired in a later PR" doc + comments removed. **Correction (round 2):** the continuous private probe must NOT invalidate a credential on a transient error — new `Provider.ProbePrivateHealth` marks `status='invalid'` ONLY on a definite auth error (`isDefiniteAuthError` = `execution.ErrAuthFailed` or `NormalizedAPIError` category `auth`); timeout/network/rate-limit/429/exchange-5xx/unknown leave the credential `active` and untouched (surfacing only as private health UNAVAILABLE/DEGRADED/RATE_LIMITED, `last_success_at` preserved), so a brief incident can't permanently disable a valid credential (`BuildPrivate` builds only from `active`). Strict `Provider.Validate` retained for one-shot operator checks. Tests: `TestProbePrivateHealthCredentialPolicy` (auth→invalid; timeout/ack-timeout/network/rate/5xx/unknown→active), `TestProbePrivateHealthSuccessAfterTemporaryFailure`, `TestProbePrivateHealthIsReadOnly`, `TestValidateStillStrictForManualCheck`, offline `TestIsDefiniteAuthError`. `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read via `Validate` when creds exist) — no place/cancel reachable (reflection guard `TestMonitorHoldsNoOrderClient`); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
 | PR15 | `pr15-market-regime-history-validation` | **in review** | Cut from accepted PR14 (`pr14-health-monitor-readonly-private`, `9f76cc4`); PR11–PR14 fixes preserved (sell-rejection-keeps-lock, executor empty-id, reconciler safe-close incl. stored REJECTED/FAILED, per-exchange balance cadence + real read-only clients, health-monitor read-only private health that never invalidates a credential on a transient error) + invariant scripts intact — full sweep green. **Corrections:** (#2) `market_regime_history` now stores `state_hash` + `stale_reason` (migration 027) and `WriteResult` inserts them, so history is self-describing (a changed UNKNOWN reason is visible, not just "something changed"); a history row's `state_hash` equals current's at that point (`TestHistoryStoresStateHashAndStaleReason`). (#3) `WriteResult` no longer ignores `SELECT state_hash` errors — only `sql.ErrNoRows` → changed; any other error is returned, never a misleading insert (`TestWriteResultReturnsRealSelectError`). (#4) regime config validated in BOTH layers — migration 027 CHECK constraints (symbol/timeframe weight>0, timeframe seconds>0, interval/neutral>=0, moderate>=neutral, strong>=moderate) + `Basket.Validate` called by `LoadBaskets` returning `ErrInvalidBasketConfig` so invalid config yields no regime (`TestBasketValidate`, `TestRegimeConfigCheckConstraints`, `TestLoadBasketsRejectsInvalidConfig`). `internal/regime` + migration 015/016/027 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue/lock writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure, decimal math): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` appended per distinct FULL-FIELD `state_hash` (direction/level/confidence/score/timeframe_scores/symbol_contributions/stale_reason/config_version); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix + config-validation matrix + no-order-client guard; gated (load config, current-upsert + history-on-change + full-evolution + state_hash/stale_reason stored, select-error-returned, config CHECK rejections, LoadBaskets rejects invalid, calculator samples+persists, redis-miss no-crash/no-fabricate). |
-| PR16 | `pr16-dashboard` | **accepted** | `internal/dashboard` + `cmd/dashboard`: READ-ONLY operator views. Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any mutating method (incl. config edit) is 405; no place/cancel/cycle/order/queue/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Cycle detail composes orders/fills/requests/state-events/locks/logs + maker-taker fields + fee_note. Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). Health public/private/api-key/ws + counters. Regime direction/level/confidence/score/contributions/stale. api-logs re-masked (defence in depth; credentials never read). WebSocket pushes safe periodic snapshot (open cycles/health/regime/balances), takes no commands. Separate binary (restart isolates). Tests: offline (no-order-client guard, mutating-method-405, step_kind, mask-secrets) + gated (all endpoints missing-data 200, seeded cycle detail + maker/taker + 404, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). Config editing + auth deferred to PR17. |
+| PR16 | `pr16-dashboard-readonly-errors` | **in review** | Cut from accepted PR15 (`pr15-market-regime-history-validation`, `1996b07`); PR14/PR15 fixes preserved (health-monitor read-only private health that never invalidates a credential on a transient error; regime history state_hash/stale_reason + WriteResult select-error handling + config validation + migration 027) and invariant scripts intact — full sweep green. **Reconstructed as STRICTLY read-only:** the config-editing/auth/live/preflight/session/credential-admin handlers are **removed from PR16** (they belong to later PRs; config editing = PR17 with explicit safety controls), so `Handler()` registers ONLY GET routes. **Corrections:** (#6) `/api/cycles/{id}` error-checks EVERY sub-query (orders/fills/exchange_requests/cycle_state_events/order_events/symbol_locks/app_logs) → 500 on any failure, never a partial 200 (cycle-not-found → 404). (#7) `/api/config` error-checks every config query (markets/exchanges/fees/regime_baskets/active-version) → 500 on any failure, never incomplete config with 200. (#8) `app_logs` are masked before display (message + fields + any string), same defence-in-depth as `api_call_logs` — both the `/api/logs` endpoint and cycle-detail `logs`. `internal/dashboard` + `cmd/dashboard`: Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any POST/PUT/PATCH/DELETE is 405; no place/cancel/cycle/order/queue/lock/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot incl. regime baskets), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). **Round 2:** (1) `doc.go` + architecture no longer claim PR16 edits config — strictly read-only, config editing = PR17 (auth/authz/audit/validation). (2) WebSocket `CheckOrigin` is **same-origin only** (`sameOriginOnly`): foreign Origin → 403, missing Origin (non-browser) allowed + documented, malformed/opaque rejected — no more `CheckOrigin=true`. (3) `snapshot()` returns an error and checks EVERY query; any failure → generic `snapshot_error` event (raw DB details logged, never exposed), never a partial normal snapshot; `stale` normalized to bool (consistent with HTTP). WebSocket snapshot-only (open cycles/health/regime/balances) — drains + ignores incoming messages, no command handler. Separate binary (restart isolates). Tests: offline (no-order-client guard, exhaustive POST/PUT/PATCH/DELETE→405 over all routes, same-origin matrix, step_kind, mask-secrets) + gated (endpoints missing-data 200, seeded cycle detail + maker/taker + 404, cycle-detail 500-on-each-subquery-failure, /api/config 500-on-each-query-failure, app_logs masked + cycle-detail logs masked, ws foreign-origin-403/same-origin/missing-origin, ws snapshot_error-on-each-query-failure, ws stale-is-bool, ws-ignores-commands-no-mutation, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). |
 | PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
 | PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
 | PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |

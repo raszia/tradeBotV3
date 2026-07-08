@@ -46,6 +46,26 @@ Each live-capable binary logs a secret-free **startup safety summary** (executio
 enabled, kill switch, canary scope, caps, credential status, active session, whether new live
 buys are allowed) so you can confirm the danger level at a glance.
 
+## 3a. Dashboard exposure — READ-ONLY but UNAUTHENTICATED (PR16)
+
+The PR16 dashboard is **read-only but has NO built-in user authentication**. **Read-only does
+not mean safe for public exposure** — anyone who can reach the port can read all operational
+data (cycles, orders, exchange requests, balances, exchange health, market regime, logs,
+config, and the live WebSocket snapshots). The same-origin WebSocket check only protects
+browsers; it does **not** block `curl`, scripts, port scanners, or non-browser WebSocket
+clients, and requests without an `Origin` header are accepted.
+
+Rules:
+- Keep `[dashboard] listen_addr = "127.0.0.1:8080"` (the shipped default) for bare-metal runs.
+- Expose the dashboard **only** behind a **trusted VPN** or an **authenticated reverse proxy**.
+- **Do NOT** publish port `8080` directly to an untrusted network.
+- **Docker:** the compose file publishes the host port loopback-only (`127.0.0.1:8080:8080`).
+  For that to reach the container, set `listen_addr = "0.0.0.0:8080"` in the mounted
+  `config.toml` (bind all *container* interfaces) — safe because the *host* only exposes
+  `127.0.0.1`. **Never** publish `0.0.0.0:8080:8080` without a VPN/auth-proxy boundary.
+
+Authenticated + audited operator/config-editing capabilities arrive in **PR17**.
+
 ## 4. Local/staging dry-run (full lifecycle, ZERO real exposure)
 
 Set `[execution] mode = "dry_run"` and restart `trade-engine` + `order-executor`. Dry-run

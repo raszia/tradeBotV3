@@ -1,11 +1,20 @@
-// Package dashboard is the READ-ONLY operator dashboard (PR16): HTTP endpoints for
-// the initial load plus a WebSocket for live updates. It is strictly read-only — it
-// runs as its own binary, holds only a *sql.DB (no exchange client, no queue), and
-// exposes ONLY GET routes (any mutating method is 405). It never places/cancels
-// orders, creates cycles/orders, mutates the queue, or edits config (config editing
-// is PR17). Secrets are never shown: the credentials view exposes STATUS ONLY (exists/
-// enabled/status/key_version/last_checked — never key material or the encrypted blob),
-// and the api-call-log view is masked (defence-in-depth on already-masked storage).
+// Package dashboard is the STRICTLY READ-ONLY operator dashboard (PR16): HTTP endpoints
+// for the initial load plus a WebSocket for live updates. It runs as its own binary,
+// holds only a *sql.DB (no exchange client, no queue — cannot trade by construction), and
+// exposes ONLY GET routes, so any POST/PUT/PATCH/DELETE is 405 Method Not Allowed. It
+// never places/cancels orders, and never mutates cycles/orders/queue/locks/config.
+//
+// Config EDITING is explicitly OUT OF SCOPE for PR16 — it is planned for PR17 and must be
+// implemented there with explicit safety controls (auth/authz, versioning, audit,
+// validation). PR16 only DISPLAYS config read-only.
+//
+// DB errors are never swallowed into a partial 200: a failed sub-query in cycle-detail or
+// /api/config returns 500 (an operator must never misread a failed query as "no data").
+//
+// Secrets are never shown: it never reads the credentials table, and BOTH api-call-log and
+// app-log views are masked (defence-in-depth on already-masked storage). The WebSocket is
+// snapshot-only — it pushes periodic read-only snapshots and takes no commands from the
+// socket (incoming messages are drained and ignored).
 package dashboard
 
 import (
@@ -16,12 +25,6 @@ import (
 	"net/http"
 	"strconv"
 	"time"
-
-	"v3TradeBot/internal/configstore"
-	"v3TradeBot/internal/credentials"
-	"v3TradeBot/internal/opreconcile"
-	"v3TradeBot/internal/preflight"
-	"v3TradeBot/internal/regime"
 )
 
 // Config tunes the dashboard.
@@ -30,17 +33,6 @@ type Config struct {
 	MaxLimit        int           // hard cap on ?limit= (default 500)
 	StaleBalanceAge time.Duration // a balance whose last_seen_at is older than this is flagged stale (default 5m)
 	WSInterval      time.Duration // live-update push cadence (default 2s)
-	// AllowedWSOrigins restricts the WebSocket Origin header. Empty = permissive (only
-	// safe for local read-only use); set it to an allowlist for any non-local deploy.
-	// The WS carries no commands either way, so it cannot affect trading.
-	AllowedWSOrigins []string
-	// ExecutionMode is the system's execution mode ("off"|"dry_run"|"live"), shown on
-	// the /api/live status so operators can see LIVE/DRY_RUN clearly (read-only).
-	ExecutionMode string
-	// MasterKey is the bootstrap encryption key, used ONLY to build the credential
-	// Provisioner (PR22) for create/rotate/disable. It is never logged or exposed; an
-	// empty key disables credential-editing endpoints safely.
-	MasterKey string
 }
 
 func (c *Config) withDefaults() {
@@ -58,18 +50,12 @@ func (c *Config) withDefaults() {
 	}
 }
 
-// Server is the dashboard. It holds a database handle + the versioned config stores
-// (+ config/log): NO exchange client and NO queue, so it cannot trade by construction.
-// Read views are open; config-editing routes are authenticated + authorized (PR17).
+// Server is the read-only dashboard. It holds ONLY a database handle (+ config/log):
+// no exchange client and no queue, so it cannot trade by construction.
 type Server struct {
-	db          *sql.DB
-	cfgStore    *configstore.Store
-	regStore    *regime.Store
-	resolver    *opreconcile.Resolver
-	provisioner *credentials.Provisioner
-	preflight   *preflight.Checker
-	cfg         Config
-	log         *slog.Logger
+	db  *sql.DB
+	cfg Config
+	log *slog.Logger
 }
 
 // New builds a Server.
@@ -78,23 +64,7 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{db: db, cfg: cfg, log: log}
-	if db != nil {
-		s.cfgStore = configstore.New(db)
-		s.regStore = regime.NewStore(db)
-		s.resolver = opreconcile.New(db, nil, log)
-		s.preflight = preflight.New(db, nil, log, cfg.ExecutionMode)
-		// Credential provisioning (PR22) needs the master key; an empty key leaves the
-		// provisioner nil and the create/rotate/disable endpoints respond safe-disabled.
-		if cfg.MasterKey != "" {
-			if pv, err := credentials.NewProvisioner(db, cfg.MasterKey, nil, log); err == nil {
-				s.provisioner = pv
-			} else {
-				log.Warn("dashboard: credential provisioning disabled", "err", err)
-			}
-		}
-	}
-	return s
+	return &Server{db: db, cfg: cfg, log: log}
 }
 
 // Handler returns the read-only route mux. Patterns are method-scoped to GET, so any
@@ -119,56 +89,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/logs", s.appLogs)
 	mux.HandleFunc("GET /api/api-logs", s.apiLogs)
 	mux.HandleFunc("GET /api/config", s.config)
-	mux.HandleFunc("GET /api/audit", s.audit)
-	mux.HandleFunc("GET /api/live", s.live)
-	mux.HandleFunc("GET /api/credentials", s.credentialStatus)
 	mux.HandleFunc("GET /ws", s.ws)
-
-	// Config-editing routes (PR17): authenticated + authorized (config_operator/admin).
-	// There is NO trading/cycle/order/queue/credential mutation route here.
-	mux.HandleFunc("POST /api/config/symbol/{id}", s.requireConfigOperator(s.editSymbolConfig))
-	mux.HandleFunc("POST /api/config/market/{id}/flags", s.requireConfigOperator(s.editMarketFlags))
-	mux.HandleFunc("POST /api/config/exchange/{id}", s.requireConfigOperator(s.editExchangeConfig))
-	mux.HandleFunc("POST /api/config/fee", s.requireConfigOperator(s.editFee))
-	mux.HandleFunc("POST /api/config/regime/basket/{id}", s.requireConfigOperator(s.editRegimeBasket))
-	mux.HandleFunc("POST /api/config/regime/basket/{id}/symbol", s.requireConfigOperator(s.editRegimeSymbol))
-	mux.HandleFunc("POST /api/config/regime/basket/{id}/timeframe", s.requireConfigOperator(s.editRegimeTimeframe))
-
-	// Operator reconciliation (PR21): inspect + resolve NEEDS_RECONCILE. List/detail/audit
-	// are read-only; preview/apply require an authenticated reconcile_operator/admin. The
-	// tool never places/cancels orders (local resolution only).
-	mux.HandleFunc("GET /api/reconcile", s.reconcileList)
-	mux.HandleFunc("GET /api/reconcile/audit", s.reconcileAudit)
-	mux.HandleFunc("GET /api/reconcile/{id}", s.reconcileDetail)
-	mux.HandleFunc("POST /api/reconcile/{id}/preview", s.requireReconcileOperator(s.reconcilePreview))
-	mux.HandleFunc("POST /api/reconcile/{id}/apply", s.requireReconcileOperator(s.reconcileApply))
-
-	// Credential provisioning (PR22): create/rotate/disable require credential_operator/
-	// admin. The audit + the existing GET /api/credentials (status only) are read-only.
-	// No endpoint ever returns key material or the encrypted blob.
-	mux.HandleFunc("GET /api/credentials/audit", s.credentialAudit)
-	mux.HandleFunc("POST /api/credentials", s.requireCredentialOperator(s.createCredential))
-	mux.HandleFunc("POST /api/credentials/rotate", s.requireCredentialOperator(s.rotateCredential))
-	mux.HandleFunc("POST /api/credentials/{id}/disable", s.requireCredentialOperator(s.disableCredential))
-
-	// Live preflight + canary acknowledgement (PR23). Preflight + ack list are read-only;
-	// acknowledging (activating canary live) requires admin. None of these place/cancel.
-	mux.HandleFunc("GET /api/live/preflight", s.livePreflight)
-	mux.HandleFunc("GET /api/live/acknowledgements", s.liveAcknowledgements)
-	mux.HandleFunc("POST /api/live/acknowledge", s.requireAdmin(s.liveAcknowledge))
-
-	// Live canary RUN sessions (PR24): view is read-only; start/stop require admin. Starting
-	// needs a ready preflight + a current acknowledgement; stopping blocks new buys at once.
-	mux.HandleFunc("GET /api/live/session", s.liveSession)
-	mux.HandleFunc("GET /api/live/warnings", s.liveWarnings)
-	mux.HandleFunc("GET /api/live/session/export", s.liveSessionExport)
-	mux.HandleFunc("POST /api/live/session/start", s.requireAdmin(s.liveSessionStart))
-	mux.HandleFunc("POST /api/live/session/stop", s.requireAdmin(s.liveSessionStop))
 	return mux
-}
-
-func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
-	s.list(w, r, "SELECT id, config_version, entity_type, entity_id, field, old_value, new_value, changed_by, reason, activated_at, created_at FROM config_change_audit ORDER BY id DESC LIMIT ?", s.limit(r))
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
@@ -194,17 +116,17 @@ func (s *Server) closedCycles(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) orders(w http.ResponseWriter, r *http.Request) {
 	if c := r.URL.Query().Get("cycle_id"); c != "" {
-		s.list(w, r, "SELECT o.*, c.dry_run FROM orders o LEFT JOIN cycles c ON c.id=o.cycle_id WHERE o.cycle_id=? ORDER BY o.id", c)
+		s.list(w, r, "SELECT * FROM orders WHERE cycle_id=? ORDER BY id", c)
 		return
 	}
-	s.list(w, r, "SELECT o.*, c.dry_run FROM orders o LEFT JOIN cycles c ON c.id=o.cycle_id ORDER BY o.id DESC LIMIT ?", s.limit(r))
+	s.list(w, r, "SELECT * FROM orders ORDER BY id DESC LIMIT ?", s.limit(r))
 }
 func (s *Server) fills(w http.ResponseWriter, r *http.Request) {
 	if c := r.URL.Query().Get("cycle_id"); c != "" {
-		s.list(w, r, "SELECT f.*, c.dry_run FROM fills f LEFT JOIN cycles c ON c.id=f.cycle_id WHERE f.cycle_id=? ORDER BY f.id", c)
+		s.list(w, r, "SELECT * FROM fills WHERE cycle_id=? ORDER BY id", c)
 		return
 	}
-	s.list(w, r, "SELECT f.*, c.dry_run FROM fills f LEFT JOIN cycles c ON c.id=f.cycle_id ORDER BY f.id DESC LIMIT ?", s.limit(r))
+	s.list(w, r, "SELECT * FROM fills ORDER BY id DESC LIMIT ?", s.limit(r))
 }
 func (s *Server) signals(w http.ResponseWriter, r *http.Request) {
 	s.list(w, r, "SELECT * FROM signals ORDER BY id DESC LIMIT ?", s.limit(r))
@@ -218,15 +140,39 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 func (s *Server) regime(w http.ResponseWriter, r *http.Request) {
 	s.list(w, r, "SELECT c.*, b.name AS basket_name FROM market_regime_current c JOIN market_regime_baskets b ON b.id=c.basket_id ORDER BY c.basket_id")
 }
+
+// appLogs masks app-log rows before display (defence in depth): secrets should never be
+// written to app_logs, but the dashboard must not rely on that assumption.
 func (s *Server) appLogs(w http.ResponseWriter, r *http.Request) {
-	s.list(w, r, "SELECT * FROM app_logs ORDER BY id DESC LIMIT ?", s.limit(r))
+	data, err := s.rows(r.Context(), "SELECT * FROM app_logs ORDER BY id DESC LIMIT ?", s.limit(r))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	maskAppLogs(data)
+	writeJSON(w, http.StatusOK, data)
+}
+
+// maskAppLogs redacts secrets from app-log rows (the message + JSON fields column, and any
+// other string value) so an api_key/secret/token/authorization/password/etc. can never
+// reach the browser even if one was written to app_logs upstream. maskSecrets only rewrites
+// key:value pairs for known-sensitive keys, so non-secret fields (level, source_binary…)
+// pass through unchanged.
+func maskAppLogs(rows []map[string]any) {
+	for _, m := range rows {
+		for k, v := range m {
+			if str, ok := v.(string); ok {
+				m[k] = maskSecrets(str)
+			}
+		}
+	}
 }
 
 // requests adds a step_kind field disambiguating a scheduled next step from a real
 // retry (RETRY_SCHEDULED with retry_count==0 is a planned simulated-IOC/reprice step;
 // retry_count>0 is an actual retry).
 func (s *Server) requests(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.QueryContext(r.Context(), "SELECT er.*, c.dry_run FROM exchange_requests er LEFT JOIN cycles c ON c.id=er.cycle_id ORDER BY er.id DESC LIMIT ?", s.limit(r))
+	rows, err := s.db.QueryContext(r.Context(), "SELECT * FROM exchange_requests ORDER BY id DESC LIMIT ?", s.limit(r))
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -306,16 +252,48 @@ func (s *Server) cycleDetail(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "cycle not found"})
 		return
 	}
-	orders, _ := s.rows(r.Context(), "SELECT * FROM orders WHERE cycle_id=? ORDER BY id", id)
-	fills, _ := s.rows(r.Context(), "SELECT * FROM fills WHERE cycle_id=? ORDER BY id", id)
-	reqs, _ := s.rows(r.Context(), "SELECT * FROM exchange_requests WHERE cycle_id=? ORDER BY id", id)
+	// Every related query is error-checked: a failed sub-query must NOT be silently
+	// swallowed into a 200 with partial data (an operator could misread "no orders" or
+	// "no logs" when the query actually failed). Any error → 500, never partial 200.
+	orders, err := s.rows(r.Context(), "SELECT * FROM orders WHERE cycle_id=? ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	fills, err := s.rows(r.Context(), "SELECT * FROM fills WHERE cycle_id=? ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	reqs, err := s.rows(r.Context(), "SELECT * FROM exchange_requests WHERE cycle_id=? ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	for _, m := range reqs {
 		m["step_kind"] = stepKind(asString(m["status"]), asInt(m["retry_count"]))
 	}
-	cycEvents, _ := s.rows(r.Context(), "SELECT * FROM cycle_state_events WHERE cycle_id=? ORDER BY id", id)
-	ordEvents, _ := s.rows(r.Context(), "SELECT * FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE cycle_id=?) ORDER BY id", id)
-	locks, _ := s.rows(r.Context(), "SELECT * FROM symbol_locks WHERE cycle_id=? ORDER BY id", id)
-	logs, _ := s.rows(r.Context(), "SELECT * FROM app_logs WHERE cycle_id=? ORDER BY id DESC LIMIT 200", id)
+	cycEvents, err := s.rows(r.Context(), "SELECT * FROM cycle_state_events WHERE cycle_id=? ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	ordEvents, err := s.rows(r.Context(), "SELECT * FROM order_events WHERE order_id IN (SELECT id FROM orders WHERE cycle_id=?) ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	locks, err := s.rows(r.Context(), "SELECT * FROM symbol_locks WHERE cycle_id=? ORDER BY id", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	logs, err := s.rows(r.Context(), "SELECT * FROM app_logs WHERE cycle_id=? ORDER BY id DESC LIMIT 200", id)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	maskAppLogs(logs) // defence in depth: never surface a secret from app_logs
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cycle":        cyc,
@@ -332,22 +310,47 @@ func (s *Server) cycleDetail(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ---- config snapshot (read-only display; no editing — that is PR17) ----
+// ---- config snapshot (read-only DISPLAY only; config EDITING is PR17 scope) ----
 
+// config returns a read-only snapshot of the market/exchange/fee/regime config. Every
+// query is error-checked: if ANY config table cannot be loaded the whole endpoint returns
+// 500 — it never returns an incomplete config with 200 (which an operator could misread as
+// "this config is empty/disabled"). It only SELECTs; it never edits config (that is PR17).
 func (s *Server) config(w http.ResponseWriter, r *http.Request) {
-	markets, _ := s.rows(r.Context(), `
+	markets, err := s.rows(r.Context(), `
 SELECT em.id AS exchange_market_id, e.code AS exchange_code, em.canonical_symbol,
   em.enabled_for_collection, em.enabled_for_signal, em.enabled_for_trading, em.enabled_for_sell_manage,
   sc.min_spread_bps, sc.buy_size, sc.buy_size_unit, sc.sell_offset_bps, sc.reprice_interval_seconds,
   sc.maker_first_enabled, sc.maker_attempts_before_taker, sc.taker_price_mode, sc.config_version
 FROM exchange_markets em JOIN exchanges e ON e.id=em.exchange_id
 LEFT JOIN symbol_configs sc ON sc.exchange_market_id=em.id ORDER BY em.id`)
-	exch, _ := s.rows(r.Context(), "SELECT ec.*, e.code AS exchange_code FROM exchange_configs ec JOIN exchanges e ON e.id=ec.exchange_id ORDER BY ec.exchange_id")
-	fees, _ := s.rows(r.Context(), "SELECT * FROM exchange_fees ORDER BY id")
-	version, _ := s.oneRow(r.Context(), "SELECT id, status, created_by, note, created_at FROM config_versions WHERE status='active' ORDER BY id DESC LIMIT 1")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	exch, err := s.rows(r.Context(), "SELECT ec.*, e.code AS exchange_code FROM exchange_configs ec JOIN exchanges e ON e.id=ec.exchange_id ORDER BY ec.exchange_id")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	fees, err := s.rows(r.Context(), "SELECT * FROM exchange_fees ORDER BY id")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	regime, err := s.rows(r.Context(), "SELECT * FROM market_regime_baskets ORDER BY id")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	version, err := s.oneRow(r.Context(), "SELECT id, status, created_by, note, created_at FROM config_versions WHERE status='active' ORDER BY id DESC LIMIT 1")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active_version": version, "markets": markets, "exchanges": exch, "fees": fees,
-		"note": "read-only display; config editing is a later PR",
+		"active_version": version, "markets": markets, "exchanges": exch, "fees": fees, "regime_baskets": regime,
+		"note": "read-only display; config editing is PR17 scope (implemented with explicit safety controls)",
 	})
 }
 
@@ -463,16 +466,6 @@ func asInt(v any) int {
 		return int(n)
 	case int:
 		return n
-	case uint64:
-		return int(n)
-	case float64:
-		return int(n)
-	case []byte:
-		i, _ := strconv.ParseInt(string(n), 10, 64)
-		return int(i)
-	case string:
-		i, _ := strconv.ParseInt(n, 10, 64)
-		return int(i)
 	}
 	return 0
 }
@@ -484,8 +477,6 @@ func truthy(v any) bool {
 	case bool:
 		return n
 	case int64:
-		return n != 0
-	case float64:
 		return n != 0
 	case string:
 		return n == "1" || n == "true"

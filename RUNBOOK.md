@@ -4,9 +4,15 @@
 > a tiny notional**, and only proceeds when preflight passes, an acknowledgement is active
 > and not expired, and a canary session is started. Nothing here broadens that scope.
 >
-> All endpoints below are JSON over the dashboard binary. Mutating endpoints need a bearer
-> token (`Authorization: Bearer <token>`); the required role is noted per step. Secrets are
-> never shown or logged anywhere in this flow.
+> All endpoints below are JSON over the dashboard binary. The mutating operator endpoints
+> used in this runbook (PR17+) need a bearer token (`Authorization: Bearer <token>`); the
+> required role is noted per step. Secrets are never shown or logged anywhere in this flow.
+>
+> **Network exposure (important).** The PR16 **read-only** dashboard views/WebSocket have
+> **no built-in user authentication** — read-only does NOT mean safe to expose. Keep the
+> dashboard bound to `127.0.0.1` (the shipped default) and reach it only over a trusted VPN
+> or an authenticated reverse proxy; never publish port `8080` to an untrusted network. Bearer
+> tokens gate the PR17+ *mutating* endpoints, not the read-only views. See DEPLOY.md §3a.
 
 ## 0. Pre-requisites (one-time)
 

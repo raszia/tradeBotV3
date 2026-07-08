@@ -67,3 +67,33 @@ func TestProductionExampleIsSafeAndSecretFree(t *testing.T) {
 		t.Error("production.example.toml should ship master_key as an empty placeholder")
 	}
 }
+
+// TestProductionExampleDashboardIsLoopbackOnly (PR16) guards the deployment-security
+// default: the PR16 dashboard is READ-ONLY but UNAUTHENTICATED, so the shipped example
+// must NOT bind it to a public/all-interfaces address. It must be loopback-only (operators
+// expose it deliberately, only behind a VPN or authenticated reverse proxy).
+func TestProductionExampleDashboardIsLoopbackOnly(t *testing.T) {
+	root := moduleRoot(t)
+	for _, name := range []string{"production.example.toml", "config.example.toml"} {
+		path := filepath.Join(root, "configs", name)
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("%s must load: %v", name, err)
+		}
+		addr := cfg.Dashboard.ListenAddr
+		host := addr
+		if i := strings.LastIndex(addr, ":"); i >= 0 {
+			host = addr[:i] // strip :port (handles host:port; bare :port -> "")
+		}
+		loopback := host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+		if !loopback {
+			t.Errorf("%s binds the unauthenticated PR16 dashboard to %q (host %q) — must be loopback-only (127.0.0.1/localhost)", name, addr, host)
+		}
+		// Explicitly reject the classic public-exposure footguns.
+		for _, bad := range []string{"0.0.0.0", "::", "[::]"} {
+			if host == bad {
+				t.Errorf("%s binds the dashboard to %q — public exposure of an unauthenticated dashboard is unsafe", name, addr)
+			}
+		}
+	}
+}

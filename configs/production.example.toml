@@ -38,9 +38,18 @@ db       = 0
 pool_size = 0                      # 0 = default 30
 
 [dashboard]
-# Bind to localhost (or an internal interface behind a reverse proxy / VPN). Operator
-# auth is via DB-stored bearer tokens (SHA-256 hashes); do NOT expose this publicly.
-listen_addr = "0.0.0.0:8080"
+# SECURITY: the PR16 dashboard is READ-ONLY but has NO built-in user authentication.
+# READ-ONLY DOES NOT MEAN SAFE FOR PUBLIC EXPOSURE — anyone who can reach this port can
+# read ALL operational data (cycles, orders, exchange requests, balances, exchange health,
+# market regime, logs, config, and the live WebSocket snapshots). Same-origin only protects
+# browsers; it does NOT stop curl / scripts / port scanners / non-browser WebSocket clients.
+#
+# Therefore bind to LOCALHOST by default. Expose the dashboard ONLY through a trusted VPN or
+# an AUTHENTICATED reverse proxy. Do NOT publish port 8080 directly to an untrusted network.
+#   - Docker: publish loopback-only  ->  127.0.0.1:8080:8080   (NEVER 0.0.0.0:8080:8080
+#     unless a trusted/authenticated boundary — VPN or auth proxy — sits in front).
+# Authenticated + audited operator/config-editing capabilities arrive in PR17.
+listen_addr = "127.0.0.1:8080"
 
 [security]
 # Encryption master key for at-rest exchange credentials + API-log masking support.
