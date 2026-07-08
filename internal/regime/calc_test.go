@@ -1,6 +1,7 @@
 package regime
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -27,6 +28,56 @@ func basket1(neutral, moderate, strong int) Basket {
 	return Basket{
 		ID: 1, Name: "b", Symbols: []SymbolWeight{sym("BTC/USDT", 1)}, Timeframes: []Timeframe{tf("1h", 3600, 1)},
 		NeutralBandBps: neutral, ModerateBps: moderate, StrongBps: strong, ConfigVersion: 7,
+	}
+}
+
+// TestBasketValidate is the offline config-rejection matrix (reviewer's required cases).
+// Only genuinely invalid values are rejected; a valid basket passes.
+func TestBasketValidate(t *testing.T) {
+	valid := basket1(5, 30, 100) // neutral<=moderate<=strong, positive symbol/tf weights
+
+	// negative weight (decimal) helper.
+	negW := func(n string, w string) SymbolWeight { return SymbolWeight{Symbol: n, Weight: dec(w)} }
+
+	cases := []struct {
+		name    string
+		mutate  func(b *Basket)
+		wantErr bool
+	}{
+		{"valid", func(*Basket) {}, false},
+		// 1. zero / negative symbol weight.
+		{"zero-symbol-weight", func(b *Basket) { b.Symbols = []SymbolWeight{negW("BTC/USDT", "0")} }, true},
+		{"negative-symbol-weight", func(b *Basket) { b.Symbols = []SymbolWeight{negW("BTC/USDT", "-1")} }, true},
+		// 2. zero / negative timeframe seconds; and zero timeframe weight.
+		{"zero-tf-seconds", func(b *Basket) { b.Timeframes = []Timeframe{tf("1h", 0, 1)} }, true},
+		{"negative-tf-seconds", func(b *Basket) { b.Timeframes = []Timeframe{tf("1h", -60, 1)} }, true},
+		{"zero-tf-weight", func(b *Basket) { b.Timeframes = []Timeframe{tf("1h", 3600, 0)} }, true},
+		// 3. negative neutral band.
+		{"negative-neutral", func(b *Basket) { b.NeutralBandBps = -1 }, true},
+		// 4. moderate < neutral.
+		{"moderate-below-neutral", func(b *Basket) { b.NeutralBandBps, b.ModerateBps = 30, 10 }, true},
+		// 5. strong < moderate.
+		{"strong-below-moderate", func(b *Basket) { b.ModerateBps, b.StrongBps = 50, 20 }, true},
+		// negative update interval.
+		{"negative-interval", func(b *Basket) { b.UpdateIntervalSeconds = -1 }, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := valid
+			b.Symbols = append([]SymbolWeight(nil), valid.Symbols...)
+			b.Timeframes = append([]Timeframe(nil), valid.Timeframes...)
+			c.mutate(&b)
+			err := b.Validate()
+			if c.wantErr && err == nil {
+				t.Errorf("%s: Validate() = nil, want error", c.name)
+			}
+			if !c.wantErr && err != nil {
+				t.Errorf("%s: Validate() = %v, want nil", c.name, err)
+			}
+			if c.wantErr && err != nil && !errors.Is(err, ErrInvalidBasketConfig) {
+				t.Errorf("%s: error %v does not wrap ErrInvalidBasketConfig", c.name, err)
+			}
+		})
 	}
 }
 

@@ -3,6 +3,7 @@ package regime
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -252,6 +253,126 @@ func TestCalculatorRedisMissDoesNotCrashOrFabricate(t *testing.T) {
 	f.db.QueryRow("SELECT stale_reason FROM market_regime_current WHERE basket_id=?", id).Scan(&reason)
 	if !reason.Valid || reason.String == "" {
 		t.Error("expected a stale reason when redis data is missing")
+	}
+}
+
+// TestRegimeConfigCheckConstraints proves the DB layer (migration 027) rejects invalid
+// regime config — the write-side half of "validate in both the migration and LoadBaskets".
+func TestRegimeConfigCheckConstraints(t *testing.T) {
+	f := setupR(t)
+	// A valid basket to attach invalid symbols/timeframes to.
+	valid := f.seedBasket(1, 2, "BTC/USDT")
+
+	rejects := func(name, query string, args ...any) {
+		if _, err := f.db.Exec(query, args...); err == nil {
+			t.Errorf("%s: expected the DB CHECK constraint to reject the insert, got nil error", name)
+		}
+	}
+	rseq++
+	// Basket-level: negative neutral, moderate<neutral, strong<moderate.
+	mkBasket := func(neutral, moderate, strong int) {
+		rseq++
+		rejects(fmt.Sprintf("basket n=%d m=%d s=%d", neutral, moderate, strong),
+			`INSERT INTO market_regime_baskets (name, enabled, update_interval_seconds, neutral_band_bps, moderate_threshold_bps, strong_threshold_bps)
+			 VALUES (?, 1, 60, ?, ?, ?)`, fmt.Sprintf("bad_%d_%d", time.Now().UnixNano(), rseq), neutral, moderate, strong)
+	}
+	mkBasket(-1, 30, 100) // negative neutral
+	mkBasket(30, 10, 100) // moderate < neutral
+	mkBasket(5, 50, 20)   // strong < moderate
+	rejects("negative update interval",
+		`INSERT INTO market_regime_baskets (name, enabled, update_interval_seconds, neutral_band_bps, moderate_threshold_bps, strong_threshold_bps)
+		 VALUES (?, 1, -1, 5, 30, 100)`, fmt.Sprintf("bad_int_%d", time.Now().UnixNano()))
+
+	// Symbol weight must be > 0.
+	rejects("zero symbol weight", "INSERT INTO market_regime_basket_symbols (basket_id, binance_symbol, weight, enabled) VALUES (?, 'ZZZ/USDT', 0, 1)", valid)
+	rejects("negative symbol weight", "INSERT INTO market_regime_basket_symbols (basket_id, binance_symbol, weight, enabled) VALUES (?, 'YYY/USDT', -1, 1)", valid)
+	// Timeframe seconds and weight must be > 0.
+	rejects("zero timeframe seconds", "INSERT INTO market_regime_timeframes (basket_id, label, seconds, weight) VALUES (?, 'z', 0, 1)", valid)
+	rejects("negative timeframe seconds", "INSERT INTO market_regime_timeframes (basket_id, label, seconds, weight) VALUES (?, 'n', -60, 1)", valid)
+	rejects("zero timeframe weight", "INSERT INTO market_regime_timeframes (basket_id, label, seconds, weight) VALUES (?, 'w', 60, 0)", valid)
+}
+
+// TestLoadBasketsRejectsInvalidConfig proves the code-side half: LoadBaskets returns
+// ErrInvalidBasketConfig (never a regime result) when a stored basket is invalid. Because
+// the CHECK constraints block a direct invalid INSERT, we drop the relevant constraint for
+// this one row to simulate config that predates the constraint / was hand-edited.
+func TestLoadBasketsRejectsInvalidConfig(t *testing.T) {
+	f := setupR(t)
+	id := f.seedBasket(1, 2, "BTC/USDT")
+	// Temporarily drop the symbol-weight CHECK so we can insert an invalid weight, proving
+	// the CODE path rejects it even if the DB somehow held bad data.
+	if _, err := f.db.Exec("ALTER TABLE market_regime_basket_symbols DROP CONSTRAINT chk_regime_symbol_weight_pos"); err != nil {
+		t.Skipf("cannot drop constraint to simulate legacy bad row: %v", err)
+	}
+	t.Cleanup(func() {
+		f.db.Exec("DELETE FROM market_regime_basket_symbols WHERE basket_id=? AND weight <= 0", id)
+		f.db.Exec("ALTER TABLE market_regime_basket_symbols ADD CONSTRAINT chk_regime_symbol_weight_pos CHECK (weight > 0)")
+	})
+	if _, err := f.db.Exec("INSERT INTO market_regime_basket_symbols (basket_id, binance_symbol, weight, enabled) VALUES (?, 'BAD/USDT', 0, 1)", id); err != nil {
+		t.Fatalf("seed invalid symbol: %v", err)
+	}
+	_, err := f.st.LoadBaskets(f.ctx)
+	if !errors.Is(err, ErrInvalidBasketConfig) {
+		t.Errorf("LoadBaskets with a zero-weight symbol = %v, want ErrInvalidBasketConfig", err)
+	}
+}
+
+// TestHistoryStoresStateHashAndStaleReason proves reviewer #2: history rows are
+// self-describing — they carry state_hash and stale_reason, not just direction/level.
+func TestHistoryStoresStateHashAndStaleReason(t *testing.T) {
+	f := setupR(t)
+	id := f.seedBasket(1, 2, "BTC/USDT")
+	b := Basket{ID: id, ConfigVersion: 7}
+	now := time.Now().UTC()
+
+	// An UNKNOWN result with a stale reason.
+	u := Result{Direction: DirUnknown, Level: LvlUnknown, Confidence: dec("0"), StaleReason: "2/3 symbols stale"}
+	if err := f.st.WriteResult(f.ctx, b, u, now); err != nil {
+		t.Fatal(err)
+	}
+	var histHash, histReason sql.NullString
+	err := f.db.QueryRow("SELECT state_hash, stale_reason FROM market_regime_history WHERE basket_id=? ORDER BY id DESC LIMIT 1", id).
+		Scan(&histHash, &histReason)
+	if err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+	if !histHash.Valid || len(histHash.String) != 64 {
+		t.Errorf("history state_hash = %q, want a 64-char hash", histHash.String)
+	}
+	if !histReason.Valid || histReason.String != "2/3 symbols stale" {
+		t.Errorf("history stale_reason = %q, want %q", histReason.String, "2/3 symbols stale")
+	}
+	// The history state_hash must equal the current row's state_hash (same evolution point).
+	var curHash sql.NullString
+	f.db.QueryRow("SELECT state_hash FROM market_regime_current WHERE basket_id=?", id).Scan(&curHash)
+	if curHash.String != histHash.String {
+		t.Errorf("history hash %q != current hash %q", histHash.String, curHash.String)
+	}
+}
+
+// TestWriteResultReturnsRealSelectError proves reviewer #3: a real SELECT state_hash error
+// (not sql.ErrNoRows) is returned, not silently swallowed into a misleading history insert.
+func TestWriteResultReturnsRealSelectError(t *testing.T) {
+	f := setupR(t)
+	id := f.seedBasket(1, 2, "BTC/USDT")
+	b := Basket{ID: id, ConfigVersion: 7}
+	r := Result{Direction: DirBullish, Level: LvlWeak, Confidence: dec("1"), ScoreBps: dec("20")}
+
+	// Break the state_hash SELECT: rename the column so the query errors (not ErrNoRows).
+	if _, err := f.db.Exec("ALTER TABLE market_regime_current CHANGE COLUMN state_hash state_hash_x CHAR(64) NULL"); err != nil {
+		t.Skipf("cannot rename column to force a select error: %v", err)
+	}
+	t.Cleanup(func() {
+		f.db.Exec("ALTER TABLE market_regime_current CHANGE COLUMN state_hash_x state_hash CHAR(64) NULL")
+	})
+
+	err := f.st.WriteResult(f.ctx, b, r, time.Now().UTC())
+	if err == nil {
+		t.Fatal("WriteResult returned nil, want the underlying SELECT error (must not swallow it)")
+	}
+	// And no misleading history row was written on the errored path.
+	if h := f.count("market_regime_history", id); h != 0 {
+		t.Errorf("history rows = %d after a select error, want 0 (no misleading insert)", h)
 	}
 }
 

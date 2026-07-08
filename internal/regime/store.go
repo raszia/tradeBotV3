@@ -6,12 +6,20 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
 )
+
+// ErrInvalidBasketConfig means a basket's stored config violates a validation rule
+// (weights/seconds must be positive, thresholds non-negative and correctly ordered). It
+// is returned by LoadBaskets so invalid config NEVER produces a regime result. The DB
+// also enforces these via CHECK constraints (migration 027); this is defence in depth.
+var ErrInvalidBasketConfig = errors.New("regime: invalid basket config")
 
 // Store loads regime basket config and writes regime current/history.
 type Store struct{ db *sql.DB }
@@ -90,9 +98,47 @@ func (s *Store) LoadBaskets(ctx context.Context) ([]Basket, error) {
 
 	out := make([]Basket, 0, len(order))
 	for _, id := range order {
-		out = append(out, *baskets[id])
+		b := *baskets[id]
+		// Reject invalid config so the calculator never computes a regime from it.
+		if err := b.Validate(); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
 	}
 	return out, nil
+}
+
+// Validate enforces the regime-config invariants in code (the DB enforces the same via
+// migration 027 CHECK constraints). A basket with no enabled symbols/timeframes is NOT a
+// config error — Calculate degrades it to UNKNOWN — so those are not rejected here; only
+// genuinely invalid values are. Returns an error wrapping ErrInvalidBasketConfig.
+func (b Basket) Validate() error {
+	if b.UpdateIntervalSeconds < 0 {
+		return fmt.Errorf("%w: basket %q update_interval_seconds must be >= 0 (got %d)", ErrInvalidBasketConfig, b.Name, b.UpdateIntervalSeconds)
+	}
+	if b.NeutralBandBps < 0 {
+		return fmt.Errorf("%w: basket %q neutral_band_bps must be >= 0 (got %d)", ErrInvalidBasketConfig, b.Name, b.NeutralBandBps)
+	}
+	if b.ModerateBps < b.NeutralBandBps {
+		return fmt.Errorf("%w: basket %q moderate_threshold_bps (%d) must be >= neutral_band_bps (%d)", ErrInvalidBasketConfig, b.Name, b.ModerateBps, b.NeutralBandBps)
+	}
+	if b.StrongBps < b.ModerateBps {
+		return fmt.Errorf("%w: basket %q strong_threshold_bps (%d) must be >= moderate_threshold_bps (%d)", ErrInvalidBasketConfig, b.Name, b.StrongBps, b.ModerateBps)
+	}
+	for _, sw := range b.Symbols {
+		if !sw.Weight.IsPositive() {
+			return fmt.Errorf("%w: basket %q symbol %q weight must be > 0 (got %s)", ErrInvalidBasketConfig, b.Name, sw.Symbol, sw.Weight.String())
+		}
+	}
+	for _, tf := range b.Timeframes {
+		if tf.Seconds <= 0 {
+			return fmt.Errorf("%w: basket %q timeframe %q seconds must be > 0 (got %d)", ErrInvalidBasketConfig, b.Name, tf.Label, tf.Seconds)
+		}
+		if !tf.Weight.IsPositive() {
+			return fmt.Errorf("%w: basket %q timeframe %q weight must be > 0 (got %s)", ErrInvalidBasketConfig, b.Name, tf.Label, tf.Weight.String())
+		}
+	}
+	return nil
 }
 
 // WriteResult upserts the basket's current regime and appends a history row ONLY when
@@ -108,9 +154,19 @@ func (s *Store) WriteResult(ctx context.Context, b Basket, r Result, computedAt 
 	symJSON, _ := json.Marshal(decimalMap(r.SymbolContributions))
 	hash := regimeStateHash(r, string(tfJSON), string(symJSON), b.ConfigVersion)
 
+	// Detect change vs the current row's state_hash. Only sql.ErrNoRows is safe to treat
+	// as "no previous state" (→ changed). Any OTHER error (DB/schema/connection/scan) must
+	// be returned — silently swallowing it and inserting would write misleading history.
 	var prevHash sql.NullString
-	_ = s.db.QueryRowContext(ctx, "SELECT state_hash FROM market_regime_current WHERE basket_id=?", b.ID).Scan(&prevHash)
-	changed := !prevHash.Valid || prevHash.String != hash
+	var changed bool
+	switch err := s.db.QueryRowContext(ctx, "SELECT state_hash FROM market_regime_current WHERE basket_id=?", b.ID).Scan(&prevHash); {
+	case errors.Is(err, sql.ErrNoRows):
+		changed = true
+	case err != nil:
+		return err
+	default:
+		changed = !prevHash.Valid || prevHash.String != hash
+	}
 
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO market_regime_current
@@ -125,11 +181,15 @@ ON DUPLICATE KEY UPDATE direction=VALUES(direction), level=VALUES(level), confid
 	}
 
 	if changed {
+		// History carries the SAME full-field payload as current — including stale_reason
+		// and the state_hash itself — so a history row shows WHAT changed, not just that
+		// something did (e.g. an UNKNOWN whose stale_reason evolved is self-describing).
 		if _, err := s.db.ExecContext(ctx, `
 INSERT INTO market_regime_history
-  (basket_id, direction, level, confidence, score_bps, timeframe_scores, symbol_contributions, config_version)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			b.ID, r.Direction, r.Level, r.Confidence.String(), decimalOrNull(r.ScoreBps), string(tfJSON), string(symJSON), b.ConfigVersion); err != nil {
+  (basket_id, direction, level, confidence, score_bps, timeframe_scores, symbol_contributions, stale_reason, state_hash, config_version)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			b.ID, r.Direction, r.Level, r.Confidence.String(), decimalOrNull(r.ScoreBps), string(tfJSON), string(symJSON),
+			nullStr(r.StaleReason), hash, b.ConfigVersion); err != nil {
 			return err
 		}
 	}
