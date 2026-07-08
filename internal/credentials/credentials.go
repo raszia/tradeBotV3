@@ -17,6 +17,7 @@ import (
 	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/domain"
 	"v3TradeBot/internal/exchanges"
+	"v3TradeBot/internal/execution"
 	"v3TradeBot/internal/secrets"
 )
 
@@ -132,10 +133,13 @@ func (p *Provider) markUnusable(ctx context.Context, id int64, reason string) {
 	}
 }
 
-// Validate performs the ONLY allowed credential check: a read-only balance read. It can
-// never place or cancel (the BalanceReader interface lacks those). On success it stamps
-// status='active' + last_checked_at; on failure it records status='invalid' with a
-// non-secret note. It returns the underlying error (which must not contain secrets).
+// Validate performs the ONLY allowed MANUAL credential check: a read-only balance read.
+// It can never place or cancel (the BalanceReader interface lacks those). It is STRICT —
+// an operator explicitly asked "is this credential good right now?" — so ANY error stamps
+// status='invalid'. This strictness is correct for a one-shot, operator-initiated check
+// but is UNSAFE for continuous polling: use ProbePrivateHealth for the health-monitor.
+// On success it stamps status='active' + last_checked_at; on failure status='invalid'
+// with a non-secret note. Returns the underlying error (which must not contain secrets).
 func (p *Provider) Validate(ctx context.Context, code string, r BalanceReader) error {
 	_, err := r.GetBalances(ctx)
 	if err != nil {
@@ -144,6 +148,53 @@ func (p *Provider) Validate(ctx context.Context, code string, r BalanceReader) e
 	}
 	p.setStatusByCode(ctx, code, "active", "")
 	return nil
+}
+
+// ProbePrivateHealth is the CONTINUOUS-monitoring credential probe used by the
+// health-monitor. Like Validate it performs ONLY a read-only balance read (it can never
+// place or cancel), but its credential-status policy is SAFE FOR REPEATED USE: it marks a
+// credential 'invalid' ONLY on a DEFINITE auth/permission/signature error. A temporary
+// exchange/network problem (timeout, deadline, network reset, rate limit / HTTP 429,
+// exchange 5xx, service unavailable) leaves the credential 'active' and untouched, so a
+// short incident can never permanently disable a valid credential — it surfaces only as a
+// health status (UNAVAILABLE/DEGRADED/RATE_LIMITED via health.Classify). It always returns
+// the underlying error unchanged so the health layer classifies it correctly.
+//
+//   - success              → status='active', last_auth_error cleared, nil error
+//   - definite auth error  → status='invalid' (non-secret note), returns the error
+//   - temporary/other error→ credential row UNTOUCHED (stays whatever it was), returns err
+func (p *Provider) ProbePrivateHealth(ctx context.Context, code string, r BalanceReader) error {
+	_, err := r.GetBalances(ctx)
+	if err == nil {
+		p.setStatusByCode(ctx, code, "active", "")
+		return nil
+	}
+	if isDefiniteAuthError(err) {
+		p.setStatusByCode(ctx, code, "invalid", "auth error on private health probe")
+	}
+	// Any non-auth error: do NOT modify credential status. A transient failure must never
+	// invalidate a healthy credential (that would let a brief outage disable live trading).
+	return err
+}
+
+// isDefiniteAuthError reports whether err is a DEFINITE authentication/authorization
+// failure — the only class of error allowed to invalidate a credential. It mirrors the
+// auth arm of health.Classify: the execution auth sentinel and a NormalizedAPIError whose
+// adapter-assigned category is auth (invalid key/secret, unauthorized, permission denied,
+// signature error). Everything else — timeout, network, rate limit, 5xx, unknown — is
+// treated as NON-auth (fail-safe: when unsure, do not invalidate).
+func isDefiniteAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, execution.ErrAuthFailed) {
+		return true
+	}
+	var apiErr *exchanges.NormalizedAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Category == exchanges.CatAuth
+	}
+	return false
 }
 
 func (p *Provider) setStatusByCode(ctx context.Context, code, status, note string) {

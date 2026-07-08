@@ -135,12 +135,18 @@ func (r *Recorder) Record(ctx context.Context, code string, res ProbeResult) err
 // the only thing the Monitor invokes — there is no order-mutating surface here.
 type ProbeFunc func(ctx context.Context) error
 
-// Target is one exchange's probes. Private is nil when no authenticated client is
-// available (private health then stays UNKNOWN — documented, never a panic).
+// Target is one exchange's read-only probes. Public is the market-data probe. Private
+// is the authenticated READ-ONLY probe (a balance read via credentials.Validate — no
+// PlaceOrder/CancelOrder is reachable through it, consistent with balance-sync's
+// read-only wiring). Private is nil ONLY as a deliberate, safe fallback when no
+// decrypted credential exists for this exchange; private health then stays UNKNOWN — a
+// documented intentional state, never "accidentally missing", never marked unhealthy on
+// absence, never a panic. Both fields are ProbeFunc, so a Target can never place or
+// cancel an order by construction (proven by TestMonitorHoldsNoOrderClient).
 type Target struct {
 	ExchangeCode string
-	Public       ProbeFunc
-	Private      ProbeFunc
+	Public       ProbeFunc // read-only public market-data probe
+	Private      ProbeFunc // read-only authenticated probe; nil = no creds ⇒ UNKNOWN
 }
 
 // Config tunes the monitor. Defaults are filled by NewMonitor.
@@ -221,8 +227,9 @@ func (m *Monitor) probeTarget(ctx context.Context, t Target) {
 	if t.Private != nil {
 		m.runProbe(ctx, t.ExchangeCode, KindPrivate, t.Private)
 	}
-	// When Private is nil, private health is intentionally left UNKNOWN (no
-	// credentials wired yet) — never marked unhealthy on absence.
+	// Private nil = no decrypted credential for this exchange, so private health is
+	// intentionally left UNKNOWN (a deliberate safe fallback, NOT an accidental
+	// omission). It is never marked unhealthy merely because credentials are absent.
 }
 
 func (m *Monitor) runProbe(ctx context.Context, code string, kind Kind, probe ProbeFunc) {

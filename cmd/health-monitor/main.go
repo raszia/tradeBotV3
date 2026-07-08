@@ -3,10 +3,18 @@
 // timeout classification recorded into exchange_health_current + exchange_health_samples.
 //
 // It calls ONLY read-only APIs (no PlaceOrder/CancelOrder), makes no trading
-// decisions, and creates no cycles/orders. PR20a: the private (authenticated) probe is
-// a READ-ONLY balance check via credentials.Validate (never places/cancels) which also
-// stamps the credential status; a missing/invalid master key or absent credential keeps
-// private health UNKNOWN and never panics.
+// decisions, and creates no cycles/orders.
+//
+// Private health is wired (Option A): the authenticated probe is a READ-ONLY balance
+// check via credentials.ProbePrivateHealth, which takes the narrow read-only
+// BalanceReader — the same read-only credential-building path balance-sync uses (PR13).
+// No place/cancel is reachable through it. Crucially, ProbePrivateHealth is the
+// CONTINUOUS-monitoring path: it marks a credential 'invalid' ONLY on a definite auth
+// error, so a temporary exchange/network incident (timeout/rate-limit/5xx) can never
+// invalidate a healthy credential — it only affects the reported health status. A
+// missing/invalid master key or an exchange with no active credential falls back to
+// public-only: private health for that exchange stays UNKNOWN (a deliberate safe
+// fallback, not an accidental omission) and the monitor never panics.
 package main
 
 import (
@@ -51,15 +59,22 @@ func main() {
 			t := health.Target{
 				ExchangeCode: code,
 				Public:       func(ctx context.Context) error { _, e := c.GetMarkets(ctx); return e },
-				Private:      nil, // stays UNKNOWN unless a credentialed read-only client is built
+				// Private is wired below when a decrypted credential exists; it stays nil
+				// (⇒ private health UNKNOWN) only as the deliberate public-only fallback.
+				Private: nil,
 			}
-			// Private probe = a READ-ONLY balance check that also validates + stamps the
-			// credential (no place/cancel is reachable through credentials.Validate).
+			// Option A: wire a READ-ONLY authenticated probe. ProbePrivateHealth takes the
+			// narrow read-only BalanceReader (GetBalances only) — no place/cancel is
+			// reachable. It is the CONTINUOUS-monitoring path: it only marks a credential
+			// 'invalid' on a DEFINITE auth error, so a temporary exchange/network incident
+			// (timeout/rate-limit/5xx) never disables a valid credential — it surfaces only
+			// as private health status. (The strict Provider.Validate is for one-shot
+			// operator-initiated checks, not for this loop.)
 			if builder != nil {
 				if pc, perr := builder.BuildPrivate(ctx, code); perr == nil {
 					ec, pv := code, provider
 					rc := pc
-					t.Private = func(ctx context.Context) error { return pv.Validate(ctx, ec, rc) }
+					t.Private = func(ctx context.Context) error { return pv.ProbePrivateHealth(ctx, ec, rc) }
 				}
 			}
 			targets = append(targets, t)

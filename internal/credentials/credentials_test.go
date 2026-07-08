@@ -288,3 +288,139 @@ func TestValidateIsReadOnlyNeverPlacesOrCancels(t *testing.T) {
 		t.Errorf("status after successful validate = %q, want active", got)
 	}
 }
+
+// balErr is a minimal read-only BalanceReader that returns a fixed error (or nil). It is
+// used to prove ProbePrivateHealth's credential-status policy without any network.
+type balErr struct {
+	err   error
+	calls int32
+}
+
+func (b *balErr) GetBalances(ctx context.Context) ([]domain.Balance, error) {
+	atomic.AddInt32(&b.calls, 1)
+	return nil, b.err
+}
+
+// apiErr builds a NormalizedAPIError with the given adapter category (as a real adapter
+// would emit), for exercising the auth-vs-temporary classification.
+func apiErr(cat exchanges.ErrorCategory) error {
+	return &exchanges.NormalizedAPIError{Exchange: "credprobe", Op: "GetBalances", Category: cat, Message: "boom"}
+}
+
+// TestProbePrivateHealthIsReadOnly proves the continuous probe never places/cancels.
+func TestProbePrivateHealthIsReadOnly(t *testing.T) {
+	f := setupC(t)
+	f.seedCred("default", 1, "active", 1, "k", "s", "")
+	probe := &credProbe{cfg: exchanges.ClientConfig{Creds: f.provider()}}
+	if err := f.provider().ProbePrivateHealth(f.ctx, "credprobe", probe); err != nil {
+		t.Fatal(err)
+	}
+	if probe.place != 0 || probe.cancel != 0 {
+		t.Errorf("probe must NEVER place/cancel: place=%d cancel=%d", probe.place, probe.cancel)
+	}
+	if got := f.status("default"); got != "active" {
+		t.Errorf("status after successful probe = %q, want active", got)
+	}
+}
+
+// TestProbePrivateHealthCredentialPolicy is the reviewer's blocking-issue matrix: ONLY a
+// definite auth error may invalidate a credential; every temporary error must leave it
+// 'active' so a brief incident cannot permanently disable live trading.
+func TestProbePrivateHealthCredentialPolicy(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus string // credential status AFTER the probe
+	}{
+		// 1. auth error invalidates (sentinel + adapter-classified auth).
+		{"auth-sentinel-invalidates", execution.ErrAuthFailed, "invalid"},
+		{"auth-apierr-invalidates", apiErr(exchanges.CatAuth), "invalid"},
+		// 2-5. temporary errors must NOT invalidate.
+		{"timeout-keeps-active", context.DeadlineExceeded, "active"},
+		{"ack-timeout-keeps-active", execution.ErrAckTimeout, "active"},
+		{"network-keeps-active", apiErr(exchanges.CatNetwork), "active"},
+		{"rate-limit-sentinel-keeps-active", execution.ErrRateLimited, "active"},
+		{"rate-limit-apierr-keeps-active", apiErr(exchanges.CatRateLimit), "active"},
+		{"exchange-5xx-keeps-active", apiErr(exchanges.CatServer), "active"},
+		{"unknown-keeps-active", errors.New("some transient blip"), "active"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := setupC(t)
+			f.seedCred("default", 1, "active", 1, "k", "s", "")
+			r := &balErr{err: c.err}
+			gotErr := f.provider().ProbePrivateHealth(f.ctx, "credprobe", r)
+			if !errors.Is(gotErr, c.err) && gotErr != c.err {
+				t.Errorf("ProbePrivateHealth returned %v, want the underlying %v", gotErr, c.err)
+			}
+			if atomic.LoadInt32(&r.calls) != 1 {
+				t.Errorf("GetBalances called %d times, want 1", r.calls)
+			}
+			if got := f.status("default"); got != c.wantStatus {
+				t.Errorf("credential status after %q error = %q, want %q", c.name, got, c.wantStatus)
+			}
+		})
+	}
+}
+
+// TestProbePrivateHealthSuccessAfterTemporaryFailure covers reviewer case 6: a temporary
+// failure leaves the credential active, and a later success keeps it active (never having
+// been invalidated in between), so BuildPrivate keeps working throughout an incident.
+func TestProbePrivateHealthSuccessAfterTemporaryFailure(t *testing.T) {
+	f := setupC(t)
+	f.seedCred("default", 1, "active", 1, "k", "s", "")
+	p := f.provider()
+
+	// Temporary failure: credential must stay active and buildable.
+	if err := p.ProbePrivateHealth(f.ctx, "credprobe", &balErr{err: context.DeadlineExceeded}); err == nil {
+		t.Fatal("expected the timeout error to propagate")
+	}
+	if got := f.status("default"); got != "active" {
+		t.Fatalf("credential status after timeout = %q, want active (transient must not invalidate)", got)
+	}
+	if !p.HasActiveCredential(f.ctx, "credprobe") {
+		t.Fatal("credential must remain active/buildable through a transient failure")
+	}
+
+	// Recovery: a subsequent success keeps it active.
+	if err := p.ProbePrivateHealth(f.ctx, "credprobe", &balErr{err: nil}); err != nil {
+		t.Fatalf("recovery probe = %v, want nil", err)
+	}
+	if got := f.status("default"); got != "active" {
+		t.Errorf("credential status after recovery = %q, want active", got)
+	}
+}
+
+// TestValidateStillStrictForManualCheck pins that the one-shot operator Validate keeps its
+// strict "any error → invalid" behaviour (only ProbePrivateHealth is lenient).
+func TestValidateStillStrictForManualCheck(t *testing.T) {
+	f := setupC(t)
+	f.seedCred("default", 1, "active", 1, "k", "s", "")
+	// A transient error via the strict manual path DOES invalidate — intentional.
+	if err := f.provider().Validate(f.ctx, "credprobe", &balErr{err: context.DeadlineExceeded}); err == nil {
+		t.Fatal("expected error")
+	}
+	if got := f.status("default"); got != "invalid" {
+		t.Errorf("manual Validate should stay strict: status = %q, want invalid", got)
+	}
+}
+
+// TestIsDefiniteAuthError is an offline guard on the classifier that gates invalidation.
+func TestIsDefiniteAuthError(t *testing.T) {
+	auth := []error{execution.ErrAuthFailed, apiErr(exchanges.CatAuth), fmt.Errorf("wrap: %w", execution.ErrAuthFailed)}
+	notAuth := []error{
+		nil, context.DeadlineExceeded, execution.ErrRateLimited, execution.ErrAckTimeout,
+		apiErr(exchanges.CatNetwork), apiErr(exchanges.CatRateLimit), apiErr(exchanges.CatServer),
+		apiErr(exchanges.CatTimeout), errors.New("plain"),
+	}
+	for _, e := range auth {
+		if !isDefiniteAuthError(e) {
+			t.Errorf("isDefiniteAuthError(%v) = false, want true", e)
+		}
+	}
+	for _, e := range notAuth {
+		if isDefiniteAuthError(e) {
+			t.Errorf("isDefiniteAuthError(%v) = true, want false (must not invalidate)", e)
+		}
+	}
+}
