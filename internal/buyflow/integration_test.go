@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 	"github.com/shopspring/decimal"
 
 	"v3TradeBot/internal/clock"
@@ -394,6 +395,137 @@ func TestRefreshNoOpWhenNoActiveCycle(t *testing.T) {
 	if ok, err := RefreshActiveCycleBuy(f.ctx, f.store, m, dec("200"), f.sig()); ok || err != nil {
 		t.Errorf("refresh with no active cycle = %v, %v; want false,nil", ok, err)
 	}
+}
+
+// setFlag flips a live DB flag on the market row (simulating a dashboard config edit).
+func (f *bfix) setFlag(m configstore.MarketConfig, col string, on bool) {
+	f.t.Helper()
+	v := 0
+	if on {
+		v = 1
+	}
+	if _, err := f.db.Exec("UPDATE exchange_markets SET "+col+"=? WHERE id=?", v, m.ExchangeMarketID); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// assertNoBuySideEffects asserts CreateBuyCycle left NOTHING behind for the market.
+func (f *bfix) assertNoBuySideEffects(m configstore.MarketConfig) {
+	f.t.Helper()
+	if n := f.count("cycles", m); n != 0 {
+		f.t.Errorf("cycles = %d, want 0 (rejected create must leave no cycle)", n)
+	}
+	if n := f.count("orders", m); n != 0 {
+		f.t.Errorf("orders = %d, want 0", n)
+	}
+	if n := f.buyReqs(m); n != 0 {
+		f.t.Errorf("buy requests = %d, want 0", n)
+	}
+	var locks int
+	f.db.QueryRow(`SELECT COUNT(*) FROM symbol_locks sl JOIN cycles c ON c.id=sl.cycle_id WHERE c.exchange_market_id=?`, m.ExchangeMarketID).Scan(&locks)
+	if locks != 0 {
+		f.t.Errorf("symbol_locks = %d, want 0", locks)
+	}
+}
+
+// TestCreateBuyCycleRejectsWhenTradingDisabled: with enabled_for_trading=0 in the DB (even
+// if the caller's in-memory MarketConfig is stale), the tx-internal recheck refuses the buy
+// and leaves no cycle/order/request/lock.
+func TestCreateBuyCycleRejectsWhenTradingDisabled(t *testing.T) {
+	f := setupB(t)
+	m := f.market("USDT", "0.5", "base", policy(true, 2, 10))
+	f.setFlag(m, "enabled_for_trading", false) // DB says disabled; m (cache) still says enabled
+	_, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600)
+	if !errors.Is(err, ErrMarketNotTradable) {
+		t.Fatalf("create with trading disabled = %v, want ErrMarketNotTradable", err)
+	}
+	f.assertNoBuySideEffects(m)
+}
+
+// TestCreateBuyCycleRejectsWhenSellManageDisabled: with enabled_for_sell_manage=0 in the DB,
+// the recheck refuses the buy (never open inventory the sell manager won't handle).
+func TestCreateBuyCycleRejectsWhenSellManageDisabled(t *testing.T) {
+	f := setupB(t)
+	m := f.market("USDT", "0.5", "base", policy(true, 2, 10))
+	f.setFlag(m, "enabled_for_sell_manage", false)
+	_, err := CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), f.sig(), 600)
+	if !errors.Is(err, ErrMarketNotTradable) {
+		t.Fatalf("create with sell-manage disabled = %v, want ErrMarketNotTradable", err)
+	}
+	f.assertNoBuySideEffects(m)
+}
+
+// newActiveVersion makes exactly ONE active config_version (superseding any prior actives,
+// like activateVersionTx) and returns its id.
+func (f *bfix) newActiveVersion() int64 {
+	f.t.Helper()
+	if _, err := f.db.Exec("UPDATE config_versions SET status='superseded' WHERE status='active'"); err != nil {
+		f.t.Fatal(err)
+	}
+	if _, err := f.db.Exec("INSERT INTO config_versions (status, created_by, activated_at) VALUES ('active','bftest',NOW(6))"); err != nil {
+		f.t.Fatal(err)
+	}
+	var v int64
+	f.db.QueryRow("SELECT id FROM config_versions WHERE status='active' ORDER BY id DESC LIMIT 1").Scan(&v)
+	return v
+}
+
+// TestCreateBuyCycleUpdateFlagsNoDeadlock runs the REAL configstore.UpdateMarketFlags
+// concurrently with CreateBuyCycle many times. Both lock the exchange_markets row FIRST
+// (and CreateBuyCycle then takes the config_versions FK lock via cycle.config_version), so
+// they share ONE lock order and never ABBA-deadlock. Exactly one of the two wins each round:
+//
+//	buy wins    → cycle created; the flag-disable sees exposure → ErrSellManageExposed
+//	config wins → flags disabled; CreateBuyCycle sees them → ErrMarketNotTradable
+//
+// A deadlock (or any other error) reaching either caller fails the test, as does any orphan.
+func TestCreateBuyCycleUpdateFlagsNoDeadlock(t *testing.T) {
+	f := setupB(t)
+	cs := configstore.New(f.db)
+	const rounds = 25
+	buyWins, cfgWins := 0, 0
+	for i := 0; i < rounds; i++ {
+		m := f.market("USDT", "0.5", "base", policy(true, 2, 10)) // fresh market: trading+sell_manage on
+		v := f.newActiveVersion()
+		sig := f.sig()
+		sig.ConfigVersion = v // stamp the cycle with the active version → real FK lock order
+
+		var buyErr, flagsErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _, buyErr = CreateBuyCycle(f.ctx, f.store, f.q, m, dec("100"), sig, 600) }()
+		go func() {
+			defer wg.Done()
+			no := false
+			// Disabling sell_manage requires trading off too (the invariant) — disable both.
+			_, flagsErr = cs.UpdateMarketFlags(f.ctx, m.ExchangeMarketID, configstore.MarketFlags{Trading: &no, SellManage: &no}, "op", "concurrent disable", v)
+		}()
+		wg.Wait()
+
+		if isDeadlock(buyErr) || isDeadlock(flagsErr) {
+			t.Fatalf("round %d: a deadlock reached a caller (buy=%v flags=%v)", i, buyErr, flagsErr)
+		}
+		switch {
+		case buyErr == nil && errors.Is(flagsErr, configstore.ErrSellManageExposed):
+			buyWins++
+			if n := f.count("cycles", m); n != 1 {
+				t.Fatalf("round %d: buy won but cycles=%d, want 1", i, n)
+			}
+		case flagsErr == nil && errors.Is(buyErr, ErrMarketNotTradable):
+			cfgWins++
+			f.assertNoBuySideEffects(m)
+		default:
+			t.Fatalf("round %d: unexpected outcome buy=%v flags=%v (want exactly one winner)", i, buyErr, flagsErr)
+		}
+	}
+	t.Logf("no-deadlock over %d rounds: buy-wins=%d config-wins=%d", rounds, buyWins, cfgWins)
+}
+
+// isDeadlock reports whether err is an InnoDB deadlock / lock-wait timeout that leaked to a
+// caller (it must not, given the consistent lock order).
+func isDeadlock(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205)
 }
 
 func (f *bfix) count(table string, m configstore.MarketConfig) int {

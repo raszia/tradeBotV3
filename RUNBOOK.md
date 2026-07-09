@@ -4,23 +4,26 @@
 > a tiny notional**, and only proceeds when preflight passes, an acknowledgement is active
 > and not expired, and a canary session is started. Nothing here broadens that scope.
 >
-> All endpoints below are JSON over the dashboard binary. The mutating operator endpoints
-> used in this runbook (PR17+) need a bearer token (`Authorization: Bearer <token>`); the
-> required role is noted per step. Secrets are never shown or logged anywhere in this flow.
+> All endpoints below are JSON over the dashboard binary. Since PR17 the dashboard requires
+> a **login session** (`POST /login` → HttpOnly session cookie); every route except
+> `/healthz` and `/login` needs it, and config edits need the `config_operator`/`admin`
+> role. Secrets are never shown or logged anywhere in this flow.
 >
-> **Network exposure (important).** The PR16 **read-only** dashboard views/WebSocket have
-> **no built-in user authentication** — read-only does NOT mean safe to expose. Keep the
-> dashboard bound to `127.0.0.1` (the shipped default) and reach it only over a trusted VPN
-> or an authenticated reverse proxy; never publish port `8080` to an untrusted network. Bearer
-> tokens gate the PR17+ *mutating* endpoints, not the read-only views. See DEPLOY.md §3a.
+> **Network exposure (important).** A login is **not** a substitute for network isolation.
+> Keep the dashboard bound to `127.0.0.1` (the shipped default) and reach it only over a
+> trusted VPN or an authenticated reverse proxy; never publish port `8080` to an untrusted
+> network. When served over HTTPS, set `[dashboard] secure_cookies = true`. See DEPLOY.md §3a.
 
 ## 0. Pre-requisites (one-time)
 
 - Real **master key** set in the bootstrap config file (`[security] master_key`) — never an
   env var. With no/invalid master key, credential loading + live execution are safe-disabled.
 - Migrations applied (`cmd/migrate`); every binary fails fast if a migration is pending.
-- Dashboard tokens provisioned out-of-band (SHA-256 hashes in `dashboard_tokens`): at least
-  one `admin`, one `credential_operator`, one `config_operator`.
+- Dashboard users provisioned (PR17): bootstrap the first admin with
+  `./bin/dashboard -config <cfg> -create-user admin:admin` — the **password is entered at a
+  hidden prompt (or piped via stdin), never on the command line** — then log in via
+  `POST /login`. Roles: `viewer` | `config_operator` | `admin` (config edits need
+  config_operator+; high-risk flag changes need admin).
 
 ## 1. Provision a credential  *(role: credential_operator/admin)*
 

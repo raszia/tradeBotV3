@@ -110,6 +110,12 @@ type RedisConfig struct {
 // its own binary so restarting it never touches the trading path.
 type DashboardConfig struct {
 	ListenAddr string `toml:"listen_addr"`
+	// SecureCookies sets the Secure flag on the login session cookie. Enable it when the
+	// dashboard is served over HTTPS (e.g. behind a TLS-terminating reverse proxy). Leave
+	// false for a plain-HTTP localhost bind, or the cookie won't be sent.
+	SecureCookies bool `toml:"secure_cookies"`
+	// SessionTTLMinutes is the login session lifetime in minutes (default 720 = 12h).
+	SessionTTLMinutes int `toml:"session_ttl_minutes"`
 }
 
 // SecurityConfig holds secrets used for at-rest protection of sensitive data

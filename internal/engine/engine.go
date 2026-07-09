@@ -504,6 +504,11 @@ func (e *Engine) prepareBuy(ctx context.Context, m configstore.MarketConfig, ask
 		_, rErr := buyflow.RefreshActiveCycleBuy(ctx, e.store, m, ask, sig)
 		return rErr
 	}
+	if errors.Is(err, buyflow.ErrMarketNotTradable) {
+		// A config edit disabled trading/sell-management for this market (the DB flags won
+		// the race vs our possibly-stale in-memory config). Skip — do NOT open a buy.
+		return nil
+	}
 	return err
 }
 

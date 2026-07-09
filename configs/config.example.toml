@@ -43,6 +43,10 @@ pool_size = 0  # 0 = default 30
 
 [dashboard]
 listen_addr = "127.0.0.1:8080"
+# PR17 login: bootstrap the first admin with (password read at a hidden prompt, NOT in args)
+#   ./bin/dashboard -config <this file> -create-user admin:admin
+secure_cookies = false      # set true when served over HTTPS (Secure cookie flag)
+session_ttl_minutes = 720   # login session lifetime (default 12h)
 
 [security]
 # Master key used to encrypt at-rest secrets (exchange API credentials stored in

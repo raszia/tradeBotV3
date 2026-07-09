@@ -105,7 +105,7 @@ func (f *efix) seedMarket(quote string, minSpreadBps int, makerFee, takerFee str
 	mID := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", canonical, bID, qID))
 	emID := last(ex(`INSERT INTO exchange_markets
 		(exchange_id, market_id, exchange_symbol, canonical_symbol, enabled_for_collection, enabled_for_signal, enabled_for_trading, enabled_for_sell_manage)
-		VALUES (?, ?, ?, ?, 1, ?, ?, 0)`, f.exID, mID, base+quote, canonical, b2i(signal), b2i(trading)))
+		VALUES (?, ?, ?, ?, 1, ?, ?, 1)`, f.exID, mID, base+quote, canonical, b2i(signal), b2i(trading)))
 	ex(`INSERT INTO symbol_configs (exchange_market_id, min_spread_bps, buy_size, buy_size_unit, sell_offset_bps, reprice_interval_seconds, order_timeout_ms, max_retries, retry_backoff_ms)
 		VALUES (?, ?, '1', 'base', 20, 5, 3000, 3, 500)`, emID, minSpreadBps)
 	ex("INSERT INTO exchange_fees (exchange_id, exchange_market_id, maker_fee, taker_fee) VALUES (?, ?, ?, ?)", f.exID, emID, makerFee, takerFee)

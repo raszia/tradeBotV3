@@ -280,6 +280,8 @@ Implemented (**PR2**, migrations `002`–`007`):
   `market_regime_timeframes`, `market_regime_current`, `market_regime_history` (015);
   `market_regime_current.state_hash` (016); **`market_regime_history.state_hash` +
   `.stale_reason`, and the regime-config CHECK constraints** (027 — see §15).
+- **PR17 (028):** `dashboard_users` (PBKDF2 password hash, role, active) + `dashboard_sessions`
+  (sha256(token) only) — the dashboard login/session model (see §14a).
 
 Records kept permanently (unless explicitly configured otherwise): orders, fills,
 cycles, signals. High-volume tables (`api_call_logs`, `comparison_events`,
@@ -1557,77 +1559,144 @@ sets a small inbound frame read limit (it accepts no commands). Full dashboard
 authentication/authorization + a configurable WS-origin allowlist land with the
 config-editing PR (**PR17**). See DEPLOY.md §3a.
 
-## 14a. Dashboard config editing (implemented in PR17 — `internal/dashboard` + `internal/configstore`/`internal/regime` admin)
+## 14a. Dashboard login + config editing (implemented in PR17 — `internal/dashboard` + `internal/configstore` admin)
 
-PR17 adds **authenticated, authorized, versioned, audited, validated** editing of the
-DB-backed operational config. It still **does not trade** — there is no place/cancel/
-cycle/order/queue/credential mutation route; only config rows change, through the
-versioned-write path.
+PR17 adds a **real login/session system** and **authenticated, authorized, versioned,
+audited, validated, concurrency-safe** editing of the DB-backed operational config. It
+still **does not trade** — there is no place/cancel, and no cycle/order/queue/lock/
+credential mutation route; only config rows change, through the versioned-write path.
 
-**Authentication (required before any mutation).** Every mutating route is wrapped by
-`requireConfigOperator`: it needs an `Authorization: Bearer <token>` whose **SHA-256
-hash** matches an enabled `dashboard_tokens` row (migration 017 — only the hash is
-stored, never the plaintext). No token / bad token → **401**. Read views stay open
-(local, read-only). Tokens are provisioned out-of-band (an admin inserts a hashed
-token); a token-management UI is later.
+**Login + sessions.** A small set of trusted internal **users** (`dashboard_users`,
+migration 028): `username`, a salted **PBKDF2-HMAC-SHA256** `password_hash` (never
+plaintext), `role`, `active`, `last_login_at`. `POST /login` verifies the password
+(constant-time) against an *enabled* user and starts a server-side session
+(`dashboard_sessions`): an opaque 256-bit random token is minted, only its **sha256 hash**
+is stored (never the token), with a `user_id`/`role`/`username` snapshot and `expires_at`.
+The raw token is returned as an **HttpOnly, SameSite=Lax, Secure-when-HTTPS** cookie
+(`[dashboard] secure_cookies`). `POST /logout` revokes the session. Bootstrap the first
+admin with `dashboard -create-user user:role` — the **password is read from a hidden TTY
+prompt (or stdin), never a command-line argument** (so it can't leak via shell history /
+`ps` / logs).
 
-**Authorization (roles).** `dashboard_tokens.role` ∈ `viewer` | `config_operator` |
-`credential_operator` | `admin`. Config editing requires `config_operator` or `admin`;
-a `viewer` is **403**. Credential and emergency-operator roles exist for later tooling
-— no dashboard user is treated as fully trusted.
+**Route protection + live user state.** Only `/healthz` and `POST /login` are
+unauthenticated. **Everything else — the UI (`/`), every read API (`/api/*`), the
+config-editing mutations, and the WebSocket (`/ws`) — requires a valid session** (401
+otherwise). Session resolution **joins `dashboard_users`** and reads the user's **current**
+role, requiring `active = 1`: so disabling a user (`active=0`) immediately breaks their
+existing sessions (→ 401), and a role change (e.g. admin→viewer or a promotion) takes effect
+on the very next request **without a re-login** — no stale role snapshot from the session
+row is ever trusted.
 
-**Versioned write flow (no silent changes).** Each edit runs in ONE transaction:
-activate a new `config_version` (superseding the prior active one), update only the
-provided fields, and write a `config_change_audit` row **per changed field**
-(config_version, entity_type, entity_id, field, old_value, new_value, `changed_by` =
-the **authenticated** operator, reason from the request, timestamp). The new
-`config_version` is stamped on the edited row where the table has the column
-(symbol_configs/exchange_configs/regime baskets); `exchange_markets` has no such column
-so the version lives on `config_versions` + the audit row. An edit with no real change
-→ 400 (`ErrNoChanges`).
+**Roles.** `viewer` | `config_operator` | `admin` (rank-ordered). Read routes need any
+logged-in role; config editing needs **`config_operator`+** (a `viewer` editing → **403**);
+**high-risk** flag changes need **`admin`** (see below). `requireRole` composes over
+`requireSession` (401 first, then 403).
+
+**Optimistic concurrency + single-active invariant (no lost updates).** Every edit body
+carries `expected_config_version`. In the edit transaction, configstore **locks ALL active
+`config_version` rows `FOR UPDATE`** (no `LIMIT`) and requires **exactly one**: zero →
+`ErrNoActiveVersion`, **two-or-more → `ErrMultipleActiveVersions`** (→ 409, edit refused —
+no new version, no config change, no misleading audit — rather than silently picking one),
+one → compare to `expected_config_version`. A mismatch → `ErrStaleConfigVersion` → **409
+Conflict** (tx rolls back, previous version stays active). Concurrent editors who both
+loaded *V* are serialized by the row lock: exactly one commits (activating *V+1*), the loser
+re-reads *V+1 ≠ V* and gets 409 — two tabs can never silently overwrite each other. The
+target config row is also locked `FOR UPDATE`. A transient InnoDB deadlock on this hot row
+is retried (`withTxRetry`) so the loser converges to a clean 409, never a 500. A
+missing/zero `expected_config_version` is rejected (400 — mandatory).
+
+**Trading ⟹ sell-management (invariant).** `enabled_for_trading=true` while
+`enabled_for_sell_manage=false` is **rejected (400)** — enforced on the *effective*
+post-change state, so it also blocks "disable sell-manage" on a market whose trading stays
+on. Otherwise the engine could open new buys the sell manager ignores, stranding inventory.
+So to turn sell management off you must also turn trading off in the same edit. Safe
+combinations: `trading=false, sell_manage=true` (stop new buys, keep managing open cycles)
+and `trading=false, sell_manage=false` (allowed only with no open exposure, below).
+
+**Sell-management disable guard (execution safety).** Disabling `enabled_for_sell_manage`
+for a market that still has **open/unresolved exposure** — any cycle in
+`BUY_REQUEST_QUEUED`/`BUY_SUBMITTED`/`BUY_PARTIALLY_FILLED`/`BUY_FILLED`/
+`SELL_REQUEST_QUEUED`/`SELL_SUBMITTED`/`SELL_REPRICE_PENDING`/`SELL_PARTIALLY_FILLED`/
+`SELL_FILLED`/`CANCEL_PENDING`/`NEEDS_RECONCILE` — is rejected inside the transaction with
+`ErrSellManageExposed` → **409** ("sell management cannot be disabled while open exposure
+exists"), leaving the flag/version/lock unchanged. The queued/submitted **buy** states are
+deliberately included: a buy that is queued or submitted can fill at any moment, so
+disabling sell management first would strand that fresh inventory. Additionally, the two
+**high-risk** transitions — **enabling trading** (`enabled_for_trading=true`) or **disabling
+sell management** (`enabled_for_sell_manage=false`) — require the **admin** role
+(config_operator → 403).
+
+**Buy creation re-checks the LIVE flags on the SAME row, in the SAME lock order (race- and
+deadlock-free).** Both paths take locks in ONE order — **`exchange_markets` row first, then
+the active `config_version`**: `buyflow.CreateBuyCycle` step 0 re-reads the market row
+`FOR UPDATE` (then takes the `config_versions` FK lock when it inserts the cycle with
+`config_version`), and `UpdateMarketFlags` locks the market row `FOR UPDATE` before its
+active-version lock. Matching the order avoids the ABBA deadlock a config edit and a buy
+would otherwise hit. `CreateBuyCycle` requires **both** `enabled_for_trading` and
+`enabled_for_sell_manage` true, else `ErrMarketNotTradable` (a clean engine no-op — no
+cycle/order/request/lock/audit). So they serialize cleanly: if a config edit disabled
+trading/sell-management first, the buy sees it and refuses (a stale in-memory config can't
+open a buy after the DB flags were turned off); if the buy commits first, the edit sees the
+open cycle and its exposure guard rejects the disable. A concurrency test drives the real
+`UpdateMarketFlags` against `CreateBuyCycle` over many rounds (both orderings) with zero
+deadlocks and zero orphans.
+
+**Validation — offsets can't make a non-positive price.** `sell_offset_bps` and
+`maker_price_offset_bps` are bounded to **[0, 10000)**: the price is
+`reference × (1 − offset/10000)`, so `10000` → zero and `>10000` → negative, which would
+break sell/maker-buy creation on already-acquired inventory. (Plus the earlier rules:
+min_spread≥0, buy_size>0, unit∈{base,quote}, timeouts>0, retries≥0, taker_mode=ASK, fees≥0.)
+
+**Fee edits — no swallowed errors, ownership validated, no-op-safe, audited by market.**
+`UpsertFee` treats only `sql.ErrNoRows` as "no previous fee"; any other read/scan error aborts
+the tx **before** activating a version, writing a fee, or auditing. A market-specific fee's
+`exchange_market_id` must **belong to** the given `exchange_id` (verified in-tx) — a market of
+another exchange is rejected (400) with no version/audit. **No-op detection is by DECIMAL
+value** (`0.001` == `0.00100000`): resubmitting unchanged fees returns `ErrNoChanges` (400)
+**before** activating a version — no version/fee/audit, so it can't advance the version and
+force a spurious `409` on another editor. Audit rows are written **per changed field only**
+(maker-only edit → one `maker_fee` row). The audit **entity uniquely identifies what changed**:
+an exchange-wide default fee is `entity_type=exchange_default_fee`, `entity_id=exchange_id`; a
+market-specific fee is `entity_type=exchange_market_fee`, `entity_id=exchange_market_id` (so two
+markets of one exchange get distinct audit rows; the exchange id travels in the reason).
+
+**Mandatory reason + trustworthy audit.** Every edit requires a **non-empty, non-whitespace
+`reason`** (else 400). Each edit runs in ONE transaction: activate a new `config_version`,
+update only provided fields, and write a `config_change_audit` row **per changed field**
+(config_version, entity_type, entity_id, field, **real** old_value/new_value, `changed_by`,
+reason, timestamp). **`changed_by` is ALWAYS the authenticated session user — never a
+client-supplied value**; a `changed_by` field in the body is rejected as an unknown field.
+The new `config_version` is stamped on the edited row where the table has the column
+(`symbol_configs`/`exchange_configs`/`exchange_fees`); `exchange_markets` has none, so the
+version lives on `config_versions` + audit. An edit with no real change → 400 (`ErrNoChanges`).
+
+**Strict JSON parsing.** Bodies are decoded with `DisallowUnknownFields()` and must contain
+**exactly one** JSON object — a second decode must be `io.EOF`, so a trailing object or
+trailing garbage → 400. Body size is bounded.
 
 **Validation before write (→ 400).** `min_spread_bps ≥ 0`; `buy_size > 0`;
-`buy_size_unit ∈ {base,quote}`; `sell_offset_bps ≥ 0`; `reprice_interval_seconds ≥ 0`;
-`order_timeout_ms > 0`; retries ≥ 0; `maker_attempts_before_taker ≥ 0`;
-`maker_signal_window_seconds > 0` (esp. when maker-first is enabled);
-`maker_wait_before_cancel_ms ≥ 0`; `max_taker_slippage_bps ≥ 0`; `taker_price_mode =
-ASK`; exchange `max_concurrent_requests > 0`, `request_timeout_ms > 0`; fees
-non-negative; regime thresholds ordered `0 ≤ neutral ≤ moderate ≤ strong`; basket
-update interval > 0; symbol/timeframe weights > 0.
+`buy_size_unit ∈ {base,quote}`; **`0 ≤ sell_offset_bps < 10000`** and
+**`0 ≤ maker_price_offset_bps < 10000`** (≥10000 → zero/negative price);
+`reprice_interval_seconds ≥ 0`; `order_timeout_ms > 0`; retries ≥ 0; maker fields sane;
+`taker_price_mode = ASK`; exchange `max_concurrent_requests > 0`, `request_timeout_ms > 0`;
+fees non-negative. Enable-flag hierarchy `enabled_for_trading ⊆ enabled_for_signal ⊆
+enabled_for_collection` enforced, **plus the `enabled_for_trading ⟹ enabled_for_sell_manage`
+invariant** — trading may not stay on while sell management is off (disabling trading alone
+still keeps managing open cycles).
 
-**Enable-flag hierarchy (enforced).** `enabled_for_trading ⊆ enabled_for_signal ⊆
-enabled_for_collection` — enabling trading without signal, or signal without
-collection, is rejected (400). `enabled_for_sell_manage` is **independent** so existing
-cycles keep being managed even when new-cycle trading is turned off (disabling trading
-never stops sell management of open cycles).
+**Editable surfaces (POST, config_operator+):** symbol config (`/api/config/symbol/{em}`),
+market flags (`/api/config/market/{em}/flags`), exchange config (`/api/config/exchange/{ex}`),
+fees (`/api/config/fee`). Read: audit history `GET /api/audit`, current user `GET /api/me`.
+(Regime-basket editing and a credential-editing surface are deferred to their own later PRs
+— PR17 ships no route for them, and there is NO order/cycle/queue/lock/credential mutation.)
 
-**Editable surfaces.** Symbol config (`POST /api/config/symbol/{em}`) — spread/size/
-sell-offset/reprice/maker-taker/IOC-wait/slippage/timeouts; market flags (`/market/{em}/
-flags`); exchange config (`/exchange/{ex}`) — concurrency/timeout/retries/backoff/rate;
-fees (`/fee`) — maker/taker per exchange or market default; regime baskets
-(`/regime/basket/{id}` + `/symbol` + `/timeframe`) — name/enabled/thresholds/interval/
-symbols+weights/timeframes+weights. Audit history at `GET /api/audit`.
+**Hot reload (no restart).** Services pick edits up through their periodic reloads
+(trade-engine `configstore.Cache`), so edits apply without restarting any service. Active
+cycles keep their **stamped `config_version`** and are never rewritten; new cycles use the
+new active version.
 
-**Credential editing — DEFERRED to a dedicated PR.** It is the riskiest surface
-(encryption, key versioning, never-return/never-log plaintext), so PR17 ships **no**
-credential mutation route (the auth boundary trivially covers "no unauthenticated
-credential editing" — there is none). The `credential_operator` role is reserved for it.
-
-**Hot reload (no restart for normal edits).** Services pick edits up through their
-periodic reloads: the trade-engine's `configstore.Cache` reloads on its interval, and
-the regime calculator re-reads baskets each pass — so symbol/exchange/fee/flag/regime
-edits apply without restarting any service. (No edited setting requires a restart.)
-
-**Open-cycle safety.** Active cycles keep their **stamped `config_version`** and are
-never rewritten; new cycles use the new active version. Current sell management reads
-the live `MarketConfig` (so e.g. a `sell_offset_bps`/`reprice_interval` change affects
-open cycles' repricing immediately) while the cycle retains its config_version stamp for
-audit; per-cycle fully-stamped sell parameters are a documented future refinement.
-
-**WebSocket origin.** `AllowedWSOrigins` config tightens the WS `Origin` check to an
-allowlist (empty = permissive, only for local read-only use). The WS still carries **no
-commands**, so it can't affect trading regardless; config editing is HTTP + token, not
-WS.
+**WebSocket.** Unchanged from PR16 (snapshot-only, same-origin, `snapshot_error` on DB
+failure, no commands) — and now, like every other route, it requires a logged-in session.
 
 ## 15. Market regime (implemented in PR15 — `internal/regime`)
 
@@ -3006,26 +3075,84 @@ venue-free).
   continues (or stops if configured); each run writes a summary to app_logs (no
   secrets); a cancelled context stops cleanly.
 
-- **PR17 — auth before any mutation**: mutating routes require a bearer token whose
-  SHA-256 hash matches an enabled `dashboard_tokens` row (migration 017; plaintext never
-  stored). No/bad token → 401; insufficient role → 403. Roles: viewer/config_operator/
-  credential_operator/admin; config editing needs config_operator/admin. Reads stay open.
+- **PR17 correction — rebased onto accepted PR16 `58d2429`** (branch
+  `pr17-config-editing-login`); all PR16 read-only/deploy-safety fixes preserved.
+- **PR17 — real login/session auth (not bearer tokens)**: `dashboard_users` (PBKDF2-SHA256
+  password hash, role, active) + `dashboard_sessions` (only the sha256 hash of an opaque
+  256-bit token; never plaintext) (migration 028). `POST /login`/`POST /logout`; HttpOnly,
+  SameSite, Secure-when-HTTPS cookie. **Every** route except `/healthz` + `/login` (UI,
+  `/api/*` reads, mutations, `/ws`) requires a valid session → 401. Roles
+  viewer/config_operator/admin; editing needs config_operator+ (viewer → 403). Bootstrap:
+  `dashboard -create-user user:role` (password from a hidden prompt/stdin, never a CLI arg).
+- **PR17 — optimistic concurrency (no lost updates)**: every edit carries
+  `expected_config_version`; the tx locks the active config_version `FOR UPDATE` and 409s
+  (`ErrStaleConfigVersion`) on mismatch — two concurrent editors are serialized, exactly one
+  wins, the loser gets 409 (deadlock on the hot row is retried so it never 500s).
+- **PR17 — sell-management disable guard**: disabling `enabled_for_sell_manage` while the
+  market has open exposure (BUY_FILLED/…/SELL_*/CANCEL_PENDING/NEEDS_RECONCILE cycle) → 409
+  (`ErrSellManageExposed`). The two high-risk transitions (enable trading / disable
+  sell-manage) require the **admin** role.
 - **PR17 — every config edit is one versioned+audited+validated tx**: activate a new
   config_version, update only provided fields, write a config_change_audit row per field
-  (old/new/operator/reason). changed_by is the authenticated operator (never client
-  input). Validation rejections → 400; no-op edits → 400.
-- **PR17 — enable-flag hierarchy enforced** (trading ⊆ signal ⊆ collection); sell_manage
-  is independent so disabling trading never stops sell management of open cycles.
+  (real old/new/operator/reason). **`changed_by` is the authenticated session user, never
+  client input** (a body `changed_by` is rejected as an unknown field). A **non-empty reason
+  is mandatory** (else 400). Validation rejections → 400; no-op edits → 400.
+- **PR17 — strict JSON**: `DisallowUnknownFields()` + exactly one object (second decode must
+  be io.EOF) → trailing object/garbage/unknown field all 400.
+- **PR17 — enable-flag hierarchy enforced** (trading ⊆ signal ⊆ collection) **plus
+  trading ⟹ sell_manage** (correction round 3): trading can't stay on while sell management
+  is off. Disabling *trading alone* still keeps managing open cycles' sells; only turning
+  sell management off (which needs trading off too) is guarded by the exposure check.
 - **PR17 — `exchange_markets` has no config_version column**, so flag edits stamp the
-  version on config_versions + audit only (the row carries no stamp); other config tables
-  stamp it on the row.
-- **PR17 — credential editing deferred** to a dedicated PR (encryption/key-version/
-  never-leak); no credential route ships, so the auth boundary trivially covers it.
-- **PR17 — hot reload via existing periodic reloads** (configstore.Cache + regime
-  LoadBaskets); no service restart for normal config edits. Active cycles keep their
-  stamped config_version and are never rewritten.
-- **PR17 — WS origin allowlist** (`AllowedWSOrigins`) added; the WS remains command-free
-  (read-only), so it can't be a config-editing vector.
+  version on config_versions + audit only; other config tables stamp it on the row.
+- **PR17 — no order/cycle/queue/lock/credential mutation**: editable surfaces are only
+  symbol/market-flags/exchange/fee config via the versioned configstore path; regime-basket
+  editing + a credential-editing surface are deferred to their own later PRs.
+- **PR17 — hot reload via existing periodic reloads** (configstore.Cache); no service
+  restart for normal config edits. Active cycles keep their stamped config_version.
+- **PR17 correction — sessions reflect LIVE user state**: session resolution joins
+  `dashboard_users` and reads the current `role`, requiring `active=1` — disabling a user
+  breaks their existing sessions (401) immediately, and a role change applies on the next
+  request without a re-login (no stale session-row snapshot is trusted).
+- **PR17 correction — password never on the command line**: `-create-user user:role` reads
+  the password from a hidden TTY prompt (or stdin), so it can't leak via history/`ps`/logs;
+  it is never in `os.Args`, never logged, and stored only as a PBKDF2 hash.
+- **PR17 correction — exposure guard includes queued/submitted buys**: disabling
+  sell-manage is blocked for `BUY_REQUEST_QUEUED`/`BUY_SUBMITTED` too (a queued/submitted
+  buy can fill and strand inventory), alongside the filled/sell/reconcile states.
+- **PR17 correction — multiple active versions fail safe**: the edit lock selects ALL
+  active `config_version` rows FOR UPDATE and returns `ErrMultipleActiveVersions` (409) on
+  2+, refusing to edit against an ambiguous config (no version/config/audit mutation).
+- **PR17 correction — `UpsertFee` hardening**: real previous-fee read errors are returned
+  (only `sql.ErrNoRows` is "no previous fee"), and a market-specific fee's
+  `exchange_market_id` must belong to its `exchange_id` (else 400) — no version/audit on
+  either rejection.
+- **PR17 correction (round 3) — trading ⟹ sell-management invariant**: `UpdateMarketFlags`
+  rejects (400) an effective state of `enabled_for_trading=true` + `enabled_for_sell_manage=false`
+  (so a market can never take new buys the sell manager ignores).
+- **PR17 correction — `CreateBuyCycle` re-checks the LIVE flags on the SAME row**: as step 0
+  in its tx it re-reads `exchange_markets FOR UPDATE` (the same row `UpdateMarketFlags` locks),
+  requiring both trading+sell-manage true else `ErrMarketNotTradable` (clean engine no-op) —
+  serializing the two so a stale cached config can't open a buy after the DB flags were
+  disabled, and a disable can't slip past an in-flight buy.
+- **PR17 correction — offset upper bounds**: `sell_offset_bps` and `maker_price_offset_bps`
+  bounded to [0, 10000) (≥10000 would make the price zero/negative and break sell/maker-buy
+  creation on already-acquired inventory).
+- **PR17 correction — fee audit identifies the market**: exchange-wide default fee audits as
+  `exchange_default_fee`/`exchange_id`; a market-specific fee as `exchange_market_fee`/
+  `exchange_market_id` (distinct rows per market of one exchange).
+- **PR17 correction — docs**: dashboard package/UI text no longer claims the whole dashboard
+  is read-only; it states PR16 reads are read-only and PR17 adds authed/audited config edits.
+- **PR17 correction (round 4) — consistent lock order (no ABBA deadlock)**: `UpdateMarketFlags`
+  now locks the `exchange_markets` row FIRST, then the active config version — the SAME order
+  `CreateBuyCycle` uses (market row FOR UPDATE, then the `config_versions` FK lock via
+  `cycles.config_version`). A concurrency test runs the REAL `UpdateMarketFlags` against
+  `CreateBuyCycle` over many rounds (both orderings occur) with no deadlock reaching either
+  caller and no orphan cycle/order/request/lock.
+- **PR17 correction — fee no-op is `ErrNoChanges`**: `UpsertFee` compares old vs new fees by
+  DECIMAL value (0.001 == 0.00100000); if neither changed it returns `ErrNoChanges` (400) BEFORE
+  activating a version — no version/fee/audit. Audit rows are written per CHANGED field only
+  (maker-only edit → one maker_fee row, etc.).
 
 - **PR16 correction — rebased onto accepted PR15 `1996b07`** (branch
   `pr16-dashboard-readonly-errors`); PR14/PR15 fixes and the invariant scripts are
@@ -3370,7 +3497,7 @@ venue-free).
 | PR14 | `pr14-health-monitor-readonly-private` | **in review** | Cut from accepted PR13 (`pr13-balance-sync-per-exchange`, `3b110ed`); PR11–PR13 fixes preserved (sell-rejection-keeps-lock, executor empty-id boundary, reconciler safe-close guards incl. stored REJECTED/FAILED, per-exchange balance cadence, real read-only balance clients, failed-sync-doesn't-zero, missing-asset-not-zeroed) and invariant scripts (`scripts/check-critical-invariants.sh`, `scripts/local-dryrun-check.sh`) intact — full sweep green. **Correction (#3):** **private health is wired read-only (Option A)**, consistent with PR13 balance-sync — `cmd/health-monitor` builds the authenticated probe via `Builder.BuildPrivate` → `Provider.ProbePrivateHealth(code, BalanceReader)`; the narrow read-only `BalanceReader` makes place/cancel unreachable (tested `credentials.TestProbePrivateHealthIsReadOnly`); an exchange with no active credential / no master key falls back to public-only with `private_status` UNKNOWN — a **deliberate safe fallback, not an accidental omission**; stale/contradictory "private accidentally missing / wired in a later PR" doc + comments removed. **Correction (round 2):** the continuous private probe must NOT invalidate a credential on a transient error — new `Provider.ProbePrivateHealth` marks `status='invalid'` ONLY on a definite auth error (`isDefiniteAuthError` = `execution.ErrAuthFailed` or `NormalizedAPIError` category `auth`); timeout/network/rate-limit/429/exchange-5xx/unknown leave the credential `active` and untouched (surfacing only as private health UNAVAILABLE/DEGRADED/RATE_LIMITED, `last_success_at` preserved), so a brief incident can't permanently disable a valid credential (`BuildPrivate` builds only from `active`). Strict `Provider.Validate` retained for one-shot operator checks. Tests: `TestProbePrivateHealthCredentialPolicy` (auth→invalid; timeout/ack-timeout/network/rate/5xx/unknown→active), `TestProbePrivateHealthSuccessAfterTemporaryFailure`, `TestProbePrivateHealthIsReadOnly`, `TestValidateStillStrictForManualCheck`, offline `TestIsDefiniteAuthError`. `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read via `Validate` when creds exist) — no place/cancel reachable (reflection guard `TestMonitorHoldsNoOrderClient`); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
 | PR15 | `pr15-market-regime-history-validation` | **in review** | Cut from accepted PR14 (`pr14-health-monitor-readonly-private`, `9f76cc4`); PR11–PR14 fixes preserved (sell-rejection-keeps-lock, executor empty-id, reconciler safe-close incl. stored REJECTED/FAILED, per-exchange balance cadence + real read-only clients, health-monitor read-only private health that never invalidates a credential on a transient error) + invariant scripts intact — full sweep green. **Corrections:** (#2) `market_regime_history` now stores `state_hash` + `stale_reason` (migration 027) and `WriteResult` inserts them, so history is self-describing (a changed UNKNOWN reason is visible, not just "something changed"); a history row's `state_hash` equals current's at that point (`TestHistoryStoresStateHashAndStaleReason`). (#3) `WriteResult` no longer ignores `SELECT state_hash` errors — only `sql.ErrNoRows` → changed; any other error is returned, never a misleading insert (`TestWriteResultReturnsRealSelectError`). (#4) regime config validated in BOTH layers — migration 027 CHECK constraints (symbol/timeframe weight>0, timeframe seconds>0, interval/neutral>=0, moderate>=neutral, strong>=moderate) + `Basket.Validate` called by `LoadBaskets` returning `ErrInvalidBasketConfig` so invalid config yields no regime (`TestBasketValidate`, `TestRegimeConfigCheckConstraints`, `TestLoadBasketsRejectsInvalidConfig`). `internal/regime` + migration 015/016/027 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue/lock writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure, decimal math): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` appended per distinct FULL-FIELD `state_hash` (direction/level/confidence/score/timeframe_scores/symbol_contributions/stale_reason/config_version); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix + config-validation matrix + no-order-client guard; gated (load config, current-upsert + history-on-change + full-evolution + state_hash/stale_reason stored, select-error-returned, config CHECK rejections, LoadBaskets rejects invalid, calculator samples+persists, redis-miss no-crash/no-fabricate). |
 | PR16 | `pr16-dashboard-readonly-errors` | **in review** | Cut from accepted PR15 (`pr15-market-regime-history-validation`, `1996b07`); PR14/PR15 fixes preserved (health-monitor read-only private health that never invalidates a credential on a transient error; regime history state_hash/stale_reason + WriteResult select-error handling + config validation + migration 027) and invariant scripts intact — full sweep green. **Reconstructed as STRICTLY read-only:** the config-editing/auth/live/preflight/session/credential-admin handlers are **removed from PR16** (they belong to later PRs; config editing = PR17 with explicit safety controls), so `Handler()` registers ONLY GET routes. **Corrections:** (#6) `/api/cycles/{id}` error-checks EVERY sub-query (orders/fills/exchange_requests/cycle_state_events/order_events/symbol_locks/app_logs) → 500 on any failure, never a partial 200 (cycle-not-found → 404). (#7) `/api/config` error-checks every config query (markets/exchanges/fees/regime_baskets/active-version) → 500 on any failure, never incomplete config with 200. (#8) `app_logs` are masked before display (message + fields + any string), same defence-in-depth as `api_call_logs` — both the `/api/logs` endpoint and cycle-detail `logs`. `internal/dashboard` + `cmd/dashboard`: Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any POST/PUT/PATCH/DELETE is 405; no place/cancel/cycle/order/queue/lock/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot incl. regime baskets), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). **Round 2:** (1) `doc.go` + architecture no longer claim PR16 edits config — strictly read-only, config editing = PR17 (auth/authz/audit/validation). (2) WebSocket `CheckOrigin` is **same-origin only** (`sameOriginOnly`): foreign Origin → 403, missing Origin (non-browser) allowed + documented, malformed/opaque rejected — no more `CheckOrigin=true`. (3) `snapshot()` returns an error and checks EVERY query; any failure → generic `snapshot_error` event (raw DB details logged, never exposed), never a partial normal snapshot; `stale` normalized to bool (consistent with HTTP). WebSocket snapshot-only (open cycles/health/regime/balances) — drains + ignores incoming messages, no command handler. Separate binary (restart isolates). Tests: offline (no-order-client guard, exhaustive POST/PUT/PATCH/DELETE→405 over all routes, same-origin matrix, step_kind, mask-secrets) + gated (endpoints missing-data 200, seeded cycle detail + maker/taker + 404, cycle-detail 500-on-each-subquery-failure, /api/config 500-on-each-query-failure, app_logs masked + cycle-detail logs masked, ws foreign-origin-403/same-origin/missing-origin, ws snapshot_error-on-each-query-failure, ws stale-is-bool, ws-ignores-commands-no-mutation, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). |
-| PR17 | `pr17-config-editing` | **accepted** | `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + `internal/regime` (admin) + migration 017: authenticated, authorized, versioned, audited, validated config EDITING. Still no trading: no place/cancel/cycle/order/queue/credential mutation route. Auth = bearer token, SHA-256-hashed in `dashboard_tokens` (plaintext never stored); no/bad token → 401, insufficient role → 403. Roles viewer/config_operator/credential_operator/admin; editing needs config_operator/admin. Each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (old/new/changed_by=authenticated operator/reason). Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries/slippage sane, maker_window>0, taker_mode=ASK, fees≥0, regime thresholds ordered, weights>0) → 400; no-op → 400. Enable-flag hierarchy trading⊆signal⊆collection enforced; sell_manage independent (disabling trading never stops open-cycle sell mgmt). Editable: symbol config, market flags, exchange config, fees, regime basket/symbol/timeframe; `GET /api/audit`. exchange_markets has no config_version col → version on config_versions+audit only. Hot reload via existing configstore.Cache + regime LoadBaskets (no restart); active cycles keep stamped config_version (never rewritten). WS origin allowlist added (WS stays command-free). Credential editing deferred to a dedicated PR (no route ships). Tests: offline (symbol/exchange Validate matrices) + gated (unauth→401, viewer→403, config_operator versioned+audited symbol update, invalid→400, flag hierarchy 400/200, exchange+fee edits + negative-fee 400, regime basket edit + bad-ordering 400, audit endpoint, no-credential/no-trading mutation routes). |
+| PR17 | `pr17-config-editing-login` | **in review** | Cut from accepted PR16 (`pr16-dashboard-readonly-errors`, `58d2429`); all PR16 read-only/deploy-safety fixes preserved. `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + migration 028: **real login/session auth** + authenticated, authorized, versioned, audited, validated, **concurrency-safe** config EDITING. Still no trading: no place/cancel, and no cycle/order/queue/lock/credential mutation route. **Login:** `dashboard_users` (PBKDF2-SHA256 password hash — never plaintext — role, active, last_login_at) + `dashboard_sessions` (only sha256(token) stored, never the token; expiry/revoke). `POST /login`/`/logout`; HttpOnly + SameSite + Secure-when-HTTPS cookie. EVERY route except `/healthz`+`/login` (UI, `/api/*`, mutations, `/ws`) needs a valid session → 401. Roles viewer/config_operator/admin; editing needs config_operator+ (viewer → 403). Session resolution **joins dashboard_users** for the LIVE role + `active=1`, so disabling a user breaks their existing sessions (401) and role changes apply without a re-login. Bootstrap via `dashboard -create-user user:role` (**password read from a hidden prompt/stdin, never a CLI arg**). **Optimistic concurrency + single-active:** every edit body carries `expected_config_version`; the tx locks ALL active config_version rows FOR UPDATE (no LIMIT) + the target row FOR UPDATE, requiring exactly one active (0→ErrNoActiveVersion, **2+→ErrMultipleActiveVersions/409**, refusing to edit) and 409s on version mismatch (`ErrStaleConfigVersion`) — concurrent editors serialized (exactly one wins, loser 409; deadlock retried so never 500). **Sell-manage guard:** disabling `enabled_for_sell_manage` with open exposure (**BUY_REQUEST_QUEUED/BUY_SUBMITTED**/BUY_PARTIALLY_FILLED/BUY_FILLED/SELL_*/CANCEL_PENDING/NEEDS_RECONCILE) → 409 (`ErrSellManageExposed`); high-risk switches (enable trading / disable sell-manage) require admin. **Fees:** `UpsertFee` returns real previous-fee read errors (only ErrNoRows = none) and validates `exchange_market_id` belongs to `exchange_id` (else 400) — no version/audit on rejection. **Audit:** each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (real old/new/reason/`changed_by`=authenticated session user, NEVER client input); **non-empty reason mandatory** (else 400). **Strict JSON:** DisallowUnknownFields + exactly-one-object (2nd decode io.EOF) → trailing/garbage/unknown → 400. Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries sane, taker_mode=ASK, fees≥0) → 400; enable-flag hierarchy trading⊆signal⊆collection; no-op → 400. Editable: symbol config, market flags, exchange config, fees; read `GET /api/audit`, `/api/me`. exchange_markets has no config_version col → version on config_versions+audit. Hot reload via configstore.Cache; active cycles keep stamped config_version. Regime + credential editing deferred to later PRs. Tests: offline (password hash round-trip, role ranking, 405 matrix, same-origin) + gated (login valid/wrong-pw/disabled/unknown, logout invalidates, all routes 401 w/o login, WS 401 w/o login, viewer read-not-edit, secrets-not-plaintext; versioned+audited edit w/ session changed_by + real old value, stale→409 + rollback leaves active, concurrent→1 ok/1 conflict + 1 active version, sell-manage disable blocked-by-exposure(3 states)/allowed-no-exposure, high-risk-requires-admin, reason mandatory + can't-impersonate, strict-JSON trailing/garbage/unknown; disabled-user-loses-session, role-change-applies-to-existing-session, multiple-active-versions→409-no-mutation, UpsertFee-returns-read-error, fee-market-ownership-validated; trading-requires-sell_manage(400), offset-bps-upper-bound[0,10000), fee-audit-identifies-market vs exchange, and buyflow CreateBuyCycle-rejects-when-trading/sell-manage-disabled + real-UpdateMarketFlags-concurrency (both orderings, no deadlock/orphan over 25 rounds); fee no-op→ErrNoChanges (decimal-equal) + per-changed-field audit). |
 | PR18 | `pr18-retention-worker` | **accepted** | `internal/retention` + `cmd/retention-worker` + migration 018: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable even if a retention_settings row names them. Config-driven (enabled/retention_days/batch_size/max_batches_per_run/pause_ms); missing/retention_days≤0 → do-nothing (never guessed), disabled → skip. Batched DELETE … WHERE ts<cutoff LIMIT batch_size (bounded by max_batches, short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. Single-run GET_LOCK advisory lock (can't acquire → clean exit, no deletes). One table's failure recorded + run continues; cancelled ctx stops cleanly; run summary written to app_logs (no secrets). No Redis, no exchange calls. Binary runs once on startup then every 6h; `-dry-run` flag (no runtime env var) for dry-run. Tests: offline whitelist/permanent guard + gated (missing-config no-op, disabled no-op, dry-run no-op+cutoff+estimate, batch-delete only-old + recent-preserved, batch_size+max_batches honored, permanent-table never targeted, one-table-failure recorded+continue, advisory-lock blocks concurrent, run recorded to app_logs, ctx-cancel clean). |
 | PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
 | PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |

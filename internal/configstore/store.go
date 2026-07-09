@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/shopspring/decimal"
 )
 
@@ -402,6 +403,31 @@ func (s *Store) withTx(ctx context.Context, fn func(*sql.Tx) error) (retErr erro
 		return err
 	}
 	return tx.Commit()
+}
+
+// withTxRetry runs fn in a transaction, retrying on a transient InnoDB deadlock / lock-wait
+// timeout (the whole tx is rolled back, so a retry is safe). Config edits contend on the
+// active config_version row (SELECT ... FOR UPDATE); under concurrency InnoDB may pick a
+// deadlock victim instead of cleanly blocking. Retrying converges: the loser re-runs, now
+// sees the winner's new active version, and returns ErrStaleConfigVersion (→ 409) rather
+// than a 500. Non-transient errors are returned immediately.
+func (s *Store) withTxRetry(ctx context.Context, fn func(*sql.Tx) error) error {
+	const attempts = 5
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = s.withTx(ctx, fn)
+		if !isRetryableTxErr(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// isRetryableTxErr reports whether err is a transient InnoDB deadlock (1213) or lock-wait
+// timeout (1205) worth retrying.
+func isRetryableTxErr(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205)
 }
 
 func nullStr(s string) any {

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -24,9 +26,11 @@ import (
 // database that it can freely break (rename a table away) and restore.
 
 type isoFix struct {
-	t  *testing.T
-	db *sql.DB
-	ts *httptest.Server
+	t      *testing.T
+	db     *sql.DB
+	srv    *Server
+	ts     *httptest.Server
+	client *http.Client // authenticated as an admin on this isolated DB
 }
 
 func setupIso(t *testing.T) *isoFix {
@@ -63,20 +67,47 @@ func setupIso(t *testing.T) *isoFix {
 	if _, err := migrate.Run(context.Background(), db, migrate.FS); err != nil {
 		t.Fatalf("migrate throwaway db: %v", err)
 	}
-	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour})
+	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour, SessionTTL: time.Hour})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close(); db.Close() })
-	return &isoFix{t: t, db: db, ts: ts}
+	f := &isoFix{t: t, db: db, srv: srv, ts: ts}
+	// Authenticate an admin (all routes require a session under PR17).
+	if _, err := srv.CreateUser(context.Background(), "isoadmin", "password123", RoleAdmin); err != nil {
+		t.Fatalf("create iso admin: %v", err)
+	}
+	jar, _ := cookiejar.New(nil)
+	f.client = &http.Client{Jar: jar}
+	resp, err := f.client.Post(ts.URL+"/login", "application/json", strings.NewReader(`{"username":"isoadmin","password":"password123"}`))
+	if err != nil {
+		t.Fatalf("iso login: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("iso login = %d, want 200", resp.StatusCode)
+	}
+	return f
 }
 
 func (f *isoFix) statusOf(path string) int {
 	f.t.Helper()
-	resp, err := http.Get(f.ts.URL + path)
+	resp, err := f.client.Get(f.ts.URL + path)
 	if err != nil {
 		f.t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode
+}
+
+// wsHeader returns the WebSocket dial header carrying the authenticated session cookie.
+func (f *isoFix) wsHeader() http.Header {
+	h := http.Header{}
+	u, _ := url.Parse(f.ts.URL)
+	for _, ck := range f.client.Jar.Cookies(u) {
+		if ck.Name == sessionCookie {
+			h.Set("Cookie", sessionCookie+"="+ck.Value)
+		}
+	}
+	return h
 }
 
 // breakTable renames a table away (so any query against it errors) for the duration of fn,
@@ -227,8 +258,9 @@ func TestWebSocketOriginEnforced(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(f.ts.URL, "http") + "/ws"
 	host := strings.TrimPrefix(f.ts.URL, "http://") // 127.0.0.1:port
 
+	// All dials carry a valid session (origin is checked AFTER the session gate).
 	// Foreign origin -> rejected with 403.
-	fh := http.Header{}
+	fh := f.wsHeader(f.client)
 	fh.Set("Origin", "http://evil.example.com")
 	if c, resp, err := websocket.DefaultDialer.Dial(wsURL, fh); err == nil {
 		c.Close()
@@ -238,7 +270,7 @@ func TestWebSocketOriginEnforced(t *testing.T) {
 	}
 
 	// Same origin -> allowed.
-	sh := http.Header{}
+	sh := f.wsHeader(f.client)
 	sh.Set("Origin", "http://"+host)
 	if c, _, err := websocket.DefaultDialer.Dial(wsURL, sh); err != nil {
 		t.Errorf("same-origin should be allowed, got %v", err)
@@ -247,7 +279,7 @@ func TestWebSocketOriginEnforced(t *testing.T) {
 	}
 
 	// Missing Origin -> allowed (non-browser client; documented behaviour).
-	if c, _, err := websocket.DefaultDialer.Dial(wsURL, nil); err != nil {
+	if c, _, err := websocket.DefaultDialer.Dial(wsURL, f.wsHeader(f.client)); err != nil {
 		t.Errorf("missing Origin should be allowed (non-browser), got %v", err)
 	} else {
 		c.Close()
@@ -265,7 +297,7 @@ func TestWebSocketSnapshotDBErrors(t *testing.T) {
 			f := setupIso(t)
 			f.breakTable(tbl, func() {
 				wsURL := "ws" + strings.TrimPrefix(f.ts.URL, "http") + "/ws"
-				conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+				conn, _, err := websocket.DefaultDialer.Dial(wsURL, f.wsHeader())
 				if err != nil {
 					t.Fatalf("ws dial: %v", err)
 				}
@@ -296,7 +328,7 @@ func TestWebSocketSnapshotStaleIsBool(t *testing.T) {
 	f.exec("INSERT INTO wallet_balances_current (exchange_id, asset, available, locked, total, last_seen_at) VALUES (?, ?, '2', '0', '2', NOW(6) - INTERVAL 2 HOUR)", exID, asset)
 
 	wsURL := "ws" + strings.TrimPrefix(f.ts.URL, "http") + "/ws"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, f.wsHeader(f.client))
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
@@ -335,7 +367,7 @@ func TestWebSocketIgnoresCommands(t *testing.T) {
 	f.db.QueryRow("SELECT state FROM cycles WHERE id=?", cyc).Scan(&beforeState)
 
 	url := "ws" + strings.TrimPrefix(f.ts.URL, "http") + "/ws"
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(url, f.wsHeader(f.client))
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}

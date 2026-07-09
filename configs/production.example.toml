@@ -48,8 +48,19 @@ pool_size = 0                      # 0 = default 30
 # an AUTHENTICATED reverse proxy. Do NOT publish port 8080 directly to an untrusted network.
 #   - Docker: publish loopback-only  ->  127.0.0.1:8080:8080   (NEVER 0.0.0.0:8080:8080
 #     unless a trusted/authenticated boundary — VPN or auth proxy — sits in front).
-# Authenticated + audited operator/config-editing capabilities arrive in PR17.
+# PR17 adds LOGIN: the UI, read APIs, config-editing, and the WebSocket all require a
+# logged-in session (only /healthz and /login are open). Bootstrap the first admin with
+# (the password is entered at a hidden prompt or piped via stdin — NEVER on the command
+# line, so it can't leak via shell history / ps / logs):
+#   ./bin/dashboard -config configs/config.toml -create-user admin:admin
+# Passwords are stored PBKDF2-hashed; session tokens are stored hashed. Even so, keep the
+# dashboard off untrusted networks (a login is not a substitute for network isolation).
 listen_addr = "127.0.0.1:8080"
+# Set true when the dashboard is served over HTTPS (e.g. behind a TLS reverse proxy), so the
+# session cookie carries the Secure flag. Leave false for a plain-HTTP localhost bind.
+secure_cookies = false
+# Login session lifetime in minutes (default 720 = 12h).
+session_ttl_minutes = 720
 
 [security]
 # Encryption master key for at-rest exchange credentials + API-log masking support.

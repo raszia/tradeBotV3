@@ -22,6 +22,12 @@ import (
 // active cycle" as a normal no-op (not a failure).
 var ErrSymbolLocked = symbollock.ErrSymbolLocked
 
+// ErrMarketNotTradable means the market's LIVE DB flags (read FOR UPDATE inside the
+// creation tx) no longer permit a new buy: enabled_for_trading and enabled_for_sell_manage
+// must BOTH be true. It is a normal no-op for the engine (like ErrSymbolLocked) — a config
+// edit that disabled trading/sell-management wins the race, so no cycle is created.
+var ErrMarketNotTradable = errors.New("buyflow: market not tradable (trading or sell-management disabled)")
+
 // buyPriority is the queue priority for entry-buy PLACE_ORDER requests (lower =
 // more urgent). Buys are time-sensitive, so they outrank routine GET_BALANCE polls.
 const buyPriority int16 = 50
@@ -68,6 +74,26 @@ func CreateBuyCycle(ctx context.Context, store *db.Store, q *queue.Queue, m conf
 		return out, errors.New("buyflow: non-positive ask")
 	}
 	err := store.WithTx(ctx, func(tx *sql.Tx) error {
+		// 0. Recheck the LIVE market flags inside the tx, locking the SAME exchange_markets
+		//    row that UpdateMarketFlags locks (SELECT ... FOR UPDATE). This closes the race
+		//    with dashboard config editing: whichever tx grabs the row first wins — if a
+		//    config edit disabled trading or sell-management first, we see it here and refuse
+		//    the buy (so a stale in-memory config can't create a buy after the DB flags were
+		//    turned off); if we grab it first, the edit blocks and then sees our open cycle.
+		//    BOTH flags must be true — never buy into a market whose sell-management is off.
+		var liveTrading, liveSellManage bool
+		if err := tx.QueryRowContext(ctx,
+			"SELECT enabled_for_trading, enabled_for_sell_manage FROM exchange_markets WHERE id=? FOR UPDATE",
+			m.ExchangeMarketID).Scan(&liveTrading, &liveSellManage); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrMarketNotTradable
+			}
+			return err
+		}
+		if !liveTrading || !liveSellManage {
+			return ErrMarketNotTradable
+		}
+
 		// 1. Continue the per-scope maker/taker attempt counter from the most recent
 		//    cycle within the rolling window (resets when the window has expired). The
 		//    symbol lock guarantees one creator per scope at a time, so this read

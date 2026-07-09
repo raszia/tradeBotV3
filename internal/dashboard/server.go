@@ -1,20 +1,24 @@
-// Package dashboard is the STRICTLY READ-ONLY operator dashboard (PR16): HTTP endpoints
-// for the initial load plus a WebSocket for live updates. It runs as its own binary,
-// holds only a *sql.DB (no exchange client, no queue — cannot trade by construction), and
-// exposes ONLY GET routes, so any POST/PUT/PATCH/DELETE is 405 Method Not Allowed. It
-// never places/cancels orders, and never mutates cycles/orders/queue/locks/config.
+// Package dashboard is the operator dashboard. It runs as its own binary and holds only a
+// *sql.DB + the versioned config store (no exchange client, no queue — it cannot trade by
+// construction: it never places/cancels orders and never mutates cycles/orders/queue/locks).
 //
-// Config EDITING is explicitly OUT OF SCOPE for PR16 — it is planned for PR17 and must be
-// implemented there with explicit safety controls (auth/authz, versioning, audit,
-// validation). PR16 only DISPLAYS config read-only.
+//   - PR16 READ views stay strictly read-only: the GET endpoints and the WebSocket only
+//     SELECT and display; any mutating method on a read route is 405.
+//   - PR17 adds AUTHENTICATED, AUTHORIZED, VERSIONED, VALIDATED, AUDITED config-editing
+//     routes (POST /api/config/*), plus login/session auth on every route. Config is the
+//     ONLY thing these mutate, and only through the config-store versioning path.
+//
+// Access: only /healthz and POST /login are unauthenticated; everything else (UI, /api/*
+// reads, config-editing mutations, /ws) requires a valid login session, and editing needs
+// the config_operator/admin role.
 //
 // DB errors are never swallowed into a partial 200: a failed sub-query in cycle-detail or
 // /api/config returns 500 (an operator must never misread a failed query as "no data").
 //
 // Secrets are never shown: it never reads the credentials table, and BOTH api-call-log and
 // app-log views are masked (defence-in-depth on already-masked storage). The WebSocket is
-// snapshot-only — it pushes periodic read-only snapshots and takes no commands from the
-// socket (incoming messages are drained and ignored).
+// snapshot-only (same-origin) — it pushes periodic read-only snapshots and takes no commands
+// from the socket (incoming messages are drained and ignored).
 package dashboard
 
 import (
@@ -25,6 +29,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"v3TradeBot/internal/configstore"
 )
 
 // Config tunes the dashboard.
@@ -33,6 +39,8 @@ type Config struct {
 	MaxLimit        int           // hard cap on ?limit= (default 500)
 	StaleBalanceAge time.Duration // a balance whose last_seen_at is older than this is flagged stale (default 5m)
 	WSInterval      time.Duration // live-update push cadence (default 2s)
+	SessionTTL      time.Duration // login session lifetime (default 12h)
+	SecureCookies   bool          // set the Secure flag on the session cookie (enable behind HTTPS)
 }
 
 func (c *Config) withDefaults() {
@@ -48,14 +56,20 @@ func (c *Config) withDefaults() {
 	if c.WSInterval <= 0 {
 		c.WSInterval = 2 * time.Second
 	}
+	if c.SessionTTL <= 0 {
+		c.SessionTTL = 12 * time.Hour
+	}
 }
 
-// Server is the read-only dashboard. It holds ONLY a database handle (+ config/log):
-// no exchange client and no queue, so it cannot trade by construction.
+// Server is the dashboard. It holds ONLY a database handle + the versioned config store
+// (+ config/log): no exchange client and no queue, so it cannot trade by construction.
+// PR16 read endpoints stay read-only; PR17 adds login/session auth + versioned+audited
+// config editing (never any order/cycle/queue/lock mutation).
 type Server struct {
-	db  *sql.DB
-	cfg Config
-	log *slog.Logger
+	db       *sql.DB
+	cfgStore *configstore.Store
+	cfg      Config
+	log      *slog.Logger
 }
 
 // New builds a Server.
@@ -64,40 +78,60 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{db: db, cfg: cfg, log: log}
+	s := &Server{db: db, cfg: cfg, log: log}
+	if db != nil {
+		s.cfgStore = configstore.New(db)
+	}
+	return s
 }
 
-// Handler returns the read-only route mux. Patterns are method-scoped to GET, so any
-// POST/PUT/DELETE/PATCH (e.g. an attempt to mutate config) gets 405 Method Not Allowed
-// — there is no mutating route on the dashboard at all.
+// Handler returns the route mux. Only /healthz and POST /login are unauthenticated;
+// EVERY other route (the UI, all /api/* reads, the config-editing mutations, and /ws)
+// requires a valid logged-in session (401 otherwise). Read routes are GET-only, so a
+// mutating method on them is 405; mutation is confined to the explicit POST /api/config/*
+// editing routes, which additionally require the config_operator or admin role (403
+// otherwise). No route places/cancels orders or mutates cycles/orders/queue/locks.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Open (no session): liveness + login.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("GET /", s.index)
+	mux.HandleFunc("POST /login", s.login)
+	mux.HandleFunc("POST /logout", s.requireSession(s.logout))
 
-	mux.HandleFunc("GET /api/cycles/open", s.openCycles)
-	mux.HandleFunc("GET /api/cycles/closed", s.closedCycles)
-	mux.HandleFunc("GET /api/cycles/{id}", s.cycleDetail)
-	mux.HandleFunc("GET /api/orders", s.orders)
-	mux.HandleFunc("GET /api/fills", s.fills)
-	mux.HandleFunc("GET /api/requests", s.requests)
-	mux.HandleFunc("GET /api/signals", s.signals)
-	mux.HandleFunc("GET /api/comparisons", s.comparisons)
-	mux.HandleFunc("GET /api/balances", s.balances)
-	mux.HandleFunc("GET /api/health", s.health)
-	mux.HandleFunc("GET /api/regime", s.regime)
-	mux.HandleFunc("GET /api/logs", s.appLogs)
-	mux.HandleFunc("GET /api/api-logs", s.apiLogs)
-	mux.HandleFunc("GET /api/config", s.config)
-	mux.HandleFunc("GET /ws", s.ws)
+	// Authenticated read views (any logged-in role).
+	mux.HandleFunc("GET /", s.requireSession(s.index))
+	mux.HandleFunc("GET /api/cycles/open", s.requireSession(s.openCycles))
+	mux.HandleFunc("GET /api/cycles/closed", s.requireSession(s.closedCycles))
+	mux.HandleFunc("GET /api/cycles/{id}", s.requireSession(s.cycleDetail))
+	mux.HandleFunc("GET /api/orders", s.requireSession(s.orders))
+	mux.HandleFunc("GET /api/fills", s.requireSession(s.fills))
+	mux.HandleFunc("GET /api/requests", s.requireSession(s.requests))
+	mux.HandleFunc("GET /api/signals", s.requireSession(s.signals))
+	mux.HandleFunc("GET /api/comparisons", s.requireSession(s.comparisons))
+	mux.HandleFunc("GET /api/balances", s.requireSession(s.balances))
+	mux.HandleFunc("GET /api/health", s.requireSession(s.health))
+	mux.HandleFunc("GET /api/regime", s.requireSession(s.regime))
+	mux.HandleFunc("GET /api/logs", s.requireSession(s.appLogs))
+	mux.HandleFunc("GET /api/api-logs", s.requireSession(s.apiLogs))
+	mux.HandleFunc("GET /api/config", s.requireSession(s.config))
+	mux.HandleFunc("GET /api/audit", s.requireSession(s.audit))
+	mux.HandleFunc("GET /api/me", s.requireSession(s.me))
+	mux.HandleFunc("GET /ws", s.requireSession(s.ws))
+
+	// Config EDITING (PR17): config_operator or admin. Versioned + audited + validated +
+	// optimistic-concurrency (expected_config_version). No order/cycle/queue/lock mutation.
+	mux.HandleFunc("POST /api/config/symbol/{id}", s.requireRole(RoleConfigOperator, s.editSymbolConfig))
+	mux.HandleFunc("POST /api/config/market/{id}/flags", s.requireRole(RoleConfigOperator, s.editMarketFlags))
+	mux.HandleFunc("POST /api/config/exchange/{id}", s.requireRole(RoleConfigOperator, s.editExchangeConfig))
+	mux.HandleFunc("POST /api/config/fee", s.requireRole(RoleConfigOperator, s.editFee))
 	return mux
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(`<!doctype html><meta charset=utf-8><title>v3TradeBot dashboard</title>
-<h1>v3TradeBot — read-only dashboard</h1>
-<p>Read-only JSON API. Endpoints under <code>/api/…</code>; live updates on <code>/ws</code>.</p>
+<h1>v3TradeBot — operator dashboard</h1>
+<p>Read-only views under <code>/api/…</code> + live updates on <code>/ws</code>; authenticated, audited config editing under <code>/api/config/…</code> (PR17). Log in at <code>/login</code>.</p>
 <ul>
 <li><a href="/api/cycles/open">/api/cycles/open</a></li>
 <li><a href="/api/balances">/api/balances</a></li>
@@ -350,7 +384,7 @@ LEFT JOIN symbol_configs sc ON sc.exchange_market_id=em.id ORDER BY em.id`)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active_version": version, "markets": markets, "exchanges": exch, "fees": fees, "regime_baskets": regime,
-		"note": "read-only display; config editing is PR17 scope (implemented with explicit safety controls)",
+		"note": "read-only snapshot; edit via POST /api/config/* (authenticated config_operator/admin, versioned + audited)",
 	})
 }
 

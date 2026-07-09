@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -91,10 +93,12 @@ func TestMaskSecrets(t *testing.T) {
 // ---- gated ----
 
 type dfix struct {
-	t   *testing.T
-	db  *sql.DB
-	ts  *httptest.Server
-	ctx context.Context
+	t      *testing.T
+	db     *sql.DB
+	srv    *Server
+	ts     *httptest.Server
+	ctx    context.Context
+	client *http.Client // authenticated as a fresh admin (so read tests just work)
 }
 
 func setupD(t *testing.T) *dfix {
@@ -114,15 +118,84 @@ func setupD(t *testing.T) *dfix {
 	if _, err := migrate.Run(ctx, db, migrate.FS); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour})
+	srv := New(db, nil, Config{DefaultLimit: 50, MaxLimit: 100, StaleBalanceAge: time.Hour, SessionTTL: time.Hour})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(func() { ts.Close(); db.Close() })
-	return &dfix{t: t, db: db, ts: ts, ctx: ctx}
+	f := &dfix{t: t, db: db, srv: srv, ts: ts, ctx: ctx}
+	// A default admin client so the (PR16) read-endpoint tests keep working under PR17 auth.
+	f.client = f.loginNewUser("admin", RoleAdmin)
+	return f
 }
 
-func (f *dfix) get(path string) (int, []map[string]any) {
+var userSeq int
+
+// uniqueUser returns a per-test-unique username so tests sharing the DB don't collide.
+func (f *dfix) uniqueUser(prefix string) string {
+	userSeq++
+	return fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixNano(), userSeq)
+}
+
+// newClient is an http.Client with its own cookie jar (unauthenticated).
+func (f *dfix) newClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Jar: jar}
+}
+
+// createUser makes a fresh user with the given role and returns (username, password).
+func (f *dfix) createUser(role string) (string, string) {
 	f.t.Helper()
-	resp, err := http.Get(f.ts.URL + path)
+	user, pass := f.uniqueUser(role), "password123"
+	if _, err := f.srv.CreateUser(f.ctx, user, pass, role); err != nil {
+		f.t.Fatalf("create user: %v", err)
+	}
+	return user, pass
+}
+
+// loginNewUser creates a user with the role and returns a client logged in as them.
+func (f *dfix) loginNewUser(prefix, role string) *http.Client {
+	f.t.Helper()
+	user, pass := f.uniqueUser(prefix), "password123"
+	if _, err := f.srv.CreateUser(f.ctx, user, pass, role); err != nil {
+		f.t.Fatalf("create user: %v", err)
+	}
+	c := f.newClient()
+	if code, _ := f.login(c, user, pass); code != http.StatusOK {
+		f.t.Fatalf("login as %s = %d, want 200", user, code)
+	}
+	return c
+}
+
+// login POSTs /login on client c; returns (status, body).
+func (f *dfix) login(c *http.Client, user, pass string) (int, map[string]any) {
+	f.t.Helper()
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, user, pass)
+	resp, err := c.Post(f.ts.URL+"/login", "application/json", strings.NewReader(body))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var obj map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&obj)
+	return resp.StatusCode, obj
+}
+
+// wsHeader returns the WebSocket dial header carrying c's session cookie (if any).
+func (f *dfix) wsHeader(c *http.Client) http.Header {
+	h := http.Header{}
+	u, _ := url.Parse(f.ts.URL)
+	for _, ck := range c.Jar.Cookies(u) {
+		if ck.Name == sessionCookie {
+			h.Set("Cookie", sessionCookie+"="+ck.Value)
+		}
+	}
+	return h
+}
+
+func (f *dfix) get(path string) (int, []map[string]any) { return f.getWith(f.client, path) }
+
+func (f *dfix) getWith(c *http.Client, path string) (int, []map[string]any) {
+	f.t.Helper()
+	resp, err := c.Get(f.ts.URL + path)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -132,9 +205,11 @@ func (f *dfix) get(path string) (int, []map[string]any) {
 	return resp.StatusCode, arr
 }
 
-func (f *dfix) getObj(path string) (int, map[string]any) {
+func (f *dfix) getObj(path string) (int, map[string]any) { return f.getObjWith(f.client, path) }
+
+func (f *dfix) getObjWith(c *http.Client, path string) (int, map[string]any) {
 	f.t.Helper()
-	resp, err := http.Get(f.ts.URL + path)
+	resp, err := c.Get(f.ts.URL + path)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -142,6 +217,26 @@ func (f *dfix) getObj(path string) (int, map[string]any) {
 	var obj map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&obj)
 	return resp.StatusCode, obj
+}
+
+// postJSON POSTs a raw JSON body on client c and returns (status, body).
+func (f *dfix) postJSON(c *http.Client, path, body string) (int, map[string]any) {
+	f.t.Helper()
+	resp, err := c.Post(f.ts.URL+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var obj map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&obj)
+	return resp.StatusCode, obj
+}
+
+// activeVersion returns the current active config_version id (0 if none).
+func (f *dfix) activeVersion() int64 {
+	var v sql.NullInt64
+	f.db.QueryRow("SELECT id FROM config_versions WHERE status='active' ORDER BY id DESC LIMIT 1").Scan(&v)
+	return v.Int64
 }
 
 func (f *dfix) exec(q string, a ...any) sql.Result {
@@ -310,7 +405,7 @@ func TestWebSocketLiveSnapshot(t *testing.T) {
 	f := setupD(t)
 	f.seedCycle()
 	url := "ws" + strings.TrimPrefix(f.ts.URL, "http") + "/ws"
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(url, f.wsHeader(f.client))
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
