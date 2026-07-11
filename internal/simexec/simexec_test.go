@@ -2,24 +2,63 @@ package simexec
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
+	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/shopspring/decimal"
 
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/execution"
+	"v3TradeBot/internal/migrate"
 )
 
-func req() execution.OrderRequest {
-	return execution.OrderRequest{ClientOrderID: "c1-buy", Symbol: "BTC/IRT", Side: "buy",
-		Quantity: decimal.RequireFromString("0.5"), LimitPrice: decimal.RequireFromString("100")}
+// ---- offline ----
+
+func TestDefaultScenarioIsFullFill(t *testing.T) {
+	if New(nil, "sim", "").scenario != FullFill {
+		t.Error("empty scenario should default to full fill")
+	}
 }
 
-// place + getOrder a scenario and return the final status (+ any errors).
-func run(t *testing.T, sc Scenario) (execution.OrderAck, error, execution.OrderStatus, error) {
+// ---- gated (the simulator is DB-backed: persistent, shared across instances) ----
+
+func setupSim(t *testing.T) *sql.DB {
 	t.Helper()
-	c := New("sim", sc)
+	dsn := os.Getenv("V3_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("set V3_TEST_MYSQL_DSN to run the simexec integration test")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+	if _, err := migrate.Run(context.Background(), db, migrate.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return db
+}
+
+// req builds a canonical order with a unique client-order-id (isolated on the shared DB).
+func req() execution.OrderRequest {
+	return execution.OrderRequest{
+		ClientOrderID: fmt.Sprintf("c%d-buy", time.Now().UnixNano()), Symbol: "BTC/IRT", Side: "buy",
+		Quantity: decimal.RequireFromString("0.5"), LimitPrice: decimal.RequireFromString("100"),
+	}
+}
+
+// run places + GetOrders a scenario and returns the final status (+ any errors).
+func run(t *testing.T, db *sql.DB, sc Scenario) (execution.OrderAck, error, execution.OrderStatus, error) {
+	t.Helper()
+	c := New(db, "sim", sc)
 	ack, perr := c.PlaceOrder(context.Background(), req())
 	if perr != nil {
 		return ack, perr, execution.OrderStatus{}, nil
@@ -29,28 +68,23 @@ func run(t *testing.T, sc Scenario) (execution.OrderAck, error, execution.OrderS
 }
 
 func TestScenarioOutcomes(t *testing.T) {
-	// Full fill.
-	if _, _, st, err := run(t, FullFill); err != nil || st.Status != execution.StateFilled || !st.FilledQty.Equal(decimal.RequireFromString("0.5")) {
+	db := setupSim(t)
+	if _, _, st, err := run(t, db, FullFill); err != nil || st.Status != execution.StateFilled || !st.FilledQty.Equal(decimal.RequireFromString("0.5")) {
 		t.Errorf("full fill = %+v err=%v", st, err)
 	}
-	// Partial fill (half).
-	if _, _, st, _ := run(t, PartialFill); st.Status != execution.StateCanceled || !st.FilledQty.Equal(decimal.RequireFromString("0.25")) {
-		t.Errorf("partial fill = %+v", st)
+	if _, _, st, _ := run(t, db, PartialFill); st.Status != execution.StatePartiallyCanceled || !st.FilledQty.Equal(decimal.RequireFromString("0.25")) {
+		t.Errorf("partial fill = %+v, want partially_canceled with 0.25 filled", st)
 	}
-	// Zero fill.
-	if _, _, st, _ := run(t, ZeroFill); st.Status != execution.StateCanceled || !st.FilledQty.IsZero() {
+	if _, _, st, _ := run(t, db, ZeroFill); st.Status != execution.StateCanceled || !st.FilledQty.IsZero() {
 		t.Errorf("zero fill = %+v", st)
 	}
-	// Cancel race -> full fill status.
-	if _, _, st, _ := run(t, CancelRace); st.Status != execution.StateFilled {
+	if _, _, st, _ := run(t, db, CancelRace); st.Status != execution.StateFilled {
 		t.Errorf("cancel race = %+v", st)
 	}
-	// Ambiguous -> GetOrder unknown.
-	if _, _, _, gerr := run(t, Ambiguous); !errors.Is(gerr, execution.ErrOrderUnknown) {
+	if _, _, _, gerr := run(t, db, Ambiguous); !errors.Is(gerr, execution.ErrOrderUnknown) {
 		t.Errorf("ambiguous getorder err = %v, want ErrOrderUnknown", gerr)
 	}
-	// Rejected -> PlaceOrder definite rejection.
-	if _, perr, _, _ := run(t, Rejected); perr == nil {
+	if _, perr, _, _ := run(t, db, Rejected); perr == nil {
 		t.Error("rejected should fail PlaceOrder")
 	} else {
 		var api *exchanges.NormalizedAPIError
@@ -58,16 +92,14 @@ func TestScenarioOutcomes(t *testing.T) {
 			t.Errorf("rejected err = %v, want a bad_request NormalizedAPIError", perr)
 		}
 	}
-	// Place timeout -> ambiguous ack timeout.
-	if _, perr, _, _ := run(t, PlaceTimeout); !errors.Is(perr, execution.ErrAckTimeout) {
+	if _, perr, _, _ := run(t, db, PlaceTimeout); !errors.Is(perr, execution.ErrAckTimeout) {
 		t.Errorf("place timeout err = %v, want ErrAckTimeout", perr)
 	}
 }
 
 func TestSatisfiesPrivateClientAndNoMutatingNetwork(t *testing.T) {
-	// Compile-time it satisfies the interface; here assert CancelOrder/GetBalances are
-	// pure (no error, no network) so dry-run never reaches a real exchange.
-	c := New("sim", FullFill)
+	db := setupSim(t)
+	c := New(db, "sim", FullFill)
 	if err := c.CancelOrder(context.Background(), "SIM-x"); err != nil {
 		t.Errorf("simulated cancel must not error: %v", err)
 	}
@@ -75,14 +107,31 @@ func TestSatisfiesPrivateClientAndNoMutatingNetwork(t *testing.T) {
 	if err != nil || len(bals) == 0 {
 		t.Errorf("simulated balances = %v, %v", bals, err)
 	}
-	// Unknown order id -> ErrOrderUnknown (not a panic / network call).
-	if _, err := c.GetOrder(context.Background(), "never-placed"); !errors.Is(err, execution.ErrOrderUnknown) {
+	if _, err := c.GetOrder(context.Background(), "never-placed-xyz"); !errors.Is(err, execution.ErrOrderUnknown) {
 		t.Errorf("unknown order = %v, want ErrOrderUnknown", err)
 	}
 }
 
-func TestDefaultScenarioIsFullFill(t *testing.T) {
-	if New("sim", "").scenario != FullFill {
-		t.Error("empty scenario should default to full fill")
+// TestPersistedOrderVisibleToNewInstance proves the fix for cross-instance/restart: an order
+// placed by client A is resolvable by a SEPARATELY-constructed client B (a different Client
+// value, as a new process/instance would build) — no ErrOrderUnknown, correct stored-scenario
+// outcome — because the state lives in the DB, not a process-local map.
+func TestPersistedOrderVisibleToNewInstance(t *testing.T) {
+	db := setupSim(t)
+	r := req()
+	a := New(db, "sim", FullFill)
+	ack, err := a.PlaceOrder(context.Background(), r)
+	if err != nil {
+		t.Fatalf("place: %v", err)
+	}
+	// A brand-new client instance (even with a DIFFERENT default scenario) resolves the order
+	// via the STORED scenario — deterministic and independent of which instance placed it.
+	b := New(db, "sim", ZeroFill)
+	st, gerr := b.GetOrder(context.Background(), ack.ExchangeOrderID)
+	if gerr != nil {
+		t.Fatalf("new instance GetOrder returned %v (want the persisted order, not ErrOrderUnknown)", gerr)
+	}
+	if st.Status != execution.StateFilled || !st.FilledQty.Equal(r.Quantity) {
+		t.Errorf("new instance resolved %+v, want a FULL fill per the stored scenario", st)
 	}
 }

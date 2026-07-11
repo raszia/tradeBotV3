@@ -122,9 +122,26 @@ func (q *Queue) EnqueueScheduled(ctx context.Context, tx *sql.Tx, r Request, del
 	return res.LastInsertId()
 }
 
-func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, limit int, allowed []RequestType) ([]Claimed, error) {
+// dryRun scopes the claim to the EXECUTION MODE: nil = no filter; &true = only requests
+// whose owning cycle has dry_run=1 (a dry-run executor); &false = only dry_run=0 (a live
+// executor). Requests with no cycle_id (e.g. bare balance polls) are claimable in any mode.
+// This keeps a dry-run executor from ever claiming a real cycle's request and vice-versa —
+// the first of two guards (the second is the executor's pre-send check).
+func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, limit int, allowed []RequestType, dryRun *bool) ([]Claimed, error) {
 	if limit <= 0 || len(allowed) == 0 {
 		return nil, nil
+	}
+	// The mode predicate (applied to BOTH the in-flight count and the select, so a dry-run
+	// and a live executor sharing an exchange never contend on each other's concurrency slots).
+	dryClause := ""
+	var dryArg []any
+	if dryRun != nil {
+		// A cycle whose dry_run matches this executor's mode, OR a CYCLE-LESS request that is
+		// READ-ONLY. A mutating (PLACE/CANCEL) request is NEVER claimable without a mode-matching
+		// cycle: it could not otherwise be classified dry-run vs live nor recovered (PR19 round 3
+		// #6; the DB CHECK also makes a cycle-less mutating row impossible).
+		dryClause = " AND (EXISTS (SELECT 1 FROM cycles c WHERE c.id = er.cycle_id AND c.dry_run = ?) OR (er.cycle_id IS NULL AND er.request_type NOT IN ('PLACE_ORDER','CANCEL_ORDER')))"
+		dryArg = []any{boolToInt(*dryRun)}
 	}
 	conn, err := q.db.Conn(ctx)
 	if err != nil {
@@ -145,11 +162,13 @@ func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, l
 
 	var claimedIDs []int64
 	err = withConnTx(ctx, conn, func(tx *sql.Tx) error {
-		// In-flight count = CLAIMED + IN_FLIGHT (both occupy a concurrency slot).
+		// In-flight count = CLAIMED + IN_FLIGHT (both occupy a concurrency slot), scoped to
+		// the same execution mode so dry-run and live executors don't consume each other's slots.
 		var inFlight int
+		countArgs := append([]any{exchangeID}, dryArg...)
 		if err := tx.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM exchange_requests WHERE exchange_id = ? AND status IN ('CLAIMED','IN_FLIGHT')",
-			exchangeID).Scan(&inFlight); err != nil {
+			"SELECT COUNT(*) FROM exchange_requests er WHERE er.exchange_id = ? AND er.status IN ('CLAIMED','IN_FLIGHT')"+dryClause,
+			countArgs...).Scan(&inFlight); err != nil {
 			return err
 		}
 		slots := limit - inFlight
@@ -164,11 +183,12 @@ func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, l
 			WHERE er.exchange_id = ?
 			  AND er.request_type IN (%s)
 			  AND (er.status = 'QUEUED' OR (er.status = 'RETRY_SCHEDULED' AND er.next_retry_at <= NOW(6)))
-			  AND EXISTS (SELECT 1 FROM exchanges e WHERE e.id = er.exchange_id AND e.enabled = 1)
+			  AND EXISTS (SELECT 1 FROM exchanges e WHERE e.id = er.exchange_id AND e.enabled = 1)%s
 			ORDER BY er.priority ASC, er.id ASC
 			LIMIT ?
-			FOR UPDATE SKIP LOCKED`, typeList)
+			FOR UPDATE SKIP LOCKED`, typeList, dryClause)
 		args := append([]any{exchangeID}, typeArgs...)
+		args = append(args, dryArg...)
 		args = append(args, slots)
 
 		rows, err := tx.QueryContext(ctx, selectSQL, args...)
@@ -379,6 +399,13 @@ func backoff(retryCount int) time.Duration {
 }
 
 // --- small helpers ---
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
 
 func inClause(types []RequestType) (string, []any) {
 	placeholders := make([]string, len(types))

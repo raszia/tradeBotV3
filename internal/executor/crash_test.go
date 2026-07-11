@@ -95,6 +95,19 @@ func (it *intg) sweep(t *testing.T) {
 	}
 }
 
+// recoverStale rebuilds a CLEAN executor (no fault hook) and runs the atomic stale-mutation
+// recovery (PR19 round 4 #1): a stale IN_FLIGHT PLACE/CANCEL becomes DEAD + a read-only recovery
+// probe, never a blind resend.
+func (it *intg) recoverStale(t *testing.T) {
+	t.Helper()
+	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: it.fake}, nil,
+		Config{Name: "recover", AllowLiveExecution: true, FinalStatusDelay: 5 * time.Millisecond, Recovery: fastRecovery()})
+	if err := it.exec.resolveExchangeIDs(it.ctx); err != nil {
+		t.Fatal(err)
+	}
+	it.exec.recoverStaleMutating(it.ctx, 0)
+}
+
 // 1. Crash/rollback after DB commit, before send: the committed QUEUED request is
 // recoverable, claimed + sent EXACTLY once, and re-processing creates no duplicate send.
 func TestCrashAfterCommitBeforeSendRecoverableNoDuplicate(t *testing.T) {
@@ -127,9 +140,10 @@ func TestCrashAfterCommitBeforeSendRecoverableNoDuplicate(t *testing.T) {
 	_ = ord
 }
 
-// 2. Crash after MarkInFlight commits, before any exchange response: the request is stuck
-// IN_FLIGHT → sweeper dead-letters the MUTATING request (never re-sends) and pushes the
-// order to NEEDS_RECONCILE; the symbol lock stays held.
+// 2. Crash after MarkInFlight commits, before any exchange response: the stuck IN_FLIGHT PLACE is
+// recovered read-only — DEAD-lettered (a recovery probe scheduled), NEVER re-sent. The probe (a
+// fake that cannot look up by client id here) cannot verify, so the order lands on NEEDS_RECONCILE
+// with the lock held.
 func TestCrashAfterMarkInFlightBeforeResponse(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderSubmitted))
@@ -140,11 +154,17 @@ func TestCrashAfterMarkInFlightBeforeResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	it.backdateInflight(c.ID)
-	it.sweep(t)
+	it.recoverStale(t)
 
 	if reqStatus(t, it.db, c.ID) != "DEAD" {
-		t.Errorf("stuck mutating request = %s, want DEAD (never re-sent)", reqStatus(t, it.db, c.ID))
+		t.Errorf("stuck mutating request = %s, want DEAD (consumed → read-only probe, never re-sent)", reqStatus(t, it.db, c.ID))
 	}
+	var probes int
+	it.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE order_id=? AND request_type='GET_ORDER' AND JSON_EXTRACT(payload,'$.purpose')=?", orderID, orders.PurposeAmbiguousPlaceProbe).Scan(&probes)
+	if probes != 1 {
+		t.Errorf("scheduled place-probe = %d, want 1", probes)
+	}
+	it.drive(6) // run the probe → cannot verify (fake has no client-id lookup) → NEEDS_RECONCILE
 	if ordState(t, it.db, orderID) != "NEEDS_RECONCILE" {
 		t.Errorf("owning order = %s, want NEEDS_RECONCILE", ordState(t, it.db, orderID))
 	}
@@ -152,7 +172,7 @@ func TestCrashAfterMarkInFlightBeforeResponse(t *testing.T) {
 		t.Errorf("lock = %s, want ACTIVE (held — exposure unknown)", it.lockState(cycleID))
 	}
 	if got := atomic.LoadInt32(&it.fake.placeCount); got != 0 {
-		t.Errorf("placeCount = %d, want 0 (sweeper must never send)", got)
+		t.Errorf("placeCount = %d, want 0 (recovery must never send)", got)
 	}
 }
 
@@ -178,12 +198,13 @@ func TestPlaceSucceedsCompletionRollsBackThenSweepReconciles(t *testing.T) {
 	if ordState(t, it.db, orderID) != string(state.OrderQueued) {
 		t.Errorf("order = %s, want unchanged QUEUED (completion rolled back)", ordState(t, it.db, orderID))
 	}
-	// Recovery: the sweeper dead-letters the stuck mutating request, never re-sending it.
+	// Recovery: the stale mutating request is DEAD-lettered into a read-only probe, never re-sent.
 	it.backdateInflight(c.ID)
-	it.sweep(t)
+	it.recoverStale(t)
 	if reqStatus(t, it.db, c.ID) != "DEAD" {
-		t.Errorf("after sweep request = %s, want DEAD (no re-send)", reqStatus(t, it.db, c.ID))
+		t.Errorf("after recovery request = %s, want DEAD (no re-send)", reqStatus(t, it.db, c.ID))
 	}
+	it.drive(6) // probe cannot verify (fake has no client-id lookup) → NEEDS_RECONCILE
 	if ordState(t, it.db, orderID) != "NEEDS_RECONCILE" {
 		t.Errorf("order = %s, want NEEDS_RECONCILE", ordState(t, it.db, orderID))
 	}
@@ -213,10 +234,12 @@ func TestCancelSucceedsCompletionRollsBackThenSweepReconciles(t *testing.T) {
 		t.Errorf("cancel request = %s, want IN_FLIGHT (completion rolled back)", reqStatus(t, it.db, c.ID))
 	}
 	it.backdateInflight(c.ID)
-	it.sweep(t)
+	it.fake.getErr = execution.ErrOrderUnknown // probe cannot confirm the cancel's outcome
+	it.recoverStale(t)
 	if reqStatus(t, it.db, c.ID) != "DEAD" {
-		t.Errorf("after sweep cancel = %s, want DEAD (not blindly retried)", reqStatus(t, it.db, c.ID))
+		t.Errorf("after recovery cancel = %s, want DEAD (not blindly retried)", reqStatus(t, it.db, c.ID))
 	}
+	it.drive(6) // cancel-probe → order unknown → NEEDS_RECONCILE (never assume cancelled/zero-fill)
 	if got := ordState(t, it.db, orderID); got != "NEEDS_RECONCILE" {
 		t.Errorf("order = %s, want NEEDS_RECONCILE (not assumed-cancelled/zero-fill)", got)
 	}
@@ -244,11 +267,13 @@ func TestCrashDuringSellRepriceCancelInFlight(t *testing.T) {
 	it.db.QueryRow("SELECT COUNT(*) FROM orders WHERE exchange_market_id=? AND role='exit_sell'", emID).Scan(&sellsBefore)
 
 	it.backdateInflight(c.ID)
-	it.sweep(t)
+	it.fake.getErr = execution.ErrOrderUnknown // probe cannot confirm the reprice-cancel's outcome
+	it.recoverStale(t)
 
 	if reqStatus(t, it.db, c.ID) != "DEAD" {
 		t.Errorf("sell cancel = %s, want DEAD", reqStatus(t, it.db, c.ID))
 	}
+	it.drive(6) // cancel-probe → order unknown → NEEDS_RECONCILE
 	if ordState(t, it.db, orderID) != "NEEDS_RECONCILE" {
 		t.Errorf("sell order = %s, want NEEDS_RECONCILE", ordState(t, it.db, orderID))
 	}

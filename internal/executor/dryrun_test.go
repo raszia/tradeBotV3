@@ -21,8 +21,8 @@ import (
 // simExec rebuilds the executor with a simulated client for the given scenario.
 func (it *intg) simExec(t *testing.T, sc simexec.Scenario) {
 	t.Helper()
-	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: simexec.New(it.code, sc)}, nil,
-		Config{Name: "dry-run", AllowLiveExecution: true, FinalStatusDelay: 10 * time.Millisecond})
+	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: simexec.New(it.db, it.code, sc)}, nil,
+		Config{Name: "dry-run", AllowLiveExecution: true, FinalStatusDelay: 10 * time.Millisecond, Recovery: fastRecovery()})
 	if err := it.exec.resolveExchangeIDs(it.ctx); err != nil {
 		t.Fatal(err)
 	}

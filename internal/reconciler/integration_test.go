@@ -40,6 +40,12 @@ func (f *fakeRO) GetOrder(_ context.Context, id string) (execution.OrderStatus, 
 	}
 	return execution.OrderStatus{}, execution.ErrOrderUnknown
 }
+func (f *fakeRO) GetOrderByClientOrderID(_ context.Context, id string) (execution.OrderStatus, error) {
+	if r, ok := f.results[id]; ok {
+		return r.st, r.err
+	}
+	return execution.OrderStatus{}, execution.ErrOrderUnknown
+}
 func (f *fakeRO) GetOpenOrders(context.Context, string) ([]execution.OrderStatus, error) {
 	return nil, nil
 }
@@ -90,7 +96,8 @@ func setupR(t *testing.T) *rfix {
 		st  execution.OrderStatus
 		err error
 	}{}}
-	rec := New(db.NewFromDB(sqlDB), map[string]ReadOnlyClient{code: fake}, nil)
+	// Real (dry_run=0) cycles are reconciled through the REAL client set; the sim set is empty.
+	rec := New(db.NewFromDB(sqlDB), map[string]ReadOnlyClient{code: fake}, nil, nil)
 	return &rfix{db: sqlDB, ctx: ctx, code: code, exID: exID, fake: fake, rec: rec}
 }
 
@@ -246,7 +253,9 @@ func TestAmbiguousKeepsLockAndNeedsReconcile(t *testing.T) {
 
 func TestUnknownExchangeIdFoundByClientIdAttaches(t *testing.T) {
 	f := setupR(t)
-	f.fake.caps = exchanges.Capabilities{ClientOrderID: true, FetchByOrderID: true}
+	// The venue must genuinely support LOOKUP by client id (PR19 round 3 #2) — not merely accept
+	// a client id on placement — for the reconciler to probe by it.
+	f.fake.caps = exchanges.Capabilities{ClientOrderID: true, FetchByOrderID: true, LookupByClientOrderID: true}
 	// order with no exchange_order_id; identified via its local client order id.
 	cyc, ord := f.seedCycleOrder(t, state.CycleBuySubmitted, state.OrderSubmitted, "")
 	var loc string

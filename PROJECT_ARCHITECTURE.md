@@ -285,6 +285,22 @@ Implemented (**PR2**, migrations `002`–`007`):
 - **PR18 (029):** `retention_settings` CHECK constraints — `retention_days ∈ NULL|[1,3650]`,
   `batch_size ∈ [1,50000]`, `max_batches_per_run ∈ [1,10000]`, `pause_ms ∈ [0,60000]` (safe
   bounds; the worker also validates at runtime — see §16a).
+- **PR19 (030):** `sim_exchange_orders` — persistent simulated-exchange order state so
+  dry-run `simexec` survives restarts and is shared across executor/reconciler instances
+  (see §16b). Carries an explicit mutable lifecycle (`status`, `filled_quantity`) so ambiguous
+  place/cancel timeouts are modelled faithfully, and `UNIQUE(exchange_code, client_order_id)`
+  so an order can be recovered by client_order_id after a place timeout AND a re-placed order is
+  immutable/idempotent. Simulation only; no real exchange, no secrets.
+- **PR19 round 2 (031):** `idx_cycles_dry_run_state (dry_run, state)` — used by the mode-scoped
+  claim's dry_run cycle-set subquery (`EXPLAIN` on 10.6 shows `MATERIALIZED c ref
+  idx_cycles_dry_run_state`) and by mode-scoped open-cycle scans; justified by the real plan, not
+  the name (§16b). No column added, no data rewritten.
+- **PR19 round 3 (032):** `sim_exchange_orders` gains `order_type`, `time_in_force` (so the full set
+  of exchange-visible immutable fields is stored + compared) and `hidden_probes` (models eventual-
+  consistency: an accepted order invisible to the first GetOrder lookups). The invariant "a mutating
+  request can never reach the exchange without a cycle + order" is enforced at RUNTIME (claim clause
+  + pre-send fail-closed guard), NOT a CHECK, so the generic `exchange_requests` queue stays
+  decoupled from trading FKs (§16b).
 
 Records kept permanently (unless explicitly configured otherwise): orders, fills,
 cycles, signals. High-volume tables (`api_call_logs`, `comparison_events`,
@@ -1903,34 +1919,181 @@ status → cycle close → reconcile — through the **real** queue/executor/ord
 sellflow boundaries, but against a **simulated exchange client** so **no real
 `PlaceOrder`/`CancelOrder` ever reaches an exchange** and there is zero real exposure.
 
-**Activation (config-driven, safe by default — never a runtime env var).** The
-bootstrap `[execution] mode` selects `off` (default) | `dry_run` | `live`:
-- **`off` (default)**: the order-executor wires **no** clients and `AllowLiveExecution=
-  false` → no order, real or simulated, can be sent. Dry-run/live must be **explicit**.
-- **`dry_run`**: the order-executor wires `simexec` clients for the enabled exchanges and
-  `AllowLiveExecution=true`; the trade-engine stamps created cycles `dry_run=1`.
-- **`live`**: real private clients (needs decrypted credentials — a later PR; until then
-  it falls back to safe `off` with a warning).
+**Activation (config-driven, safe by default, STRICTLY VALIDATED — never a runtime env
+var).** The bootstrap `[execution] mode` must be **EXACTLY** one of `off`|`dry_run`|`live`:
+an empty value normalizes to `off`, but any other value (a typo like `dryrun`, `DRY_RUN`,
+`simulate`) is a **hard startup error** — it is never silently treated as `off`
+(`config.Validate`). Both `config.example.toml` and `production.example.toml` ship an
+explicit `[execution] mode = "off"`.
+- **`off` (default)**: the trade-engine is wired with `PrepareBuyCycles=false`, so it is
+  **strictly signal-only** — it consumes market data, compares, and records
+  comparison_events/signals, but creates **NO cycle / order / PLACE_ORDER request /
+  symbol lock** (it never calls `buyflow.CreateBuyCycle`). The order-executor wires no
+  clients. So a safe `off` deployment never fills the DB with executable trading state a
+  later mode change could pick up. Dry-run/live must be **explicit**.
+- **`dry_run`**: the order-executor wires `simexec` clients and the trade-engine both
+  prepares buys and stamps created cycles `dry_run=1`.
+- **`live`**: real private clients + the PR20 safety stack.
 
-**Simulated client (`simexec`, no I/O).** It implements `exchanges.PrivateClient` with
-**no network code at all**, recording each placed order so `GetOrder` returns a
-consistent status per a configurable **scenario**: `full_fill`, `partial_fill` (half,
-remainder cancelled), `zero_fill`, `ambiguous` (GetOrder unknown → NEEDS_RECONCILE),
-`rejected` (definite place rejection), `place_timeout` (ambiguous ack), `cancel_race`
-(cancel raced a full fill). The dry-run binary default is `full_fill`.
+**Strict dry-run/live SEPARATION (two guards).** A dry-run executor must process only
+requests whose cycle is `dry_run=1`, a live executor only `dry_run=0` — enforced twice:
+(1) at **queue claim** — `queue.Claim` takes a mode filter and joins `cycles`, so a
+mismatched request is never claimed (and the in-flight slot count is mode-scoped too, so a
+dry and a live executor sharing an exchange don't contend); (2) a **final pre-send check**
+immediately before every `PlaceOrder`/`CancelOrder` (`abortOnModeMismatch`) — if the
+cycle's `dry_run` doesn't match the executor mode it refuses to send and leaves the request
+**untouched** (never marked failed/sent/completed; the sweeper reverts it for the
+correct-mode executor). So `simexec` can never mark a real cycle filled, and a live client
+can never send for a dry-run cycle. The pre-send check **fails closed** (PR19 round 2):
+`cycleDryRun` returns an error on any DB error / missing cycle / invalid-or-NULL `dry_run`,
+and the guard then refuses to send and leaves the request recoverable — "cannot confirm the
+cycle's mode → do not call the exchange". The final live gate applies the same fail-closed
+check before a real send.
+
+**Simulated client (`simexec`, no I/O, PERSISTENT).** It implements
+`exchanges.PrivateClient` with **no network code at all**. Its order state is stored in
+**`sim_exchange_orders` (migration 030)**, not a process-local map: every simulated
+PlaceOrder is recorded (keyed by the deterministic `SIM-<client_order_id>` AND by
+`client_order_id`, with an explicit mutable lifecycle `status`+`filled_quantity`), so ANY
+executor instance — a different process, one after a restart, or the reconciler — can look
+it up (by exchange_order_id OR client_order_id) and observe the SAME deterministic state. A
+follow-up `GET_ORDER` handled by a different instance therefore resolves correctly instead
+of returning `ErrOrderUnknown` and spuriously pushing a dry-run cycle to `NEEDS_RECONCILE`.
+Base scenarios: `full_fill`, `partial_fill` (half, remainder cancelled), `zero_fill`,
+`ambiguous` (deliberately GetOrder-unknown → NEEDS_RECONCILE), `rejected` (definite place
+rejection), `cancel_race`. The dry-run binary default is `full_fill`.
+
+**Immutable idempotency.** A re-placed identical `client_order_id` returns the first
+accepted order deterministically (no second row — an accepted order is immutable, enforced by
+`UNIQUE(exchange_code, client_order_id)`); the same id with a **different** payload is a hard
+conflict, never an overwrite.
+
+**Ambiguous-execution recovery (PR19 round 2).** On Iranian venues an order or cancel may
+succeed at the exchange while the HTTP response times out. A timeout is treated as an UNKNOWN
+outcome — never a success, never a failure, and **never blindly retried**. The simulator
+models this faithfully and the executor recovers it read-only:
+
+- *Accepted-but-timed-out PLACE* — `place_timeout_accepted_{open,partial_fill,full_fill}`
+  PERSIST the order first (with its real state/fill), then return `ErrAckTimeout` **without**
+  the exchange order id; `place_timeout_not_accepted` (and the legacy `place_timeout` alias)
+  persist nothing. The executor's ambiguous-place path DEAD-letters the place (consumed, never
+  re-sent) and schedules a **read-only `ambiguous_place_probe` GET_ORDER** that looks the order
+  up **by `client_order_id`** (the exchange id was never returned). Found → resume the normal
+  ack flow (`OnPlaceAck`/`OnSellPlaceAck`, which drives the cancel → final-status path that
+  records fills); provably-not-placed (`ErrOrderUnknown`) → resolve cleanly (buy: FAILED + lock
+  released, no exposure; sell: NEEDS_RECONCILE + lock held); transient → bounded read-only
+  retry, then NEEDS_RECONCILE.
+- *Ambiguous CANCEL* — `cancel_timeout_{but_canceled,still_open,partial_then_canceled,`
+  `filled_before_cancel}` mutate the persisted state then return `ErrAckTimeout`. The executor
+  DEAD-letters the cancel and schedules a read-only `ambiguous_cancel_probe` GET_ORDER (by the
+  known exchange id). Terminal (canceled/partial/filled) → record the ACTUAL filled qty and
+  continue via `OnCancelResult`/`OnSellCancelResult` → final status; **still open** (cancel
+  didn't take) → re-issue the cancel, **bounded** (a proven re-cancel from a read-only check,
+  never a blind resend) — after `maxRecoveryAttempts` it goes to NEEDS_RECONCILE. Fill
+  recording is idempotent (deterministic `exchange_fill_id` + `UNIQUE(order_id,
+  exchange_fill_id)`), so a re-run or a concurrent instance cannot double-apply a fill.
+
+**Ambiguous-execution HARDENING (PR19 round 3).** Eight refinements make the recovery safe against
+eventual consistency, crashes, adapter quirks, and cross-instance drift:
+
+- **A first "not found" is never proof of non-placement.** After a place timeout the probe looks
+  the order up and, on `ErrOrderUnknown`, does **bounded read-only retries with backoff** (the
+  simulator's `hidden_probes` models a venue where an accepted order is briefly invisible, then
+  appears). The symbol lock stays HELD and the cycle is NOT failed on an early miss. Only after the
+  bounded retries are exhausted AND the venue declares a **reliable negative**
+  (`Capabilities.ReliableNotFound`, false for real Iranian venues) is the order classed
+  "provably-not-placed" and failed cleanly; otherwise it goes to NEEDS_RECONCILE (lock held).
+- **"Accepts a client id on place" ≠ "can look an order up by client id".** These are separate
+  capabilities: `ClientOrderID` (accepted on placement) vs **`LookupByClientOrderID`** (GetOrder
+  resolves by client id — true only for Wallex, whose GetOrder IS keyed by client id; false for
+  Nobitex/Bitpin, which accept a client id on place but query by exchange id). Recovery/reconciler
+  probe by client id ONLY when `LookupByClientOrderID` is true — never passing a client id into an
+  exchange-id-only endpoint, never treating such a venue's "not found" as proof.
+- **Crash-after-send recovery.** If the process crashes after the exchange accepted a PLACE/CANCEL
+  but before the response was handled (so no `ErrAckTimeout` probe was persisted), the executor's
+  sweep (`recoverStaleMutating`) converts each stale IN_FLIGHT mutation — mode-scoped — into a
+  persisted READ-ONLY recovery probe (place by client_order_id, cancel by exchange id) and
+  DEAD-letters the original mutation. Never a blind resend.
+- **The EXACT sent client id is persisted before the network call.** The executor computes the
+  adapter's `ClientOrderIDForSend(local)` (e.g. Nobitex's 32-char truncation), COMMITS it to
+  `client_order_id_sent`, THEN sends exactly that value. Recovery looks the order up by
+  `client_order_id_sent` (not the raw local id), and a recovered order whose immutable fields
+  (side/quantity/symbol) disagree is NEVER attached — it goes to NEEDS_RECONCILE.
+- **The simulator is deterministic across restarts/instances.** `CancelOrder`/`GetOrder` behave per
+  the order's OWN persisted scenario (and stored immutable fields), NOT the current client
+  instance's configured scenario — so a restarted/second instance with a different default never
+  changes an existing order's behaviour.
+- **A mutating request can never reach the exchange without a cycle + order.** Enforced at runtime
+  (the right layer for the generic queue): the mode-scoped claim only claims a mutating request
+  whose cycle's dry_run matches the executor, and a pre-send fail-closed guard FAILS a PLACE/CANCEL
+  with a missing cycle_id/order_id without any exchange/simexec call.
+- **Terminal recovered states are handled directly.** A probe that finds the order already
+  filled/canceled/partially-canceled records the fills immediately (no redundant cancel or extra
+  GET_ORDER); an open order continues the cancel flow; a rejected order takes the terminal-failure
+  path. Recovery avoids redundant API calls and queue rows.
+- **The claim index is justified on the real 10.6 plan.** `idx_exreq_claim (exchange_id, status,
+  priority, id)` serves an index-ORDERED per-status scan; the single-query status OR
+  (`QUEUED OR RETRY_SCHEDULED`) does a small filesort over the bounded candidate set, but at 3334
+  candidates that measured ~0.1 ms (a split-query variant was only 1.06x — within noise), so the
+  claim is left as-is rather than adding locking/merge complexity to the safety-critical path.
+  `idx_cycles_dry_run_state` (031) IS used by the claim's dry_run subquery (EXPLAIN-verified) — kept
+  on evidence, not on its name.
+
+**Ambiguous-execution HARDENING round 4 (PR19).** Five further refinements: (1) stale-mutation
+recovery (`recoverStaleMutating`) is ATOMIC — a `SELECT … FOR UPDATE SKIP LOCKED` claim + status
+re-check, schedule probe, mark DEAD, all in one tx — and the generic `SweepStuck` no longer touches
+mutating IN_FLIGHT, so exactly one probe is ever created and the order is never prematurely
+reconciled; (2) client-id recovery goes through a dedicated `ClientOrderLookup.GetOrderByClientOrderID`
+(Wallex client-id GetOrder, Bitpin `?identifier=`, Nobitex list-recent-orders + match the reliable
+`clientOrderId`), never a client id into an exchange-id endpoint; (3) the simulator looks the order
+up FIRST and replays the order's OWN persisted scenario (never the current instance's), so behaviour
+is deterministic across restarts/instances; (4) a recovered order is identified by its reliable
+identifier + symbol + side (quantity is a sanity signal, NOT an exact-identity requirement — venues
+round and partial fills are smaller); (5) recovery timing is per-exchange configurable
+(`RecoveryConfig`: max_attempts / initial_delay / max_delay / total_timeout) with bounded exponential
+backoff + jitter — the window closes on either bound → NEEDS_RECONCILE with the lock HELD and no
+blind resend. The exact sent client id is committed before the network call and that persist verifies
+EXACTLY ONE row updated (else fail closed).
+
+**Recovery window is RUNTIME-CONFIGURED (PR19 round 4 correction).** The window is not
+hard-coded: the bootstrap `[execution.recovery]` section (`max_attempts`, `initial_delay_ms`,
+`max_delay_ms`, `total_timeout_ms` — safe defaults 6/1s/30s/5m) plus
+`[execution.recovery.per_exchange.<code>]` partial overrides are parsed by `internal/config`,
+VALIDATED AT STARTUP (each resolved window must have max_attempts>0, initial_delay>0,
+max_delay>=initial_delay, total_timeout>0, and stay within hard safety bounds: ≤100 attempts,
+≤1h max_delay, ≤24h total_timeout; negatives and violations are hard startup errors), and wired
+by `cmd/order-executor` (`recoveryFromConfig`) into `executor.Config.Recovery`/`RecoveryPerExchange`.
+A PARTIAL per-exchange override inherits every unset field from the CONFIGURED global values —
+in both the config resolution and the executor's own merge — never from hard-coded defaults.
+EVERY unresolved cancel-probe outcome — a transient lookup failure (timeout / network /
+rate-limit / retryable 5xx / context deadline or cancellation) exactly like a proven still-open —
+consumes an attempt of this SAME persisted window (attempt counter + `FirstProbeAt` wall-clock +
+jittered exponential backoff), NEVER the generic queue retry policy (`retry_count`/`max_retries`
+stay untouched on probe rows). Window exhaustion marks the probe DEAD and the order/cycle
+NEEDS_RECONCILE in ONE transaction (`deadReconcile`) — no crash window between them.
 
 **Does not bypass the architecture.** Dry-run does **not** mark cycles closed from the
 engine — every transition goes through the same queue → executor → `internal/orders`
-boundaries (the simulated-IOC place→cancel→status flow for the buy, and the resting
-sell place→poll for the sell). The engine only sets the `dry_run` marker.
+boundaries. The engine only sets the `dry_run` marker.
 
 **Dashboard labelling.** Cycles carry `dry_run`; the orders/requests/fills views surface
 it via a join to the cycle, so the dashboard clearly shows `DRY_RUN`.
 
-**Reconciler safety.** The reconciler loads `cycles.dry_run` (migration 019) and emits a
-`dry_run_cycle` identification decision, so a simulated dry-run order is never confused
-with a real exchange order; dry-run cycles are only ever verified against the simulated
-client (or skipped when no client is wired).
+**Reconciler holds BOTH client sets and never mixes them (PR19 round 2).** `cmd/reconciler`
+builds **two** read-only client maps — **simulated** (DB-backed `simexec`, always available;
+no network, no credentials) and **real** (credentialed read-only clients where a master key
++ credential exist) — and the reconciler routes STRICTLY by each cycle's `dry_run` flag
+(`clientFor(dryRun, code)`): a `dry_run=1` cycle is verified ONLY through a sim client, a
+`dry_run=0` cycle ONLY through a real client. It is therefore impossible to query a real cycle
+through the simulator, query a dry-run cycle through a real client, send a `SIM-*` id to a real
+exchange, or query a real id through the simulator — regardless of the process's own execution
+mode (a live deployment still reconciles a stray dry-run cycle correctly, and vice-versa). When
+the correctly-scoped client is absent the order is **skipped** (`NoAction`, cycle state
+untouched) — never verified through the other mode's client. The reconciler holds every client
+through the `ReadOnlyClient` interface (no place/cancel reachable) and loads `cycles.dry_run`
+(migration 019). Because both sim and real cycle orders can be recovered by `client_order_id`,
+migration 030 adds `UNIQUE(exchange_code, client_order_id)` and migration 031 an
+`idx_cycles_dry_run_state` for mode-scoped scans.
 
 ## 16c. Limited live execution (implemented in PR20 — `internal/live`)
 
@@ -3083,6 +3246,99 @@ venue-free).
 - **PR19 — dry-run is identifiable**: dashboard surfaces `dry_run` on cycles/orders/
   requests/fills; the reconciler logs a `dry_run_cycle` decision so a simulated order is
   never confused with a real one.
+- **PR19 correction — rebuilt on accepted PR18 `a8a7036`** (branch `pr19-dry-run`, single
+  commit); all PR14–PR18 work preserved (full sweep green).
+- **PR19 correction — execution.mode is strictly validated**: exactly off/dry_run/live;
+  empty → off; a typo (e.g. `dryrun`) is a hard startup error, never silently `off`. Both
+  config examples ship an explicit `[execution] mode = "off"`.
+- **PR19 correction — `off` creates no executable state**: the engine is wired
+  `PrepareBuyCycles=false` in off mode, so it is strictly signal-only (no cycle/order/
+  PLACE_ORDER-request/symbol-lock; never calls CreateBuyCycle).
+- **PR19 correction — strict dry-run/live separation (two guards)**: `queue.Claim` filters
+  by the owning cycle's `dry_run` (mode-scoped in-flight count too), so a dry-run executor
+  never claims a live request and vice-versa; a final pre-send check (`abortOnModeMismatch`)
+  refuses any mismatched send and leaves the request untouched (sweeper reverts it).
+- **PR19 correction — simexec is PERSISTENT (migration 030 `sim_exchange_orders`)**: state
+  survives restarts and is shared across instances, so a follow-up GET_ORDER on another
+  instance resolves deterministically (no spurious NEEDS_RECONCILE). In dry-run the
+  reconciler is wired READ-ONLY simexec clients so dry-run cycles are reconciled, not skipped.
+- **PR19 round 2 — a timeout is an UNKNOWN outcome, recovered read-only, never blindly
+  retried**: an ambiguous PLACE/CANCEL DEAD-letters the mutating request and schedules a
+  read-only GET_ORDER probe (`ambiguous_place_probe` looked up by `client_order_id`;
+  `ambiguous_cancel_probe` by the known exchange id) that determines the real state, records
+  the actual filled qty, and continues the state machine; a still-open cancel is re-issued only
+  after a read-only check PROVES it open, bounded by `maxRecoveryAttempts`; only after bounded
+  recovery fails does it go to NEEDS_RECONCILE. Recovery is a persisted queue row, so it
+  survives a restart and is safe across instances; fills stay idempotent (`UNIQUE(order_id,
+  exchange_fill_id)` + deterministic id).
+- **PR19 round 2 — simexec models accepted-but-timed-out place/cancel**: the accepted-timeout
+  scenarios persist the order FIRST (with real state/fill) then return `ErrAckTimeout` without
+  the exchange id (recover by client_order_id); cancel-timeout scenarios mutate state then time
+  out; `GetOrder` resolves by exchange_order_id OR client_order_id; a re-placed identical
+  client_order_id is immutable/idempotent, a different payload is a conflict
+  (`UNIQUE(exchange_code, client_order_id)`), never an overwrite.
+- **PR19 round 2 — reconciler never mixes real and dry-run clients**: it holds BOTH sets and
+  routes strictly by `cycle.dry_run` (sim-only for dry-run cycles, real-only for real cycles);
+  absent client → skip safely, no cross-mode query.
+- **PR19 round 2 — the final live guard fails closed on cycle-mode uncertainty**: `cycleDryRun`
+  errors on any DB error / missing cycle / invalid-or-NULL dry_run, and the pre-send check +
+  live gate then refuse to send and leave the request recoverable ("cannot confirm mode → do
+  not call the exchange").
+- **PR19 round 3 — a first "not found" is never proof of non-placement**: after a place timeout the
+  probe does bounded read-only retries with backoff (eventual-consistency: the sim's `hidden_probes`
+  hides an accepted order for the first lookups); the lock stays HELD and the cycle is NOT failed on
+  an early miss; only a `ReliableNotFound` venue lets an exhausted probe conclude provably-not-placed
+  (else NEEDS_RECONCILE).
+- **PR19 round 3 — lookup-by-client-id is a distinct capability from client-id-on-place**:
+  `LookupByClientOrderID` (Wallex only) vs `ClientOrderID`; recovery/reconciler probe by client id
+  ONLY when the venue's GetOrder genuinely accepts one, never passing a client id to an
+  exchange-id-only endpoint.
+- **PR19 round 3 — crash-after-send is recovered read-only**: the sweep converts a stale IN_FLIGHT
+  PLACE/CANCEL (crashed after the exchange accepted, before the response) into a persisted read-only
+  recovery probe, never a blind resend.
+- **PR19 round 3 — the EXACT sent client id is committed before the network call**: the executor
+  persists `client_order_id_sent = adapter.ClientOrderIDForSend(local)` (e.g. Nobitex's 32-char
+  truncation) BEFORE sending, sends exactly that, recovers by it, and refuses to attach a recovered
+  order whose immutable fields disagree.
+- **PR19 round 3 — the simulator is deterministic across instances**: CancelOrder/GetOrder follow the
+  order's OWN persisted scenario + stored immutable fields, never the current client's configured
+  scenario.
+- **PR19 round 3 — a mutating request never reaches the exchange without a cycle + order**: enforced
+  at runtime (mode-scoped claim clause + pre-send fail-closed guard), keeping the generic queue
+  decoupled from trading FKs; terminal recovered states are recorded directly (no redundant
+  cancel/probe). The claim index is justified on the real MariaDB 10.6 `EXPLAIN` (§16b).
+- **PR19 round 4 — stale-mutation recovery is ATOMIC and single-owner**: `recoverStaleMutating`
+  claims each stale IN_FLIGHT PLACE/CANCEL with `SELECT … FOR UPDATE SKIP LOCKED` + a status
+  re-check, schedules the read-only probe, and marks the mutation DEAD in one tx; the generic
+  `SweepStuck` no longer touches mutating IN_FLIGHT, so the two paths cannot race (exactly one probe,
+  never a premature reconcile).
+- **PR19 round 4 — real-venue client-id recovery via `ClientOrderLookup`**: a dedicated
+  `GetOrderByClientOrderID` interface (never `GetOrder`, which takes an exchange id). Wallex maps it
+  to its client-id-keyed GetOrder; Bitpin to `GET /odr/orders/?identifier=`; Nobitex lists recent
+  orders and matches the reliable `clientOrderId` (unique per user). `LookupByClientOrderID` is true
+  iff a venue implements it, verified in adapter tests.
+- **PR19 round 4 — the simulator looks up first, then replays the PERSISTED scenario**: a repeated
+  PlaceOrder resolves an existing order by client id and returns a result derived ONLY from the
+  stored order + stored scenario (conflict on a different payload) — a restart / a second instance
+  with a different default cannot change an accepted order's behaviour.
+- **PR19 round 4 — recovered-order identity is reliable-id + symbol + side (not exact quantity)**:
+  the order is found BY a reliable identifier, and symbol/side must agree; quantity is NOT an
+  exact-identity check (venues round; partial fills are smaller), so it never rejects the correct
+  order.
+- **PR19 round 4 correction — the recovery window is RUNTIME-configured, never hard-coded**:
+  `[execution.recovery]` (+ `per_exchange` partial overrides) is parsed/validated at startup
+  (invalid → hard error; hard safety bounds ≤100 attempts / ≤1h max_delay / ≤24h total) and wired
+  into the executor by cmd/order-executor; partial overrides inherit the CONFIGURED global in both
+  layers.
+- **PR19 round 4 correction — every unresolved cancel-probe outcome uses the recovery window**:
+  transient lookup failures (timeout/network/rate-limit/5xx/context) consume window attempts with
+  jittered exponential backoff + `FirstProbeAt` TotalTimeout — never the generic queue retry
+  policy; exhaustion = DEAD probe + NEEDS_RECONCILE in ONE transaction, lock held.
+- **PR19 round 4 — recovery timing is configurable per exchange**: `RecoveryConfig`
+  (max_attempts / initial_delay / max_delay / total_timeout) with bounded EXPONENTIAL backoff +
+  jitter; the window closes on either bound → NEEDS_RECONCILE, lock HELD, no blind resend. The exact
+  sent client id is persisted before the network call and the persist verifies EXACTLY ONE row
+  (else fail closed).
 
 - **PR18 — retention can only touch a fixed whitelist** of high-volume tables (each with
   a whitelisted timestamp column); permanent trading tables are absent and thus never
@@ -3537,7 +3793,7 @@ venue-free).
 | PR16 | `pr16-dashboard-readonly-errors` | **in review** | Cut from accepted PR15 (`pr15-market-regime-history-validation`, `1996b07`); PR14/PR15 fixes preserved (health-monitor read-only private health that never invalidates a credential on a transient error; regime history state_hash/stale_reason + WriteResult select-error handling + config validation + migration 027) and invariant scripts intact — full sweep green. **Reconstructed as STRICTLY read-only:** the config-editing/auth/live/preflight/session/credential-admin handlers are **removed from PR16** (they belong to later PRs; config editing = PR17 with explicit safety controls), so `Handler()` registers ONLY GET routes. **Corrections:** (#6) `/api/cycles/{id}` error-checks EVERY sub-query (orders/fills/exchange_requests/cycle_state_events/order_events/symbol_locks/app_logs) → 500 on any failure, never a partial 200 (cycle-not-found → 404). (#7) `/api/config` error-checks every config query (markets/exchanges/fees/regime_baskets/active-version) → 500 on any failure, never incomplete config with 200. (#8) `app_logs` are masked before display (message + fields + any string), same defence-in-depth as `api_call_logs` — both the `/api/logs` endpoint and cycle-detail `logs`. `internal/dashboard` + `cmd/dashboard`: Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any POST/PUT/PATCH/DELETE is 405; no place/cancel/cycle/order/queue/lock/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot incl. regime baskets), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). **Round 2:** (1) `doc.go` + architecture no longer claim PR16 edits config — strictly read-only, config editing = PR17 (auth/authz/audit/validation). (2) WebSocket `CheckOrigin` is **same-origin only** (`sameOriginOnly`): foreign Origin → 403, missing Origin (non-browser) allowed + documented, malformed/opaque rejected — no more `CheckOrigin=true`. (3) `snapshot()` returns an error and checks EVERY query; any failure → generic `snapshot_error` event (raw DB details logged, never exposed), never a partial normal snapshot; `stale` normalized to bool (consistent with HTTP). WebSocket snapshot-only (open cycles/health/regime/balances) — drains + ignores incoming messages, no command handler. Separate binary (restart isolates). Tests: offline (no-order-client guard, exhaustive POST/PUT/PATCH/DELETE→405 over all routes, same-origin matrix, step_kind, mask-secrets) + gated (endpoints missing-data 200, seeded cycle detail + maker/taker + 404, cycle-detail 500-on-each-subquery-failure, /api/config 500-on-each-query-failure, app_logs masked + cycle-detail logs masked, ws foreign-origin-403/same-origin/missing-origin, ws snapshot_error-on-each-query-failure, ws stale-is-bool, ws-ignores-commands-no-mutation, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). |
 | PR17 | `pr17-config-editing-login` | **in review** | Cut from accepted PR16 (`pr16-dashboard-readonly-errors`, `58d2429`); all PR16 read-only/deploy-safety fixes preserved. `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + migration 028: **real login/session auth** + authenticated, authorized, versioned, audited, validated, **concurrency-safe** config EDITING. Still no trading: no place/cancel, and no cycle/order/queue/lock/credential mutation route. **Login:** `dashboard_users` (PBKDF2-SHA256 password hash — never plaintext — role, active, last_login_at) + `dashboard_sessions` (only sha256(token) stored, never the token; expiry/revoke). `POST /login`/`/logout`; HttpOnly + SameSite + Secure-when-HTTPS cookie. EVERY route except `/healthz`+`/login` (UI, `/api/*`, mutations, `/ws`) needs a valid session → 401. Roles viewer/config_operator/admin; editing needs config_operator+ (viewer → 403). Session resolution **joins dashboard_users** for the LIVE role + `active=1`, so disabling a user breaks their existing sessions (401) and role changes apply without a re-login. Bootstrap via `dashboard -create-user user:role` (**password read from a hidden prompt/stdin, never a CLI arg**). **Optimistic concurrency + single-active:** every edit body carries `expected_config_version`; the tx locks ALL active config_version rows FOR UPDATE (no LIMIT) + the target row FOR UPDATE, requiring exactly one active (0→ErrNoActiveVersion, **2+→ErrMultipleActiveVersions/409**, refusing to edit) and 409s on version mismatch (`ErrStaleConfigVersion`) — concurrent editors serialized (exactly one wins, loser 409; deadlock retried so never 500). **Sell-manage guard:** disabling `enabled_for_sell_manage` with open exposure (**BUY_REQUEST_QUEUED/BUY_SUBMITTED**/BUY_PARTIALLY_FILLED/BUY_FILLED/SELL_*/CANCEL_PENDING/NEEDS_RECONCILE) → 409 (`ErrSellManageExposed`); high-risk switches (enable trading / disable sell-manage) require admin. **Fees:** `UpsertFee` returns real previous-fee read errors (only ErrNoRows = none) and validates `exchange_market_id` belongs to `exchange_id` (else 400) — no version/audit on rejection. **Audit:** each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (real old/new/reason/`changed_by`=authenticated session user, NEVER client input); **non-empty reason mandatory** (else 400). **Strict JSON:** DisallowUnknownFields + exactly-one-object (2nd decode io.EOF) → trailing/garbage/unknown → 400. Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries sane, taker_mode=ASK, fees≥0) → 400; enable-flag hierarchy trading⊆signal⊆collection; no-op → 400. Editable: symbol config, market flags, exchange config, fees; read `GET /api/audit`, `/api/me`. exchange_markets has no config_version col → version on config_versions+audit. Hot reload via configstore.Cache; active cycles keep stamped config_version. Regime + credential editing deferred to later PRs. Tests: offline (password hash round-trip, role ranking, 405 matrix, same-origin) + gated (login valid/wrong-pw/disabled/unknown, logout invalidates, all routes 401 w/o login, WS 401 w/o login, viewer read-not-edit, secrets-not-plaintext; versioned+audited edit w/ session changed_by + real old value, stale→409 + rollback leaves active, concurrent→1 ok/1 conflict + 1 active version, sell-manage disable blocked-by-exposure(3 states)/allowed-no-exposure, high-risk-requires-admin, reason mandatory + can't-impersonate, strict-JSON trailing/garbage/unknown; disabled-user-loses-session, role-change-applies-to-existing-session, multiple-active-versions→409-no-mutation, UpsertFee-returns-read-error, fee-market-ownership-validated; trading-requires-sell_manage(400), offset-bps-upper-bound[0,10000), fee-audit-identifies-market vs exchange, and buyflow CreateBuyCycle-rejects-when-trading/sell-manage-disabled + real-UpdateMarketFlags-concurrency (both orderings, no deadlock/orphan over 25 rounds); fee no-op→ErrNoChanges (decimal-equal) + per-changed-field audit). |
 | PR18 | `pr18-retention-worker` | **in review** | Rebuilt on accepted PR17 (`a2938db`); all PR14–PR17 work preserved (full sweep green). `internal/retention` + `cmd/retention-worker` + migrations 018/029: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable. **Correction #2 — one pinned `*sql.Conn` for the whole run:** GET_LOCK + load settings + counts + batch DELETEs + app_logs report all run on the SAME pinned connection, with RELEASE_LOCK before close — correct under `SetMaxOpenConns(1)` (no self-hang) and lock stays tied to the deleting connection (no two-worker overlap); lock released on every exit incl. errors. **Correction #3 — safe bounds:** retention_days∈[1,3650], batch_size∈[1,50000], max_batches_per_run∈[1,10000], pause_ms∈[0,60000], validated at runtime (out-of-range → per-table validation error, no DELETE, others continue — never defaulted) + DB CHECK (migration 029); overflow-safe cutoff via `AddDate(0,0,-days)`. **Correction #4 — lock-skip reported + logged:** a lock-blocked run returns a completed report (`LockAcquired=false`, `SkippedReason`) AND writes an app_logs entry; a run with any table error logs at `warn` not `info`. Missing/NULL/<1 days → not configured (do nothing); disabled → skip. Batched DELETE…LIMIT (short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. No Redis, no exchange calls; file-config + `-dry-run` flag only (no runtime env). Binary runs once then every 6h. Tests: offline whitelist/permanent guard + bounds-validate matrix (boundary accept + all out-of-range reject); gated missing/disabled/dry-run no-op, batch-only-old + recent-preserved, batch/max honored, permanent-never-targeted, one-table-failure→warn+continue, invalid-setting→skip+continue, DB-bounds-reject, MaxOpenConns(1)-no-hang, two-workers-no-overlap, lock-released-on-error, lock-skip-reported+logged, run-recorded, ctx-cancel-clean. |
-| PR19 | `pr19-dry-run` | **accepted** | `internal/simexec` + migration 019 + config `[execution] mode` + engine/buyflow/executor/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle (signal→cycle→lock→buy→queue→executor→simulated fill→sell→simulated status→close→reconcile) through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. Activation config-driven + safe-by-default: `[execution] mode` off (default; no clients, AllowLiveExecution=false) / dry_run (wire simexec clients + AllowLiveExecution=true + engine stamps cycles.dry_run) / live (real clients, deferred → falls back to safe off). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills; reconciler loads cycles.dry_run + logs a dry_run_cycle decision (never confuses simulated with real). Tests: offline (simexec scenario matrix, no-mutating-network, default full-fill) + config default-safe (mode off ⇒ not dry/live) + gated (full lifecycle buy→sell→CLOSED+lock-released, zero-fill→CANCELLED, partial-buy→sells-filled-qty-only, ambiguous→NEEDS_RECONCILE, dashboard dry_run label, reconciler dry_run identification). |
+| PR19 | `pr19-dry-run` | **in review** | Rebuilt on accepted PR18 (`a8a7036`); all PR14–PR18 work preserved (full sweep green). `internal/simexec` + migrations 019/030 + config `[execution] mode` + engine/buyflow/executor/queue/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. **Correction #5 — mode strictly validated:** exactly off/dry_run/live; empty→off; a typo (dryrun/DRY_RUN/…) is a hard startup error (config.Validate), never silently off; both config examples ship explicit `[execution] mode="off"`. **Correction #3 — off creates no executable state:** engine wired `PrepareBuyCycles=false` in off mode → strictly signal-only (records comparison/signal but NO cycle/order/PLACE_ORDER-request/symbol-lock; never calls CreateBuyCycle). **Correction #2 — strict dry/live separation (two guards):** `queue.Claim` takes a dry_run filter joining cycles (mode-scoped in-flight count too), so a dry-run executor claims only dry_run=1 requests and a live executor only dry_run=0; a final pre-send `abortOnModeMismatch` refuses any mismatched PlaceOrder/CancelOrder and leaves the request untouched (sweeper reverts). **Correction #4 — simexec PERSISTENT (migration 030 sim_exchange_orders):** order state survives restarts + is shared across instances (keyed by SIM-<client_order_id> + stored scenario), so a follow-up GET_ORDER on a new instance resolves deterministically instead of ErrOrderUnknown→NEEDS_RECONCILE; in dry_run the reconciler is wired READ-ONLY simexec clients so dry-run cycles are reconciled (not skipped). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills. **Round 2 — ambiguous execution (7 blockers): (1)** simexec models accepted-but-timed-out PLACE (`place_timeout_accepted_{open,partial_fill,full_fill}` persist first then ErrAckTimeout WITHOUT the exchange id; `place_timeout_not_accepted` persists nothing) with an explicit mutable lifecycle (`status`,`filled_quantity`); **(2)** GetOrder resolves by exchange_order_id OR `client_order_id` (migration 030 adds `UNIQUE(exchange_code, client_order_id)`); **(3)** an ambiguous PLACE/CANCEL DEAD-letters the mutating request and schedules a read-only GET_ORDER recovery probe (`ambiguous_place_probe` by client_order_id → resume ack flow / provably-not-placed→clean-fail; `ambiguous_cancel_probe` → record actual fill & continue), NEVER a blind retry, NEEDS_RECONCILE only after bounded recovery; **(4)** cancel-timeout scenarios (`cancel_timeout_{but_canceled,still_open,partial_then_canceled,filled_before_cancel}`) mutate then time out; still-open → bounded proven re-cancel; **(5)** reconciler holds BOTH real+sim client sets and routes strictly by `cycle.dry_run` (never mixes; absent client → skip safely); **(6)** the final live guard fails closed on any cycle-mode DB error/missing/NULL (`cycleDryRun (bool,error)`) → send nothing, request stays recoverable; **(7)** immutable simexec idempotency (identical re-place → same order, no second row; different payload → conflict). Migration 031 `idx_cycles_dry_run_state`. Fills idempotent (`UNIQUE(order_id,exchange_fill_id)` + deterministic id) → no double-apply across instances. Tests: offline + gated — simexec accepted/cancel-timeout matrix, idempotency, client-id lookup; executor place/cancel-timeout recovery (full/open/partial/not-accepted, canceled/filled/partial/still-open-bounded), cross-instance recovery, no-double-fill, fail-closed live guard; reconciler routes-by-dry-run-never-mixes + skips-when-mode-client-absent. **Round 3 — ambiguous-execution hardening (8 blockers, migration 032; verified on MariaDB 10.6): (1)** a first `ErrOrderUnknown` is NOT proof of non-placement — bounded read-only retries with backoff (sim `hidden_probes` models eventual-consistency delayed visibility), lock HELD, cycle NOT failed; only a `ReliableNotFound` venue after bounded probes → provably-not-placed (else NEEDS_RECONCILE); **(2)** new capability `LookupByClientOrderID` (Wallex-only) distinct from `ClientOrderID` (place) — recovery/reconciler probe by client id only when GetOrder truly accepts one, never into an exchange-id-only endpoint; **(3)** crash-after-send recovery: the sweep converts a stale IN_FLIGHT PLACE/CANCEL into a persisted read-only probe (`recoverStaleMutating`), never a blind resend; **(4)** the EXACT `adapter.ClientOrderIDForSend(local)` (e.g. Nobitex 32-char truncation) is committed to `client_order_id_sent` BEFORE the send, recovered by it, and a mismatched recovered order (side/qty/symbol) is never attached; **(5)** simexec CancelOrder/GetOrder use the order's OWN persisted scenario + stored immutable fields (order_type/tif), deterministic across instances; **(6)** a mutating request never reaches an exchange without a cycle+order — mode-scoped claim clause + pre-send fail-closed guard (runtime, not a CHECK, keeping the generic queue decoupled); **(7)** terminal recovered states recorded DIRECTLY (`RecoverBuy/SellPlace|Cancel`) — no redundant cancel/GET_ORDER; **(8)** claim index justified on the real 10.6 `EXPLAIN` (idx_exreq_claim serves the per-status index-ordered scan; the OR-filesort measured ~0.1ms/3334 rows, split 1.06x → left as-is; idx_cycles_dry_run_state proven used by the dry_run subquery). Tests: delayed-visibility recovery, reliable-vs-unreliable negative, crash-place/crash-cancel recovery, persist-client-id-before-send, mismatched-order-not-attached, deterministic-cancel-across-instances, immutable-fields-include-type/tif, cycleless-mutating-fails-closed. **Round 4 — recovery hardening (5 blockers; verified on MariaDB 10.6): (1)** stale-mutation recovery is ATOMIC (`SELECT … FOR UPDATE SKIP LOCKED` claim + status re-check + schedule probe + mark DEAD in one tx) and `SweepStuck` no longer touches mutating IN_FLIGHT — exactly one probe, never a premature reconcile (concurrency test with two recoverers + the sweeper); **(2)** real-venue recovery via a dedicated `ClientOrderLookup.GetOrderByClientOrderID` (Wallex client-id GetOrder; Bitpin `?identifier=`; Nobitex list-recent-orders + match the reliable `clientOrderId`), `LookupByClientOrderID` true iff implemented (adapter tests for Bitpin + Nobitex); **(3)** the simulator looks up FIRST and replays the order's OWN persisted scenario (not the current instance's) — a different-instance re-place follows the original scenario, no second row; **(4)** recovered-order identity = reliable id + symbol + side (quantity is NOT an exact-identity requirement); **(5)** per-exchange configurable recovery timing (`RecoveryConfig` max_attempts/initial/max/total) with bounded exponential backoff + jitter — window-expiry → NEEDS_RECONCILE, lock HELD, no resend; and `client_order_id_sent` persistence verifies EXACTLY ONE row updated (else fail closed). Tests: two-instance-recovery-plus-sweeper-no-race, cross-instance-persisted-scenario, Bitpin/Nobitex client-id lookup, wrong-side-not-attached, configurable window-expiry. **Round 4 correction (4 fixes; verified on MariaDB 10.6): (1)** the recovery window is RUNTIME-configured — `[execution.recovery]` + `[execution.recovery.per_exchange.<code>]` in the bootstrap TOML (documented safe defaults 6/1s/30s/5m), validated at startup (max_attempts>0, initial>0, max>=initial, total>0, safety bounds ≤100/≤1h/≤24h; negatives/violations = hard error), wired via `recoveryFromConfig` into `executor.Config`; partial per-exchange overrides inherit the CONFIGURED global (config resolution AND the executor merge — never hard defaults); **(2)** transient cancel-probe lookup failures (timeout/network/rate-limit/5xx/context) consume attempts of the SAME persisted window (attempt + FirstProbeAt + jittered exp backoff + TotalTimeout), never `q.ScheduleRetry`/queue max_retries (probe rows keep retry_count=0); **(3)** window exhaustion = DEAD probe + NEEDS_RECONCILE in ONE tx (`deadReconcile`), no crash window; **(4)** `SweepStuck` doc updated (mutating IN_FLIGHT is skipped for `recoverStaleMutating`, never dead-lettered here). Tests: config parse/defaults/validation matrix, cmd wiring incl. partial-inherit, transient-window-not-queue-retries (probe-row count, retry_count=0, 1 CANCEL_ORDER only, lock ACTIVE, atomic DEAD+NEEDS_RECONCILE), TotalTimeout expiry, executor-side partial inherit + backoff cap/jitter bounds. Full `go test -p 1 ./...`, `go vet`, invariants all green on MariaDB 10.6. |
 | PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
 | PR20a | `pr20a-credential-decryption` | **accepted** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |
 | PR21 | `pr21-operator-reconcile` | **accepted** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button). mark_failed safety: FAILED is terminal, so with open/unknown exposure it is REFUSED (kept in NEEDS_RECONCILE, lock held, audited) unless the operator sets external_resolution_confirmed=true + a mandatory external_resolution_reason (then FAILED + lock released, audited with the flag); proven zero exposure allowed but prefers cancel_zero_exposure. Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required, mark_failed-open-exposure-refused+kept-in-reconcile, mark_failed-forced-with-external-confirmation, forced-requires-external-reason, zero-exposure-failed-warns) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). Correction: `mark_failed` refuses to strand open/unknown exposure (kept in NEEDS_RECONCILE) unless explicitly forced with `external_resolution_confirmed`+reason (migration 021 adds the audit column). |

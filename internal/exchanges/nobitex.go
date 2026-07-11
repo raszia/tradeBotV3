@@ -81,18 +81,19 @@ func init() {
 	Register(Registration{
 		Code: nobitexCode,
 		Capabilities: Capabilities{
-			MarketMetadata:  true,
-			OrderBookREST:   true,
-			OrderBookWS:     false, // WS porting deferred
-			BalanceFetch:    true,
-			PlaceOrder:      true,
-			CancelByOrderID: true,
-			FetchByOrderID:  true,
-			FetchOpenOrders: true,
-			RecentFills:     false,
-			OrderUpdatesWS:  false, // no private WS here
-			OrderStatusPoll: true,  // order state via GetOrder polling
-			ClientOrderID:   true,  // Nobitex supports clientOrderId (<=32 chars)
+			MarketMetadata:        true,
+			OrderBookREST:         true,
+			OrderBookWS:           false, // WS porting deferred
+			BalanceFetch:          true,
+			PlaceOrder:            true,
+			CancelByOrderID:       true,
+			FetchByOrderID:        true,
+			FetchOpenOrders:       true,
+			RecentFills:           false,
+			OrderUpdatesWS:        false, // no private WS here
+			OrderStatusPoll:       true,  // order state via GetOrder polling
+			ClientOrderID:         true,  // Nobitex accepts clientOrderId on placement (<=32 chars)
+			LookupByClientOrderID: true,  // via GetOrderByClientOrderID: list recent orders + match the reliable clientOrderId
 		},
 		NewPublic:  newNobitexPublic,
 		NewPrivate: newNobitexPrivate,
@@ -396,6 +397,22 @@ type nobitexOrder struct {
 
 // --- PlaceOrder ---
 
+// nobitexNormalizeClientID mirrors the venue's clientOrderId rule (trim + <=32 chars). It is
+// deterministic and idempotent, and is exposed via ClientOrderIDForSend so the order-executor
+// persists the EXACT id Nobitex receives (recovery must look the order up by that value).
+func nobitexNormalizeClientID(local string) string {
+	cid := strings.TrimSpace(local)
+	if len(cid) > nobitexClientOrderIDMax {
+		cid = cid[:nobitexClientOrderIDMax]
+	}
+	return cid
+}
+
+// ClientOrderIDForSend implements exchanges.ClientOrderIDNormalizer.
+func (c *nobitexPrivate) ClientOrderIDForSend(local string) string {
+	return nobitexNormalizeClientID(local)
+}
+
 func (c *nobitexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
 	base, quote := nobitexSplitSymbol(req.Symbol)
 	if base == "" || quote == "" {
@@ -418,11 +435,9 @@ func (c *nobitexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequ
 	if !strings.EqualFold(req.OrderType, execution.OrderTypeMarket) {
 		fields["price"] = nobitexPriceToVenue(quote, req.LimitPrice).String()
 	}
-	// clientOrderId (<=32 chars) — only sent when supported and non-empty.
-	if cid := strings.TrimSpace(req.ClientOrderID); cid != "" {
-		if len(cid) > nobitexClientOrderIDMax {
-			cid = cid[:nobitexClientOrderIDMax]
-		}
+	// clientOrderId (<=32 chars) — only sent when supported and non-empty. Uses the same
+	// normalization exposed via ClientOrderIDForSend so the executor persists the EXACT value.
+	if cid := nobitexNormalizeClientID(req.ClientOrderID); cid != "" {
 		fields["clientOrderId"] = cid
 	}
 
@@ -485,6 +500,35 @@ func (c *nobitexPrivate) GetOrder(ctx context.Context, exchangeOrderID string) (
 		return execution.OrderStatus{}, nobitexBusinessError(path, payload.Status, payload.Code, raw)
 	}
 	return c.orderToStatus(payload.Order, "", ""), nil
+}
+
+// GetOrderByClientOrderID implements exchanges.ClientOrderLookup. Nobitex's GetOrder is keyed by
+// the EXCHANGE order id, so after an ambiguous placement (exchange id unknown) recovery lists the
+// user's recent orders and matches the RELIABLE clientOrderId (unique per user, enforced by
+// Nobitex's partial unique index — so a match is never the wrong order). The submitted id is
+// normalized the same way it was sent (<=32 chars). "Not found" is NEVER proof of non-placement
+// (the order may be beyond the recent-orders page), so the caller keeps probing / reconciles.
+func (c *nobitexPrivate) GetOrderByClientOrderID(ctx context.Context, clientOrderID string) (execution.OrderStatus, error) {
+	want := nobitexNormalizeClientID(clientOrderID)
+	if want == "" {
+		return execution.OrderStatus{}, fmt.Errorf("nobitex GetOrderByClientOrderID: empty client order id")
+	}
+	// List recent orders (all statuses, full detail) and match the client order id.
+	var payload nobitexOrdersListResponse
+	path := "/market/orders/list?details=2"
+	raw, err := c.doJSON(ctx, http.MethodGet, path, &payload)
+	if err != nil {
+		return execution.OrderStatus{}, err
+	}
+	if payload.Status != "" && payload.Status != "ok" {
+		return execution.OrderStatus{}, nobitexBusinessError(path, payload.Status, payload.Code, raw)
+	}
+	for _, o := range payload.Orders {
+		if o.ClientOrderID == want {
+			return c.orderToStatus(o, "", ""), nil
+		}
+	}
+	return execution.OrderStatus{}, execution.ErrOrderUnknown
 }
 
 // --- GetOpenOrders ---

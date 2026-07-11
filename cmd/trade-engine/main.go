@@ -47,15 +47,17 @@ func main() {
 		if base.Cfg.Execution.IsLive() {
 			liveGuard = live.NewGuard(store.DB(), clock.NewSystem(), base.Log)
 		}
+		// Buy-cycle preparation is gated by the execution mode: in "off" mode the engine is
+		// STRICTLY signal-only — it consumes market data, compares, and persists
+		// comparison_events/signals, but creates NO cycle/order/PLACE_ORDER-request/symbol-lock
+		// (it never calls buyflow.CreateBuyCycle). It only prepares buys in dry_run/live, so a
+		// safe "off" deployment can never fill the DB with executable trading state that a later
+		// mode change could pick up. (The engine library still defaults this FALSE.)
+		prepareBuys := !base.Cfg.Execution.IsOff() // dry_run || live
 		eng := engine.New(store, rc, cache, clock.NewSystem(), base.Log, engine.Config{
-			DryRun:    base.Cfg.Execution.IsDryRun(),
-			LiveGuard: liveGuard,
-			// PR9: buy-cycle preparation is ENABLED. On a passing signal for a trading-enabled
-			// market the engine prepares the buy transactionally via internal/buyflow (cycle +
-			// symbol lock + order + QUEUED PLACE_ORDER request). The engine still never calls an
-			// exchange; the order-executor remains the only sender. The buyflow path stays gated
-			// behind this flag (the engine library defaults it FALSE — PR8's signal-only boundary).
-			PrepareBuyCycles: true,
+			DryRun:           base.Cfg.Execution.IsDryRun(),
+			LiveGuard:        liveGuard,
+			PrepareBuyCycles: prepareBuys,
 		})
 		base.Log.Info("trade-engine starting", "redis", base.Cfg.Redis.Addr, "mode", base.Cfg.Execution.Mode)
 		// Startup live-safety summary (no secrets).

@@ -451,3 +451,48 @@ func TestBitpinRateLimitThrottleParsed(t *testing.T) {
 		t.Errorf("empty parse = %s, want 0", d)
 	}
 }
+
+// TestBitpinGetOrderByClientOrderID (PR19 round 4 #2): Bitpin resolves an order by the
+// "identifier" (our client order id) via GET /odr/orders/?identifier=<id> — ALWAYS the identifier
+// endpoint, never the numeric-id path.
+func TestBitpinGetOrderByClientOrderID(t *testing.T) {
+	var sawIdentifier string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/usr/authenticate/":
+			_, _ = w.Write([]byte(`{"access":"A","refresh":"R"}`))
+		case strings.HasPrefix(r.URL.Path, "/api/v1/odr/orders/") && r.URL.Query().Get("identifier") != "":
+			sawIdentifier = r.URL.Query().Get("identifier")
+			if sawIdentifier == "want-1" {
+				_, _ = w.Write([]byte(`[{"id":"999","identifier":"want-1","state":"active","type":"limit","side":"buy","symbol":"BTC_IRT","price":"100","base_amount":"0.5","remain_amount":"0.5","dealed_base_amount":"0"}]`))
+			} else {
+				_, _ = w.Write([]byte(`[]`))
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	priv := bitpinTestPrivate(t, srv)
+	if !priv.Capabilities().LookupByClientOrderID {
+		t.Fatal("Bitpin must declare LookupByClientOrderID")
+	}
+	lk, ok := priv.(ClientOrderLookup)
+	if !ok {
+		t.Fatal("Bitpin must implement ClientOrderLookup")
+	}
+	st, err := lk.GetOrderByClientOrderID(context.Background(), "want-1")
+	if err != nil {
+		t.Fatalf("GetOrderByClientOrderID: %v", err)
+	}
+	if sawIdentifier != "want-1" {
+		t.Errorf("server saw identifier %q, want want-1 (must use the ?identifier= endpoint)", sawIdentifier)
+	}
+	if st.ExchangeOrderID != "999" {
+		t.Errorf("recovered exchange id = %q, want 999", st.ExchangeOrderID)
+	}
+	if _, e := lk.GetOrderByClientOrderID(context.Background(), "no-such"); !errors.Is(e, execution.ErrOrderUnknown) {
+		t.Errorf("unknown identifier err = %v, want ErrOrderUnknown", e)
+	}
+}

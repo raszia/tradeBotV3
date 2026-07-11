@@ -14,7 +14,6 @@ import (
 
 	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/migrate"
-	"v3TradeBot/internal/state"
 )
 
 func intgQueue(t *testing.T) (*sql.DB, *Queue, context.Context) {
@@ -64,6 +63,7 @@ type reqOpt struct {
 	claimedBy   string
 	reqType     RequestType
 	orderID     *int64
+	cycleID     *int64
 	timeoutMs   int
 }
 
@@ -79,14 +79,69 @@ func seedRequest(t *testing.T, db *sql.DB, exID int64, o reqOpt) int64 {
 		o.timeoutMs = 10000
 	}
 	res, err := db.Exec(`INSERT INTO exchange_requests
-		(exchange_id, order_id, request_type, priority, status, payload, timeout_ms, max_retries, next_retry_at, inflight_at, claimed_at, claimed_by, idempotency_key)
-		VALUES (?, ?, ?, ?, ?, '{}', ?, 5, ?, ?, ?, ?, ?)`,
-		exID, o.orderID, string(o.reqType), o.priority, o.status, o.timeoutMs, o.nextRetryAt, o.inflightAt, o.claimedAt, nullStr(o.claimedBy), uniqueCode("idem"))
+		(exchange_id, order_id, cycle_id, request_type, priority, status, payload, timeout_ms, max_retries, next_retry_at, inflight_at, claimed_at, claimed_by, idempotency_key)
+		VALUES (?, ?, ?, ?, ?, ?, '{}', ?, 5, ?, ?, ?, ?, ?)`,
+		exID, o.orderID, o.cycleID, string(o.reqType), o.priority, o.status, o.timeoutMs, o.nextRetryAt, o.inflightAt, o.claimedAt, nullStr(o.claimedBy), uniqueCode("idem"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	id, _ := res.LastInsertId()
 	return id
+}
+
+// seedCycleDryRun creates the minimal FK chain for a cycle with the given dry_run flag and
+// returns the cycle id.
+func seedCycleDryRun(t *testing.T, db *sql.DB, exID int64, dry int) int64 {
+	t.Helper()
+	last := func(r sql.Result) int64 { id, _ := r.LastInsertId(); return id }
+	ex := func(q string, a ...any) sql.Result {
+		r, err := db.Exec(q, a...)
+		if err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+		return r
+	}
+	b := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'crypto')", uniqueCode("QB")))
+	qa := last(ex("INSERT INTO assets (symbol, kind) VALUES (?, 'fiat')", uniqueCode("QQ")))
+	m := last(ex("INSERT INTO markets (canonical_symbol, base_asset_id, quote_asset_id, quote_asset_type) VALUES (?, ?, ?, 'OTHER')", uniqueCode("QM")+"/IRT", b, qa))
+	em := last(ex("INSERT INTO exchange_markets (exchange_id, market_id, exchange_symbol, canonical_symbol) VALUES (?, ?, ?, ?)", exID, m, uniqueCode("QES"), uniqueCode("QM")+"/IRT"))
+	return last(ex("INSERT INTO cycles (exchange_market_id, buy_exchange_id, canonical_symbol, state, dry_run) VALUES (?, ?, ?, 'BUY_REQUEST_QUEUED', ?)", em, exID, uniqueCode("QM")+"/IRT", dry))
+}
+
+// TestClaimSeparatesDryRunFromLive: a dry-run claimer (&true) claims only requests whose
+// cycle has dry_run=1; a live claimer (&false) only dry_run=0. A mismatched request is left
+// QUEUED and untouched.
+func TestClaimSeparatesDryRunFromLive(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	dryCyc := seedCycleDryRun(t, db, exID, 1)
+	liveCyc := seedCycleDryRun(t, db, exID, 0)
+	dryReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &dryCyc})
+	liveReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &liveCyc})
+
+	yes, no := true, false
+	// Dry-run claimer: only the dry request.
+	claimed, err := q.Claim(ctx, exID, "dry", 10, AllTypes, &yes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != dryReq {
+		t.Fatalf("dry-run claim = %v, want only the dry request %d", claimed, dryReq)
+	}
+	// The live request was NOT claimed — still QUEUED, untouched.
+	if st, _, _ := reqRow(t, db, liveReq); st != "QUEUED" {
+		t.Errorf("live request under a dry-run claimer = %s, want QUEUED (untouched)", st)
+	}
+
+	// Live claimer: only the live request (the dry one is now CLAIMED by the dry claimer, but
+	// even if it were free, a live claimer would skip it).
+	claimed2, err := q.Claim(ctx, exID, "live", 10, AllTypes, &no)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed2) != 1 || claimed2[0].ID != liveReq {
+		t.Fatalf("live claim = %v, want only the live request %d", claimed2, liveReq)
+	}
 }
 
 // reqRow reads a request's status + claim fields (for assertions).
@@ -113,7 +168,7 @@ func TestClaimPriorityAndLimitAndSkips(t *testing.T) {
 	dueRetry := seedRequest(t, db, exID, reqOpt{priority: 50, status: "RETRY_SCHEDULED", nextRetryAt: &past})
 
 	// limit 2 -> claims the two most urgent eligible (high=10, dueRetry=50).
-	claimed, err := q.Claim(ctx, exID, "w1", 2, AllTypes)
+	claimed, err := q.Claim(ctx, exID, "w1", 2, AllTypes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +192,7 @@ func TestClaimRespectsPerExchangeConcurrency(t *testing.T) {
 	seedRequest(t, db, exID, reqOpt{})
 
 	// limit 3, 2 in use -> only 1 new claim.
-	claimed, err := q.Claim(ctx, exID, "w1", 3, AllTypes)
+	claimed, err := q.Claim(ctx, exID, "w1", 3, AllTypes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +217,7 @@ func TestClaimConcurrentClaimersHoldLimit(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			c, err := q.Claim(ctx, exID, fmt.Sprintf("w%d", n), 3, AllTypes)
+			c, err := q.Claim(ctx, exID, fmt.Sprintf("w%d", n), 3, AllTypes, nil)
 			if err != nil {
 				t.Errorf("claim: %v", err)
 				return
@@ -182,7 +237,7 @@ func TestClaimSkipsDisabledExchange(t *testing.T) {
 	db, q, ctx := intgQueue(t)
 	exID := seedExchange(t, db, 0) // disabled
 	seedRequest(t, db, exID, reqOpt{})
-	claimed, err := q.Claim(ctx, exID, "w1", 5, AllTypes)
+	claimed, err := q.Claim(ctx, exID, "w1", 5, AllTypes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +253,7 @@ func TestClaimTypeFilter(t *testing.T) {
 	seedRequest(t, db, exID, reqOpt{reqType: TypeGetBalance})
 
 	// Only read-only types allowed -> the PLACE_ORDER is not claimed.
-	claimed, err := q.Claim(ctx, exID, "w1", 5, ReadOnlyTypes)
+	claimed, err := q.Claim(ctx, exID, "w1", 5, ReadOnlyTypes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,14 +262,18 @@ func TestClaimTypeFilter(t *testing.T) {
 	}
 }
 
-func TestSweepStuckReadOnlyRequeuesMutatingDeadReconcile(t *testing.T) {
+// TestSweepStuckReadOnlyRequeuesMutatingSkipped (PR19 round 4 #1): the generic sweeper re-queues
+// stale read-only IN_FLIGHT but LEAVES stale mutating IN_FLIGHT UNTOUCHED — those are recovered
+// exclusively by the order-executor's atomic recoverStaleMutating (read-only probe), so the two
+// paths cannot race a probe against a premature reconcile.
+func TestSweepStuckReadOnlyRequeuesMutatingSkipped(t *testing.T) {
 	db, q, ctx := intgQueue(t)
 	exID := seedExchange(t, db, 1)
 
 	old := time.Now().Add(-time.Hour)
 	// stuck read-only -> should be re-queued (RETRY_SCHEDULED)
 	roID := seedRequest(t, db, exID, reqOpt{reqType: TypeGetOrder, status: "IN_FLIGHT", inflightAt: &old})
-	// stuck mutating with an order -> DEAD + order NEEDS_RECONCILE
+	// stuck mutating with an order -> LEFT IN_FLIGHT for the executor's recovery (not dead-lettered)
 	orderID := seedOrderInState(t, db, exID, "SUBMITTED")
 	mutID := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "IN_FLIGHT", inflightAt: &old, orderID: &orderID})
 
@@ -222,17 +281,17 @@ func TestSweepStuckReadOnlyRequeuesMutatingDeadReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeuedReadOnly < 1 || res.DeadMutating < 1 {
+	if res.RequeuedReadOnly < 1 || res.SkippedMutating < 1 {
 		t.Fatalf("sweep result = %+v", res)
 	}
 	if s := statusOf(t, db, roID); s != "RETRY_SCHEDULED" {
 		t.Errorf("read-only stuck status = %s, want RETRY_SCHEDULED", s)
 	}
-	if s := statusOf(t, db, mutID); s != "DEAD" {
-		t.Errorf("mutating stuck status = %s, want DEAD (never re-sent)", s)
+	if s := statusOf(t, db, mutID); s != "IN_FLIGHT" {
+		t.Errorf("mutating stuck status = %s, want IN_FLIGHT (left for the executor's recovery, not swept)", s)
 	}
-	if os := orderStateOf(t, db, orderID); os != string(state.OrderNeedsReconcile) {
-		t.Errorf("order state = %s, want NEEDS_RECONCILE", os)
+	if os := orderStateOf(t, db, orderID); os != "SUBMITTED" {
+		t.Errorf("order state = %s, want unchanged SUBMITTED (sweeper never touched it)", os)
 	}
 }
 
@@ -371,7 +430,7 @@ func TestSweepStuckRecoversStaleClaimed(t *testing.T) {
 	}
 
 	// It can be claimed again by another executor.
-	claimed, err := q.Claim(ctx, exID, "newworker", 5, AllTypes)
+	claimed, err := q.Claim(ctx, exID, "newworker", 5, AllTypes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

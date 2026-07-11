@@ -42,7 +42,7 @@ func main() {
 		switch base.Cfg.Execution.Mode {
 		case config.ExecutionDryRun:
 			for _, code := range loadEnabledExchanges(ctx, store) {
-				clients[code] = simexec.New(code, simexec.FullFill)
+				clients[code] = simexec.New(store.DB(), code, simexec.FullFill)
 			}
 			allowLive = true
 			base.Log.Warn("order-executor in DRY-RUN: SIMULATED clients only; no real orders will be sent", "exchanges", len(clients))
@@ -78,11 +78,22 @@ func main() {
 		// dangerous this process is at a glance.
 		base.Log.Info("live startup safety", live.BuildSafetySummary(ctx, store.DB(), clock.NewSystem(), base.Cfg.Execution.Mode).LogArgs()...)
 
+		// The ambiguous-mutation recovery window is RUNTIME-CONFIGURED from the bootstrap
+		// [execution.recovery] section (validated at startup; per-exchange partial overrides
+		// inherit the configured global values) — never hard-coded in production.
+		recGlobal, recPer := recoveryFromConfig(base.Cfg.Execution)
+		base.Log.Info("ambiguous-recovery window",
+			"max_attempts", recGlobal.MaxAttempts, "initial_delay", recGlobal.InitialDelay,
+			"max_delay", recGlobal.MaxDelay, "total_timeout", recGlobal.TotalTimeout,
+			"per_exchange_overrides", len(recPer))
+
 		exec := executor.New(store, q, clients, base.Log, executor.Config{
-			Name:               "order-executor",
-			AllowLiveExecution: allowLive,
-			ExecutionMode:      base.Cfg.Execution.Mode,
-			Guard:              guard,
+			Name:                "order-executor",
+			AllowLiveExecution:  allowLive,
+			ExecutionMode:       base.Cfg.Execution.Mode,
+			Guard:               guard,
+			Recovery:            recGlobal,
+			RecoveryPerExchange: recPer,
 		})
 		return exec.Run(ctx) // blocks until shutdown
 	})
@@ -90,6 +101,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "order-executor: "+err.Error())
 		os.Exit(1)
 	}
+}
+
+// recoveryFromConfig converts the validated bootstrap [execution.recovery] section into the
+// executor's recovery types: the resolved GLOBAL window plus fully-resolved per-exchange
+// overrides (partial overrides already inherit the configured global values inside
+// config.ResolvedRecovery — never hard-coded defaults). Kept as a separate function so the
+// config→executor wiring is unit-testable.
+func recoveryFromConfig(ec config.ExecutionConfig) (executor.RecoveryConfig, map[string]executor.RecoveryConfig) {
+	g, per := ec.ResolvedRecovery()
+	toExec := func(v config.ExecutionRecoveryValues) executor.RecoveryConfig {
+		return executor.RecoveryConfig{
+			MaxAttempts:  v.MaxAttempts,
+			InitialDelay: v.InitialDelay,
+			MaxDelay:     v.MaxDelay,
+			TotalTimeout: v.TotalTimeout,
+		}
+	}
+	var perExec map[string]executor.RecoveryConfig
+	if len(per) > 0 {
+		perExec = make(map[string]executor.RecoveryConfig, len(per))
+		for code, v := range per {
+			perExec[code] = toExec(v)
+		}
+	}
+	return toExec(g), perExec
 }
 
 // loadEnabledExchanges returns the codes of enabled exchanges (best-effort).

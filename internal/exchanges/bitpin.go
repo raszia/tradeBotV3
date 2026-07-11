@@ -77,18 +77,19 @@ func init() {
 	Register(Registration{
 		Code: bitpinCode,
 		Capabilities: Capabilities{
-			MarketMetadata:  true,
-			OrderBookREST:   true,
-			OrderBookWS:     false, // Centrifugo WS deferred
-			BalanceFetch:    true,
-			PlaceOrder:      true,
-			CancelByOrderID: true,
-			FetchByOrderID:  true,
-			FetchOpenOrders: true,
-			RecentFills:     false, // GetRecentFills not implemented in this adapter
-			OrderUpdatesWS:  false, // order push feed deferred
-			OrderStatusPoll: true,
-			ClientOrderID:   true, // Bitpin "identifier" field
+			MarketMetadata:        true,
+			OrderBookREST:         true,
+			OrderBookWS:           false, // Centrifugo WS deferred
+			BalanceFetch:          true,
+			PlaceOrder:            true,
+			CancelByOrderID:       true,
+			FetchByOrderID:        true,
+			FetchOpenOrders:       true,
+			RecentFills:           false, // GetRecentFills not implemented in this adapter
+			OrderUpdatesWS:        false, // order push feed deferred
+			OrderStatusPoll:       true,
+			ClientOrderID:         true, // Bitpin accepts an "identifier" field on placement
+			LookupByClientOrderID: true, // GET /odr/orders/?identifier=<id> resolves by client id
 		},
 		NewPublic:  newBitpinPublic,
 		NewPrivate: newBitpinPrivate,
@@ -588,23 +589,43 @@ func (b *bitpinPrivate) GetOrder(ctx context.Context, exchangeOrderID string) (e
 			return execution.OrderStatus{}, err
 		}
 	} else {
-		// The ?identifier= endpoint returns a top-level array (not {"results":[]}).
-		raw, err := b.doJSON(ctx, "order", http.MethodGet, "/api/v1/odr/orders/?identifier="+url.QueryEscape(exchangeOrderID), nil, nil)
-		if err != nil {
-			return execution.OrderStatus{}, err
-		}
-		var direct []bitpinOrder
-		if jerr := json.Unmarshal(raw, &direct); jerr == nil && len(direct) > 0 {
-			order = direct[0]
-		} else {
-			var payload bitpinOrdersResponse
-			if jerr := json.Unmarshal(raw, &payload); jerr == nil && len(payload.Results) > 0 {
-				order = payload.Results[0]
-			}
-		}
+		return b.getOrderByIdentifier(ctx, exchangeOrderID)
 	}
 	if len(order.ID) == 0 && order.Identifier == "" {
 		return execution.OrderStatus{}, fmt.Errorf("bitpin GetOrder %q: %w", exchangeOrderID, execution.ErrOrderUnknown)
+	}
+	return bitpinOrderToStatus(order, "", ""), nil
+}
+
+// GetOrderByClientOrderID implements exchanges.ClientOrderLookup: it resolves an order by the
+// "identifier" (our client order id) via GET /odr/orders/?identifier=<id> — ALWAYS the identifier
+// endpoint, never the numeric-id path, so an all-digit client id can never be misrouted. Used by
+// the ambiguous-place recovery when the exchange order id is unknown.
+func (b *bitpinPrivate) GetOrderByClientOrderID(ctx context.Context, clientOrderID string) (execution.OrderStatus, error) {
+	if clientOrderID == "" {
+		return execution.OrderStatus{}, fmt.Errorf("bitpin GetOrderByClientOrderID: empty identifier")
+	}
+	return b.getOrderByIdentifier(ctx, clientOrderID)
+}
+
+func (b *bitpinPrivate) getOrderByIdentifier(ctx context.Context, identifier string) (execution.OrderStatus, error) {
+	// The ?identifier= endpoint returns a top-level array (not {"results":[]}).
+	raw, err := b.doJSON(ctx, "order", http.MethodGet, "/api/v1/odr/orders/?identifier="+url.QueryEscape(identifier), nil, nil)
+	if err != nil {
+		return execution.OrderStatus{}, err
+	}
+	var order bitpinOrder
+	var direct []bitpinOrder
+	if jerr := json.Unmarshal(raw, &direct); jerr == nil && len(direct) > 0 {
+		order = direct[0]
+	} else {
+		var payload bitpinOrdersResponse
+		if jerr := json.Unmarshal(raw, &payload); jerr == nil && len(payload.Results) > 0 {
+			order = payload.Results[0]
+		}
+	}
+	if len(order.ID) == 0 && order.Identifier == "" {
+		return execution.OrderStatus{}, fmt.Errorf("bitpin identifier %q: %w", identifier, execution.ErrOrderUnknown)
 	}
 	return bitpinOrderToStatus(order, "", ""), nil
 }

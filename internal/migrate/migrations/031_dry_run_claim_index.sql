@@ -1,0 +1,26 @@
+-- migrate:ddl
+-- 031_dry_run_claim_index
+--
+-- PR19 round 3 (index justified on the real MariaDB 10.6 plan). The mode-scoped queue claim
+-- (queue.Claim) filters candidate requests by the owning cycle's dry_run via a correlated
+-- subquery `EXISTS (SELECT 1 FROM cycles c WHERE c.id = er.cycle_id AND c.dry_run = ?)`.
+--
+-- Measured on 10.6 with 40k requests / 400 cycles (`EXPLAIN`): when the optimizer MATERIALIZES
+-- that subquery (the dry-run cycle SET), it reads it via THIS index —
+--   `MATERIALIZED c  ref  idx_cycles_dry_run_state  key_len 1  rows 200  Using index`
+-- i.e. it builds the dry_run-cycle set straight from the index instead of scanning the cycles
+-- table. dry_run is low-cardinality, so it is paired with `state` (the column open-cycle scans
+-- filter on) to stay selective and to also serve mode-scoped open-cycle scans. It is NOT kept
+-- "because the name mentions claim": the `EXPLAIN` above shows it is actually used.
+--
+-- The exchange_requests side of the claim needs NO new index: the existing
+-- `idx_exreq_claim (exchange_id, status, priority, id)` already serves an index-ORDERED scan per
+-- status value (verified: splitting the status OR yields `type=ref, key=idx_exreq_claim` with NO
+-- filesort). The single-query status OR (`QUEUED OR RETRY_SCHEDULED`) does incur a small filesort
+-- over the bounded candidate set, but it measured ~0.1 ms even at 3334 candidates (a split-query
+-- variant was only 1.06x — within noise), so the query is left as-is rather than adding
+-- locking/merge complexity to the safety-critical claim (see PROJECT_ARCHITECTURE.md §16b).
+--
+-- Idempotent (IF NOT EXISTS); adds no column and rewrites no data.
+ALTER TABLE cycles
+  ADD INDEX IF NOT EXISTS idx_cycles_dry_run_state (dry_run, state);

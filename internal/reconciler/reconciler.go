@@ -40,18 +40,41 @@ type ReadOnlyClient interface {
 }
 
 // Reconciler inspects DB vs exchange state and recovers safe cases.
+//
+// PR19 round 2 — strict dry/live separation. The reconciler holds TWO independent read-only
+// client sets and routes STRICTLY by the owning cycle's dry_run flag: a dry-run (dry_run=1)
+// cycle is only ever verified through a SIMULATED client, and a real (dry_run=0) cycle only
+// through a REAL read-only client. It is therefore impossible to query a real cycle through
+// the simulator, query a dry-run cycle through a real client, send a SIM-* id to a real
+// exchange, or query a real id through the simulator. When the correctly-scoped client is
+// absent, the order is SKIPPED (NoAction) without changing cycle state — never verified
+// through the wrong client set.
 type Reconciler struct {
-	store   *db.Store
-	clients map[string]ReadOnlyClient // exchange code -> read-only client
-	log     *slog.Logger
+	store       *db.Store
+	realClients map[string]ReadOnlyClient // exchange code -> read-only client for REAL (dry_run=0) cycles
+	simClients  map[string]ReadOnlyClient // exchange code -> read-only client for DRY-RUN (dry_run=1) cycles
+	log         *slog.Logger
 }
 
-// New builds a Reconciler.
-func New(store *db.Store, clients map[string]ReadOnlyClient, log *slog.Logger) *Reconciler {
-	if clients == nil {
-		clients = map[string]ReadOnlyClient{}
+// New builds a Reconciler with separate real and simulated read-only client sets. Either map
+// may be nil/empty (that mode's cycles are then skipped safely).
+func New(store *db.Store, realClients, simClients map[string]ReadOnlyClient, log *slog.Logger) *Reconciler {
+	if realClients == nil {
+		realClients = map[string]ReadOnlyClient{}
 	}
-	return &Reconciler{store: store, clients: clients, log: log}
+	if simClients == nil {
+		simClients = map[string]ReadOnlyClient{}
+	}
+	return &Reconciler{store: store, realClients: realClients, simClients: simClients, log: log}
+}
+
+// clientFor returns the read-only client scoped to the cycle's mode and exchange, or nil when
+// none is wired. Routing is by dry_run FIRST so a mode can never borrow the other's client.
+func (r *Reconciler) clientFor(dryRun bool, exchangeCode string) ReadOnlyClient {
+	if dryRun {
+		return r.simClients[exchangeCode]
+	}
+	return r.realClients[exchangeCode]
 }
 
 // Report summarises a reconciliation pass.
@@ -132,8 +155,18 @@ type orderRow struct {
 	ExchangeCode       string
 	ExchangeOrderID    string
 	LocalClientOrderID string
+	ClientOrderIDSent  string // the EXACT id sent to the venue (may be adapter-normalized)
 	Side               string
 	FilledQty          decimal.Decimal
+}
+
+// clientLookupID is the id to query the venue by when the exchange order id is unknown: the
+// EXACT client id we sent (adapter-normalized), falling back to the local client id.
+func (o orderRow) clientLookupID() string {
+	if o.ClientOrderIDSent != "" {
+		return o.ClientOrderIDSent
+	}
+	return o.LocalClientOrderID
 }
 
 func (r *Reconciler) loadOpenCycles(ctx context.Context) ([]cycleRow, error) {
@@ -161,7 +194,7 @@ func (r *Reconciler) loadOpenCycles(ctx context.Context) ([]cycleRow, error) {
 func (r *Reconciler) loadOrders(ctx context.Context, cycleID int64) ([]orderRow, error) {
 	rows, err := r.store.DB().QueryContext(ctx, `
 		SELECT o.id, o.state, o.version, e.code, COALESCE(o.exchange_order_id,''),
-		       o.local_client_order_id, o.side, o.filled_quantity
+		       o.local_client_order_id, COALESCE(o.client_order_id_sent,''), o.side, o.filled_quantity
 		FROM orders o JOIN exchanges e ON e.id = o.exchange_id
 		WHERE o.cycle_id = ?`, cycleID)
 	if err != nil {
@@ -173,7 +206,7 @@ func (r *Reconciler) loadOrders(ctx context.Context, cycleID int64) ([]orderRow,
 		var o orderRow
 		var st string
 		if err := rows.Scan(&o.ID, &st, &o.Version, &o.ExchangeCode, &o.ExchangeOrderID,
-			&o.LocalClientOrderID, &o.Side, &o.FilledQty); err != nil {
+			&o.LocalClientOrderID, &o.ClientOrderIDSent, &o.Side, &o.FilledQty); err != nil {
 			return nil, err
 		}
 		o.State = state.OrderState(st)
@@ -292,12 +325,20 @@ func (r *Reconciler) reconcileCycle(ctx context.Context, c cycleRow, rep *Report
 // reconcileOrder verifies one non-terminal order via read-only exchange calls and
 // returns an outcome. It NEVER sends/cancels.
 func (r *Reconciler) reconcileOrder(ctx context.Context, c cycleRow, o orderRow) OrderOutcome {
-	client := r.clients[o.ExchangeCode]
+	// STRICT dry/live routing (PR19 round 2 #5): a dry-run cycle is verified ONLY through a
+	// simulated client, a real cycle ONLY through a real client. The other mode's client is
+	// never reachable here, so no cross-mode query is possible.
+	client := r.clientFor(c.DryRun, o.ExchangeCode)
 	if client == nil {
-		// No read-only client wired for this exchange: cannot verify. NoAction
-		// (skip) rather than NEEDS_RECONCILE — the reconciler simply isn't
-		// configured for this venue; flagging everything would be noise.
-		return OrderOutcome{Decision: NoAction, Reason: "no read-only client for " + o.ExchangeCode + "; skipped"}
+		// No read-only client wired for this exchange IN THIS MODE: cannot verify. NoAction
+		// (skip) rather than NEEDS_RECONCILE — the reconciler simply isn't configured for this
+		// venue/mode; flagging everything would be noise, and we must NOT fall back to the other
+		// mode's client. Cycle state is left unchanged.
+		mode := "live"
+		if c.DryRun {
+			mode = "dry-run"
+		}
+		return OrderOutcome{Decision: NoAction, Reason: "no " + mode + " read-only client for " + o.ExchangeCode + "; skipped"}
 	}
 
 	// Pre-send states with no exchange id: the order hasn't been sent yet (it is
@@ -316,11 +357,11 @@ func (r *Reconciler) reconcileOrder(ctx context.Context, c cycleRow, o orderRow)
 		return decideKnownOrder(o.State, st, err)
 	}
 
-	// exchange_order_id unknown (only local_client_order_id). Do NOT resend.
-	// Try to POSITIVELY identify the order via safe data.
-	if caps.ClientOrderID && caps.FetchByOrderID && o.LocalClientOrderID != "" {
-		// Client-order-id venues (e.g. Wallex) key GetOrder by the client id.
-		st, err := client.GetOrder(ctx, o.LocalClientOrderID)
+	// exchange_order_id unknown. Do NOT resend. Try to POSITIVELY identify the order by the client
+	// id — but ONLY through a real ClientOrderLookup client (never GetOrder, which takes an
+	// exchange id), and using the EXACT id we sent (client_order_id_sent, else the local id).
+	if lk, ok := client.(exchanges.ClientOrderLookup); ok && caps.LookupByClientOrderID && o.clientLookupID() != "" {
+		st, err := lk.GetOrderByClientOrderID(ctx, o.clientLookupID())
 		if err == nil {
 			out := decideKnownOrder(o.State, st, nil)
 			if st.ExchangeOrderID != "" {
@@ -328,6 +369,7 @@ func (r *Reconciler) reconcileOrder(ctx context.Context, c cycleRow, o orderRow)
 			}
 			return out
 		}
+		// A "not found" is NEVER proof of no fill (eventual consistency) → keep it reconcile-owned.
 		if errors.Is(err, execution.ErrOrderUnknown) {
 			return OrderOutcome{Decision: NeedsReconcile, Reason: "client-order-id not found — NOT proof of no fill"}
 		}

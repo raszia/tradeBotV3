@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadFromFileWithDefaults(t *testing.T) {
@@ -160,5 +161,146 @@ func TestExecutionModeDefaultIsSafe(t *testing.T) {
 	}
 	if live := (ExecutionConfig{Mode: ExecutionLive}); !live.IsLive() {
 		t.Error("explicit live should report IsLive")
+	}
+}
+
+// loadTOML writes body to a temp config file and Loads it (DSN included so Validate runs).
+func loadTOML(t *testing.T, body string) (Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[mysql]\ndsn=\"u:p@tcp(h:3306)/db\"\n"+body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(path)
+}
+
+// TestRecoveryConfigParsedAndResolved (PR19 round 4): the [execution.recovery] section is
+// genuinely runtime-parsed; a full per-exchange override wins; a PARTIAL per-exchange override
+// inherits every unset field from the CONFIGURED global values — never hard-coded defaults.
+func TestRecoveryConfigParsedAndResolved(t *testing.T) {
+	cfg, err := loadTOML(t, `
+[execution]
+mode = "off"
+[execution.recovery]
+max_attempts = 9
+initial_delay_ms = 2000
+max_delay_ms = 40000
+total_timeout_ms = 600000
+[execution.recovery.per_exchange.nobitex]
+max_attempts = 12
+[execution.recovery.per_exchange.wallex]
+max_attempts = 3
+initial_delay_ms = 500
+max_delay_ms = 5000
+total_timeout_ms = 60000
+`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	g, per := cfg.Execution.ResolvedRecovery()
+	if g.MaxAttempts != 9 || g.InitialDelay != 2*time.Second || g.MaxDelay != 40*time.Second || g.TotalTimeout != 10*time.Minute {
+		t.Errorf("global resolved = %+v, want 9/2s/40s/10m (configured values, not defaults)", g)
+	}
+	// Partial override: max_attempts set, everything else INHERITS THE CONFIGURED GLOBAL
+	// (2s/40s/10m) — not the hard defaults (1s/30s/5m).
+	nb := per["nobitex"]
+	if nb.MaxAttempts != 12 {
+		t.Errorf("nobitex max_attempts = %d, want the override 12", nb.MaxAttempts)
+	}
+	if nb.InitialDelay != 2*time.Second || nb.MaxDelay != 40*time.Second || nb.TotalTimeout != 10*time.Minute {
+		t.Errorf("nobitex partial override inherited %v/%v/%v, want the CONFIGURED global 2s/40s/10m", nb.InitialDelay, nb.MaxDelay, nb.TotalTimeout)
+	}
+	// Full override wins outright.
+	wx := per["wallex"]
+	if wx.MaxAttempts != 3 || wx.InitialDelay != 500*time.Millisecond || wx.MaxDelay != 5*time.Second || wx.TotalTimeout != time.Minute {
+		t.Errorf("wallex full override = %+v, want 3/500ms/5s/1m", wx)
+	}
+}
+
+// TestRecoveryConfigDefaults: an omitted [execution.recovery] section takes the documented
+// safe defaults (6 attempts, 1s initial, 30s cap, 5m total) with no per-exchange overrides.
+func TestRecoveryConfigDefaults(t *testing.T) {
+	cfg, err := loadTOML(t, "[execution]\nmode = \"off\"\n")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	g, per := cfg.Execution.ResolvedRecovery()
+	if g.MaxAttempts != 6 || g.InitialDelay != time.Second || g.MaxDelay != 30*time.Second || g.TotalTimeout != 5*time.Minute {
+		t.Errorf("defaults = %+v, want 6/1s/30s/5m", g)
+	}
+	if per != nil {
+		t.Errorf("per-exchange = %v, want nil when unconfigured", per)
+	}
+}
+
+// TestRecoveryConfigValidation: an invalid recovery window is a HARD STARTUP ERROR — never
+// silently corrected: negatives, inverted delays, out-of-bounds values, and per-exchange
+// overrides whose RESOLVED window is invalid.
+func TestRecoveryConfigValidation(t *testing.T) {
+	bad := map[string]string{
+		"negative max_attempts":  "[execution.recovery]\nmax_attempts = -1\n",
+		"max_attempts over 100":  "[execution.recovery]\nmax_attempts = 101\n",
+		"negative initial delay": "[execution.recovery]\ninitial_delay_ms = -5\n",
+		"max below initial":      "[execution.recovery]\ninitial_delay_ms = 10000\nmax_delay_ms = 2000\n",
+		"max delay over 1h":      "[execution.recovery]\ninitial_delay_ms = 1000\nmax_delay_ms = 3600001\n",
+		"negative total":         "[execution.recovery]\ntotal_timeout_ms = -1\n",
+		"total over 24h":         "[execution.recovery]\ntotal_timeout_ms = 86400001\n",
+		"negative per-exchange":  "[execution.recovery.per_exchange.nobitex]\nmax_attempts = -2\n",
+		// Resolved per-exchange window invalid: global initial 5s, override caps max at 2s.
+		"per-exchange resolved max below inherited initial": "[execution.recovery]\ninitial_delay_ms = 5000\nmax_delay_ms = 30000\n[execution.recovery.per_exchange.wallex]\nmax_delay_ms = 2000\n",
+	}
+	for name, body := range bad {
+		if _, err := loadTOML(t, body); err == nil {
+			t.Errorf("%s: Load succeeded, want a hard startup error", name)
+		} else if !strings.Contains(err.Error(), "execution.recovery") {
+			t.Errorf("%s: error %v should mention execution.recovery", name, err)
+		}
+	}
+	// Sane explicit values (and a sane partial override) must pass.
+	if _, err := loadTOML(t, "[execution.recovery]\nmax_attempts = 10\ninitial_delay_ms = 500\nmax_delay_ms = 60000\ntotal_timeout_ms = 900000\n[execution.recovery.per_exchange.nobitex]\ntotal_timeout_ms = 1200000\n"); err != nil {
+		t.Errorf("valid recovery config rejected: %v", err)
+	}
+}
+
+// TestExecutionModeValidation: exactly off/dry_run/live are accepted; empty normalizes to
+// off; a typo/unknown value is a hard startup error (never silently treated as off).
+func TestExecutionModeValidation(t *testing.T) {
+	load := func(mode string) (*Config, error) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.toml")
+		body := "[mysql]\ndsn=\"u:p@tcp(h:3306)/db\"\n"
+		if mode != "<omit>" {
+			body += "[execution]\nmode=\"" + mode + "\"\n"
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		return &cfg, err
+	}
+
+	// Empty / omitted → normalized to off, valid.
+	for _, m := range []string{"", "<omit>"} {
+		cfg, err := load(m)
+		if err != nil {
+			t.Errorf("mode %q should load (normalize to off), got %v", m, err)
+		} else if cfg.Execution.Mode != ExecutionOff || !cfg.Execution.IsOff() {
+			t.Errorf("mode %q normalized to %q, want off", m, cfg.Execution.Mode)
+		}
+	}
+	// Valid explicit values.
+	for _, m := range []string{ExecutionOff, ExecutionDryRun, ExecutionLive} {
+		if _, err := load(m); err != nil {
+			t.Errorf("mode %q must be valid, got %v", m, err)
+		}
+	}
+	// Typos / unknown → validation error mentioning execution.mode.
+	for _, m := range []string{"dryrun", "DRY_RUN", "simulate", "on", "Off", "unknown"} {
+		_, err := load(m)
+		if err == nil {
+			t.Errorf("mode %q must be rejected (not silently treated as off)", m)
+		} else if !strings.Contains(err.Error(), "execution.mode") {
+			t.Errorf("mode %q error = %v, want it to mention execution.mode", m, err)
+		}
 	}
 }

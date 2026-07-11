@@ -67,7 +67,46 @@ type Capabilities struct {
 	RecentFills     bool // GetRecentFills (where implemented)
 	OrderUpdatesWS  bool // SubscribeOrderUpdates over WebSocket
 	OrderStatusPoll bool // order status available via polling
-	ClientOrderID   bool // venue accepts a client-provided order id
+	// ClientOrderID: the venue accepts a client-provided order id ON PLACEMENT. This is
+	// DISTINCT from being able to look an order up by that id — see LookupByClientOrderID.
+	ClientOrderID bool
+	// LookupByClientOrderID: GetOrder can resolve an order BY its client order id. Only set
+	// this when the adapter's GetOrder genuinely accepts a client id (e.g. Wallex, which keys
+	// orders by client_id). An adapter that accepts a client id on placement but whose GetOrder
+	// takes only the exchange order id must leave this FALSE — the ambiguous-place recovery must
+	// never pass a client id into an endpoint that expects an exchange order id, and must never
+	// treat a "not found" from such a venue as proof the order was not placed.
+	LookupByClientOrderID bool
+	// ReliableNotFound: a "not found" from GetOrder is a TRUTHFUL negative — the venue has no
+	// eventual-consistency window in which an accepted order is briefly invisible. Almost always
+	// FALSE for real venues (an order may be accepted but not yet queryable), so a "not found"
+	// is ambiguous and must NOT be treated as proof of non-placement. Only when this is true may
+	// the recovery, after bounded read-only retries still find nothing, classify the order as
+	// provably-not-placed and fail it cleanly.
+	ReliableNotFound bool
+}
+
+// ClientOrderLookup is an OPTIONAL interface a PrivateClient implements when it can resolve an
+// order BY its client order id through a read-only API. This is what the ambiguous-place recovery
+// and the reconciler use when the exchange order id is unknown — NEVER GetOrder (which takes an
+// exchange order id on most venues). An adapter should implement it ONLY when the lookup uses a
+// RELIABLE identifier (the venue's own client-order-id field, unique per user), so a recovered
+// order is never the wrong one. `Capabilities.LookupByClientOrderID` must be true iff this is
+// implemented. ErrOrderUnknown means "not found (yet)" — never proof the order was not placed.
+type ClientOrderLookup interface {
+	GetOrderByClientOrderID(ctx context.Context, clientOrderID string) (execution.OrderStatus, error)
+}
+
+// ClientOrderIDNormalizer is an OPTIONAL interface a PrivateClient may implement when it
+// transforms the local client order id before sending it (truncation, length limits, encoding,
+// prefixing). ClientOrderIDForSend returns the EXACT identifier the adapter will transmit for a
+// given local id, so the order-executor can persist that value (client_order_id_sent) BEFORE the
+// network call and recover the order by exactly what the venue received. Adapters that send the
+// id verbatim need not implement it (the executor then persists the local id unchanged).
+// Implementations MUST be deterministic and idempotent (ClientOrderIDForSend(ClientOrderIDForSend(x))
+// == ClientOrderIDForSend(x)) so the adapter's own PlaceOrder re-normalization is a no-op.
+type ClientOrderIDNormalizer interface {
+	ClientOrderIDForSend(local string) string
 }
 
 // PublicClient is the read-only market-data surface. It requires NO credentials,

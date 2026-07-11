@@ -62,18 +62,19 @@ func init() {
 	Register(Registration{
 		Code: wallexCode,
 		Capabilities: Capabilities{
-			MarketMetadata:  true,
-			OrderBookREST:   true,
-			OrderBookWS:     false, // public WS exists on Wallex but is deferred here
-			BalanceFetch:    true,
-			PlaceOrder:      true,
-			CancelByOrderID: true, // by client_id (see file header)
-			FetchByOrderID:  true, // by client_id (see file header)
-			FetchOpenOrders: true,
-			RecentFills:     false,
-			OrderUpdatesWS:  false, // no private order WS
-			OrderStatusPoll: true,  // status available via GetOrder polling
-			ClientOrderID:   true,  // Wallex identifies orders by client_id
+			MarketMetadata:        true,
+			OrderBookREST:         true,
+			OrderBookWS:           false, // public WS exists on Wallex but is deferred here
+			BalanceFetch:          true,
+			PlaceOrder:            true,
+			CancelByOrderID:       true, // by client_id (see file header)
+			FetchByOrderID:        true, // by client_id (see file header)
+			FetchOpenOrders:       true,
+			RecentFills:           false,
+			OrderUpdatesWS:        false, // no private order WS
+			OrderStatusPoll:       true,  // status available via GetOrder polling
+			ClientOrderID:         true,  // Wallex identifies orders by client_id
+			LookupByClientOrderID: true,  // GetOrder(id) here IS a lookup by client_id (see file header)
 		},
 		NewPublic:  newWallexPublic,
 		NewPrivate: newWallexPrivate,
@@ -615,6 +616,12 @@ func (w *wallexPrivate) CancelOrder(ctx context.Context, exchangeOrderID string)
 //
 // QUIRK: Wallex looks up by CLIENT order id. The exchangeOrderID argument is
 // treated as the client id.
+
+// GetOrderByClientOrderID implements exchanges.ClientOrderLookup. On Wallex the client order id
+// IS the order key, so this is exactly GetOrder.
+func (w *wallexPrivate) GetOrderByClientOrderID(ctx context.Context, clientOrderID string) (execution.OrderStatus, error) {
+	return w.GetOrder(ctx, clientOrderID)
+}
 
 func (w *wallexPrivate) GetOrder(ctx context.Context, exchangeOrderID string) (execution.OrderStatus, error) {
 	clientOrderID := exchangeOrderID

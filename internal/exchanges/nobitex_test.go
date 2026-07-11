@@ -449,18 +449,19 @@ func TestNobitexCapabilityFlags(t *testing.T) {
 	}
 	c := r.Capabilities
 	want := Capabilities{
-		MarketMetadata:  true,
-		OrderBookREST:   true,
-		OrderBookWS:     false,
-		BalanceFetch:    true,
-		PlaceOrder:      true,
-		CancelByOrderID: true,
-		FetchByOrderID:  true,
-		FetchOpenOrders: true,
-		RecentFills:     false,
-		OrderUpdatesWS:  false,
-		OrderStatusPoll: true,
-		ClientOrderID:   true,
+		MarketMetadata:        true,
+		OrderBookREST:         true,
+		OrderBookWS:           false,
+		BalanceFetch:          true,
+		PlaceOrder:            true,
+		CancelByOrderID:       true,
+		FetchByOrderID:        true,
+		FetchOpenOrders:       true,
+		RecentFills:           false,
+		OrderUpdatesWS:        false,
+		OrderStatusPoll:       true,
+		ClientOrderID:         true,
+		LookupByClientOrderID: true, // list recent orders + match clientOrderId (round 4 #2)
 	}
 	if c != want {
 		t.Errorf("capabilities = %+v, want %+v", c, want)
@@ -508,4 +509,43 @@ func isUnsupported(err error) bool {
 
 func isSentinel(err, target error) bool {
 	return err != nil && errors.Is(err, target)
+}
+
+// TestNobitexGetOrderByClientOrderID (PR19 round 4 #2): after an ambiguous placement Nobitex has
+// no GetOrder-by-client-id, so recovery lists recent orders and matches the RELIABLE clientOrderId.
+func TestNobitexGetOrderByClientOrderID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/market/orders/list") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"ok","orders":[
+			{"id":111,"clientOrderId":"other-order","type":"buy","execution":"limit","srcCurrency":"btc","dstCurrency":"rls","price":"6000000000","amount":"0.01","matchedAmount":"0","unmatchedAmount":"0.01","status":"Active","market":"BTCIRT"},
+			{"id":222,"clientOrderId":"want-42","type":"buy","execution":"limit","srcCurrency":"btc","dstCurrency":"rls","price":"6000000000","amount":"0.02","matchedAmount":"0.02","unmatchedAmount":"0","status":"Done","market":"BTCIRT"}
+		]}`))
+	}))
+	defer srv.Close()
+
+	priv := newNobitexPrivateTest(t, srv)
+	if !priv.Capabilities().LookupByClientOrderID {
+		t.Fatal("Nobitex must declare LookupByClientOrderID")
+	}
+	lk, ok := priv.(ClientOrderLookup)
+	if !ok {
+		t.Fatal("Nobitex must implement ClientOrderLookup")
+	}
+	st, err := lk.GetOrderByClientOrderID(context.Background(), "want-42")
+	if err != nil {
+		t.Fatalf("GetOrderByClientOrderID: %v", err)
+	}
+	if st.ClientOrderID != "want-42" {
+		t.Errorf("matched clientOrderId = %q, want want-42", st.ClientOrderID)
+	}
+	if st.ExchangeOrderID != "222" {
+		t.Errorf("matched exchange id = %q, want 222 (the right order)", st.ExchangeOrderID)
+	}
+	// An unknown client id → ErrOrderUnknown (never the wrong order, never proof of no placement).
+	if _, e := lk.GetOrderByClientOrderID(context.Background(), "no-such"); !errors.Is(e, execution.ErrOrderUnknown) {
+		t.Errorf("unknown client id err = %v, want ErrOrderUnknown", e)
+	}
 }

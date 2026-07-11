@@ -22,16 +22,31 @@ import (
 	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/reconciler"
 	"v3TradeBot/internal/service"
+	"v3TradeBot/internal/simexec"
 )
 
 func main() {
 	err := service.RunWithDB("reconciler", service.ConfigFlag(), func(ctx context.Context, base service.Base, store *db.Store) error {
 		// The reconciler cannot place/cancel by construction (it holds a ReadOnlyClient
-		// interface). Build credentialed read-only clients where available; no/invalid
-		// master key → empty set → inspect + report only.
-		clients := map[string]reconciler.ReadOnlyClient{}
+		// interface). PR19 round 2: it holds BOTH client sets and routes STRICTLY by each
+		// cycle's dry_run flag — a dry-run cycle is only ever verified through a simulated
+		// client, a real cycle only through a real read-only client, regardless of the process's
+		// own execution mode. This makes a cross-mode query impossible even when both a
+		// dry-run and a real cycle exist at once.
+
+		// Simulated (dry_run=1) read-only clients — always available (DB-backed, no network, no
+		// credentials). They read the SAME persisted sim_exchange_orders the executor wrote.
+		simClients := map[string]reconciler.ReadOnlyClient{}
+		for _, code := range enabledExchanges(ctx, store) {
+			simClients[code] = simexec.New(store.DB(), code, simexec.FullFill)
+		}
+
+		// Real (dry_run=0) read-only clients — built from DB-decrypted credentials where
+		// available; a missing/invalid master key or absent credential leaves the set empty, so
+		// real cycles are inspect-only (never verified through the simulator).
+		realClients := map[string]reconciler.ReadOnlyClient{}
 		if provider, perr := credentials.NewProvider(store.DB(), base.Cfg.Security.MasterKey, clock.NewSystem(), base.Log); perr != nil {
-			base.Log.Warn("reconciler: read-only clients disabled (no/invalid master key); inspect-only", "err", perr)
+			base.Log.Warn("reconciler: real read-only clients disabled (no/invalid master key); real cycles inspect-only", "err", perr)
 		} else {
 			iolog := exchanges.NewIOLogger(exchanges.IOLogConfig{Enabled: true, Source: "reconciler"}, store.DB())
 			defer iolog.Close()
@@ -41,16 +56,33 @@ func main() {
 				if err != nil {
 					continue
 				}
-				clients[code] = client // narrowed to ReadOnlyClient (no place/cancel reachable)
+				realClients[code] = client // narrowed to ReadOnlyClient (no place/cancel reachable)
 			}
 		}
 
-		rec := reconciler.New(store, clients, base.Log)
-		base.Log.Info("reconciler ready (read-only)", "clients", len(clients))
+		rec := reconciler.New(store, realClients, simClients, base.Log)
+		base.Log.Info("reconciler ready (read-only)", "real_clients", len(realClients), "sim_clients", len(simClients), "mode", base.Cfg.Execution.Mode)
 		return rec.RunPeriodic(ctx, 30*time.Second)
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reconciler: "+err.Error())
 		os.Exit(1)
 	}
+}
+
+// enabledExchanges returns the codes of enabled exchanges (best-effort).
+func enabledExchanges(ctx context.Context, store *db.Store) []string {
+	rows, err := store.DB().QueryContext(ctx, "SELECT code FROM exchanges WHERE enabled=1")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var codes []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err == nil {
+			codes = append(codes, c)
+		}
+	}
+	return codes
 }

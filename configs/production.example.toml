@@ -77,3 +77,16 @@ master_key = ""
 #             full RUNBOOK.md checklist is satisfied.
 # Local/staging readiness uses "off" or "dry_run" ONLY.
 mode = "off"
+
+[execution.recovery]
+# Ambiguous-mutation recovery window (see config.example.toml for the full description).
+# A timed-out PlaceOrder/CancelOrder is probed READ-ONLY with bounded exponential backoff
+# + jitter until resolved or this window is exhausted (then NEEDS_RECONCILE, lock held).
+# Milliseconds; zero/omitted = safe default; negative/out-of-bounds = hard startup error.
+max_attempts = 6
+initial_delay_ms = 1000
+max_delay_ms = 30000
+total_timeout_ms = 300000
+# Per-exchange overrides (partial overrides inherit the values above), e.g.:
+# [execution.recovery.per_exchange.nobitex]
+# total_timeout_ms = 900000

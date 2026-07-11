@@ -39,11 +39,28 @@ type fakeClient struct {
 	placeCount  int32
 	cancelCount int32
 	getCount    int32
+	// PR19 round 3 test hooks.
+	capsOverride *exchanges.Capabilities // capability set (nil → default)
+	normalizeCID func(string) string     // ClientOrderIDForSend transform (nil → passthrough)
+	onPlace      func()                  // called INSIDE PlaceOrder (assert persisted-before-send)
+	lastSentCID  string                  // the ClientOrderID PlaceOrder actually received
 }
 
 func (f *fakeClient) Name() string { return f.code }
 func (f *fakeClient) Capabilities() exchanges.Capabilities {
+	if f.capsOverride != nil {
+		return *f.capsOverride
+	}
 	return exchanges.Capabilities{PlaceOrder: true}
+}
+
+// ClientOrderIDForSend implements exchanges.ClientOrderIDNormalizer (passthrough unless a
+// transform is set), so tests can prove the EXACT sent id is persisted before the network call.
+func (f *fakeClient) ClientOrderIDForSend(local string) string {
+	if f.normalizeCID != nil {
+		return f.normalizeCID(local)
+	}
+	return local
 }
 func (f *fakeClient) GetBalances(context.Context) ([]domain.Balance, error) {
 	if f.balErr != nil {
@@ -51,8 +68,12 @@ func (f *fakeClient) GetBalances(context.Context) ([]domain.Balance, error) {
 	}
 	return []domain.Balance{{Asset: "USDT", Available: decimal.RequireFromString("100")}}, nil
 }
-func (f *fakeClient) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderAck, error) {
+func (f *fakeClient) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
 	atomic.AddInt32(&f.placeCount, 1)
+	f.lastSentCID = req.ClientOrderID
+	if f.onPlace != nil {
+		f.onPlace()
+	}
 	return f.placeAck, f.placeErr
 }
 func (f *fakeClient) CancelOrder(context.Context, string) error {
@@ -60,6 +81,13 @@ func (f *fakeClient) CancelOrder(context.Context, string) error {
 	return f.cancelErr
 }
 func (f *fakeClient) GetOrder(context.Context, string) (execution.OrderStatus, error) {
+	atomic.AddInt32(&f.getCount, 1)
+	return f.getStatus, f.getErr
+}
+
+// GetOrderByClientOrderID implements exchanges.ClientOrderLookup (delegates to the fake's
+// canned status/error, like GetOrder) so recovery-by-client-id tests can drive the fake.
+func (f *fakeClient) GetOrderByClientOrderID(context.Context, string) (execution.OrderStatus, error) {
 	atomic.AddInt32(&f.getCount, 1)
 	return f.getStatus, f.getErr
 }
@@ -294,7 +322,11 @@ func TestPlaceDefiniteRejectionFailsCleanly(t *testing.T) {
 	}
 }
 
-func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
+// TestPlaceAmbiguousSchedulesRecoveryProbe (PR19 round 2 #3): an ambiguous PLACE timeout is an
+// UNKNOWN outcome — never a blind resend and NO LONGER an immediate NEEDS_RECONCILE. Instead the
+// place request is DEAD-lettered (consumed) and a READ-ONLY GET_ORDER recovery probe is
+// scheduled; the order is left QUEUED/SUBMITTED for the probe to resolve.
+func TestPlaceAmbiguousSchedulesRecoveryProbe(t *testing.T) {
 	it := setup(t)
 	orderID, cycleID := it.seedBuyOrder(t, string(state.CycleBuySubmitted), string(state.OrderSubmitted))
 	it.fake.placeErr = execution.ErrAckTimeout // ambiguous: maybe placed, maybe not
@@ -302,13 +334,19 @@ func TestPlaceAmbiguousDeadAndReconcile(t *testing.T) {
 	it.exec.process(it.ctx, c)
 
 	if s := reqStatus(t, it.db, c.ID); s != "DEAD" {
-		t.Errorf("ambiguous status = %s, want DEAD (never re-sent)", s)
+		t.Errorf("ambiguous place request status = %s, want DEAD (consumed, never re-sent)", s)
 	}
-	if os := ordState(t, it.db, orderID); os != string(state.OrderNeedsReconcile) {
-		t.Errorf("order state = %s, want NEEDS_RECONCILE", os)
+	// The order must NOT be prematurely failed/reconciled — recovery is pending.
+	if os := ordState(t, it.db, orderID); os == string(state.OrderNeedsReconcile) || os == string(state.OrderFailed) {
+		t.Errorf("order state = %s, want it left for recovery (not NEEDS_RECONCILE/FAILED)", os)
 	}
-	if cs := cycState(t, it.db, cycleID); cs != string(state.CycleNeedsReconcile) {
-		t.Errorf("cycle state = %s, want NEEDS_RECONCILE", cs)
+	// Exactly one read-only recovery probe must be scheduled for this order.
+	var probes int
+	it.db.QueryRow(`SELECT COUNT(*) FROM exchange_requests
+		WHERE order_id=? AND request_type='GET_ORDER'
+		  AND JSON_EXTRACT(payload,'$.purpose') = ?`, orderID, orders.PurposeAmbiguousPlaceProbe).Scan(&probes)
+	if probes != 1 {
+		t.Errorf("scheduled ambiguous_place_probe = %d, want 1 (read-only recovery, not blind resend)", probes)
 	}
 }
 
@@ -366,11 +404,16 @@ func TestPlaceSuccessRollsBackWhenOrderTransitionInvalid(t *testing.T) {
 	}
 }
 
-func TestCancelSuccess(t *testing.T) {
+// TestCancelWithoutCycleFailsClosed (PR19 round 3 #6): a mutating CANCEL_ORDER with no cycle/order
+// context cannot be classified dry-run vs live nor recovered — it must FAIL CLOSED with NO send.
+func TestCancelWithoutCycleFailsClosed(t *testing.T) {
 	it := setup(t)
 	c := it.seedRequest(t, queue.TypeCancelOrder, `{"exchange_order_id":"EX1"}`, nil)
 	it.exec.process(it.ctx, c)
-	if s := reqStatus(t, it.db, c.ID); s != "SUCCEEDED" {
-		t.Errorf("cancel success status = %s", s)
+	if n := atomic.LoadInt32(&it.fake.cancelCount); n != 0 {
+		t.Errorf("CancelOrder called %d times for a cycle-less request, want 0 (fail closed)", n)
+	}
+	if s := reqStatus(t, it.db, c.ID); s != "FAILED" {
+		t.Errorf("cycle-less cancel status = %s, want FAILED (not sent)", s)
 	}
 }

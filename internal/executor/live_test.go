@@ -16,8 +16,8 @@ import (
 func (it *intg) liveExec(t *testing.T, sc simexec.Scenario) {
 	t.Helper()
 	guard := live.NewGuard(it.store.DB(), clock.NewSystem(), nil)
-	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: simexec.New(it.code, sc)}, nil,
-		Config{Name: "live", AllowLiveExecution: true, ExecutionMode: "live", Guard: guard, FinalStatusDelay: 10 * time.Millisecond})
+	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: simexec.New(it.db, it.code, sc)}, nil,
+		Config{Name: "live", AllowLiveExecution: true, ExecutionMode: "live", Guard: guard, FinalStatusDelay: 10 * time.Millisecond, Recovery: fastRecovery()})
 	if err := it.exec.resolveExchangeIDs(it.ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -90,18 +90,30 @@ func TestLiveGateNoCredentialsRefuses(t *testing.T) {
 	}
 }
 
-func TestLiveAmbiguousPlaceNeedsReconcileNoBlindResend(t *testing.T) {
+// TestLiveAmbiguousPlaceRecoversNoBlindResend (PR19 round 3 #1/#3): an ambiguous live PLACE
+// timeout is never blindly retried. The original place is DEAD-lettered and a READ-ONLY recovery
+// probe runs. A "not found" is NEVER proof of non-placement (eventual consistency), so after
+// bounded retries the order goes to NEEDS_RECONCILE with the lock HELD — never a clean fail, never
+// re-placed.
+func TestLiveAmbiguousPlaceRecoversNoBlindResend(t *testing.T) {
 	it := setup(t)
 	it.liveControls(0, true)
-	it.liveExec(t, simexec.PlaceTimeout) // PlaceOrder returns an ambiguous ack timeout
+	it.liveExec(t, simexec.PlaceTimeout) // PlaceOrder times out; the order is not found on probes
 	cyc, ord, placeReq := it.seedBuyCycle(t, "0.5")
 	it.db.Exec("UPDATE exchange_markets SET live_enabled=1 WHERE exchange_id=?", it.exID)
-	it.drive(3)
-	// Ambiguous live place -> order+cycle NEEDS_RECONCILE, request DEAD, never re-sent.
-	if it.cycleState(cyc) != "NEEDS_RECONCILE" || ordState(t, it.db, ord) != "NEEDS_RECONCILE" {
-		t.Errorf("ambiguous live place = cyc:%s ord:%s, want NEEDS_RECONCILE", it.cycleState(cyc), ordState(t, it.db, ord))
-	}
+	it.drive(14)
+	// The original place is DEAD (consumed, never re-sent).
 	if s := reqStatus(t, it.db, placeReq); s != "DEAD" {
-		t.Errorf("ambiguous request = %s, want DEAD (not blindly retried)", s)
+		t.Errorf("ambiguous place request = %s, want DEAD (not blindly retried)", s)
+	}
+	// Unresolved after bounded read-only retries → NEEDS_RECONCILE, lock held (outcome unknown).
+	if it.cycleState(cyc) != "NEEDS_RECONCILE" || ordState(t, it.db, ord) != "NEEDS_RECONCILE" {
+		t.Errorf("unresolved ambiguous live buy = cyc:%s ord:%s, want NEEDS_RECONCILE", it.cycleState(cyc), ordState(t, it.db, ord))
+	}
+	// No blind re-place: exactly one PLACE_ORDER ever existed for this order.
+	var places int
+	it.db.QueryRow("SELECT COUNT(*) FROM exchange_requests WHERE order_id=? AND request_type='PLACE_ORDER'", ord).Scan(&places)
+	if places != 1 {
+		t.Errorf("PLACE_ORDER requests for order = %d, want 1 (never blindly re-placed)", places)
 	}
 }

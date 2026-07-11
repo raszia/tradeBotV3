@@ -11,7 +11,7 @@ import (
 type StuckResult struct {
 	RequeuedClaimed  int // stale CLAIMED (never sent) reset to QUEUED
 	RequeuedReadOnly int // stale read-only IN_FLIGHT rescheduled
-	DeadMutating     int // stale mutating IN_FLIGHT dead-lettered + order NEEDS_RECONCILE
+	SkippedMutating  int // stale mutating IN_FLIGHT left for the order-executor's read-only recovery
 }
 
 // SweepStuck recovers requests left behind by a crashed executor. Recovery is
@@ -22,9 +22,12 @@ type StuckResult struct {
 //     can take them. This is always safe — including for mutating PLACE/CANCEL — because
 //     IN_FLIGHT (not CLAIMED) is the pre-send boundary.
 //   - Stale IN_FLIGHT READ-ONLY requests are idempotent → re-queued (RETRY_SCHEDULED).
-//   - Stale IN_FLIGHT MUTATING requests (PLACE/CANCEL) are NEVER blindly re-sent: their
-//     send outcome is unknown, so the request is moved to DEAD and the owning order is
-//     pushed to NEEDS_RECONCILE (same tx) for the reconciler / operator to resolve.
+//   - Stale IN_FLIGHT MUTATING requests (PLACE/CANCEL) are NEVER touched here (counted as
+//     SkippedMutating): their send outcome is unknown, and they are recovered EXCLUSIVELY
+//     by the order-executor's recoverStaleMutating — an atomic FOR-UPDATE-SKIP-LOCKED claim
+//     that converts each one into a persisted read-only recovery probe (never a blind
+//     resend). Keeping this sweeper out of mutating rows means the two recovery paths can
+//     never race a probe against a premature NEEDS_RECONCILE.
 //
 // "Stale" = older than its timeout_ms + graceSeconds.
 func (q *Queue) SweepStuck(ctx context.Context, graceSeconds int) (StuckResult, error) {
@@ -70,10 +73,11 @@ func (q *Queue) SweepStuck(ctx context.Context, graceSeconds int) (StuckResult, 
 
 	for _, s := range found {
 		if s.typ.IsMutating() {
-			if err := q.deadMutatingStuck(ctx, s.id, s.orderID); err != nil {
-				return res, err
-			}
-			res.DeadMutating++
+			// PR19 round 4 #1: a stale mutating IN_FLIGHT is recovered EXCLUSIVELY by the
+			// order-executor's recoverStaleMutating (an atomic FOR-UPDATE-SKIP-LOCKED claim that
+			// schedules a read-only recovery probe, never a blind resend). The generic sweeper does
+			// NOT touch it, so the two paths cannot race a probe against a premature reconcile.
+			res.SkippedMutating++
 			continue
 		}
 		// Read-only: safe to re-queue.

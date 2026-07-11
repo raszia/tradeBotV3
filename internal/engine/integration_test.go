@@ -476,6 +476,38 @@ func TestBelowThresholdNoCycle(t *testing.T) {
 // TestSignalOnlyMarketTouchesNoExecutionState (PR8 correction) — a signal-enabled but
 // NOT-trading market writes ONLY comparison_events + signals. The engine must create no
 // cycle/order/symbol-lock and must NOT mutate exchange_requests.
+// TestOffModeCreatesNoExecutableState (PR19): in "off" mode the trade-engine is wired with
+// PrepareBuyCycles=false (cmd/trade-engine sets `!Execution.IsOff()`), so even a valid
+// opportunity on a TRADING-ENABLED market records a signal but creates NO cycle / order /
+// PLACE_ORDER request / symbol lock — nothing a later mode change could execute.
+func TestOffModeCreatesNoExecutableState(t *testing.T) {
+	f := setupE(t)
+	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, true) // signal + trading ENABLED
+	base := baseOf(sym)
+	f.seedBook(f.exCode, sym, "99", "100", 0)
+	f.seedBook("binance", base+"/USDT", "101", "102", 0) // ~100 bps > 50 → passes
+	// off mode = PrepareBuyCycles stays FALSE (do NOT call enableBuyPrep).
+	reqBefore := f.exchangeRequestCount()
+
+	f.run(mc)
+
+	if f.signalCount(sym) != 1 {
+		t.Errorf("off mode: signal=%d, want 1 (signals may still be recorded)", f.signalCount(sym))
+	}
+	if n := f.cycleCount(mc); n != 0 {
+		t.Errorf("off mode cycles=%d, want 0", n)
+	}
+	if n := f.orderCountForMarket(mc); n != 0 {
+		t.Errorf("off mode orders=%d, want 0", n)
+	}
+	if n := f.lockCountForMarket(mc); n != 0 {
+		t.Errorf("off mode symbol_locks=%d, want 0", n)
+	}
+	if n := f.exchangeRequestCount(); n != reqBefore {
+		t.Errorf("off mode exchange_requests changed %d -> %d, want no PLACE_ORDER request", reqBefore, n)
+	}
+}
+
 func TestSignalOnlyMarketTouchesNoExecutionState(t *testing.T) {
 	f := setupE(t)
 	mc, sym := f.seedMarket("USDT", 50, "0", "0", true, false) // signal yes, trading NO

@@ -24,7 +24,7 @@ import (
 func (it *intg) iocExec(t *testing.T) {
 	t.Helper()
 	it.exec = New(it.store, it.q, map[string]exchanges.PrivateClient{it.code: it.fake}, nil,
-		Config{Name: "ioc", AllowLiveExecution: true, FinalStatusDelay: 10 * time.Millisecond})
+		Config{Name: "ioc", AllowLiveExecution: true, FinalStatusDelay: 10 * time.Millisecond, Recovery: fastRecovery()})
 	if err := it.exec.resolveExchangeIDs(it.ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -129,13 +129,17 @@ func TestSimulatedIOCZeroFillReleasesLock(t *testing.T) {
 	}
 }
 
+// TestSimulatedIOCCancelAmbiguousNeedsReconcile (PR19 round 2 #3): an ambiguous cancel is
+// never re-sent blindly — a READ-ONLY recovery probe determines the real state. Here the fake
+// reports an indeterminate (unknown) status for the probe AND the final status, so the flow
+// resolves conservatively to NEEDS_RECONCILE with the lock HELD (never guesses a fill).
 func TestSimulatedIOCCancelAmbiguousNeedsReconcile(t *testing.T) {
 	it := setup(t)
 	it.iocExec(t)
 	cyc, ord, _ := it.seedBuyCycle(t, "0.5")
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EXE-3"}
 	it.fake.cancelErr = context.DeadlineExceeded // ambiguous: we cannot tell if the cancel took
-	it.drive(5)
+	it.drive(8)
 
 	if it.orderState(ord) != "NEEDS_RECONCILE" || it.cycleState(cyc) != "NEEDS_RECONCILE" {
 		t.Fatalf("states = ord:%s cyc:%s, want NEEDS_RECONCILE both", it.orderState(ord), it.cycleState(cyc))

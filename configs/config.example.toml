@@ -53,3 +53,32 @@ session_ttl_minutes = 720   # login session lifetime (default 12h)
 # the database) and to support masking of raw API logs. Set a strong value in
 # real deployments and keep this file secret.
 master_key = ""
+
+[execution]
+# Trade-execution mode (config-driven, NEVER a runtime env var). EXACTLY one of:
+#   off     = no cycles/orders/requests/locks are created; nothing is sent (default, safest)
+#   dry_run = SIMULATED clients only — full lifecycle, ZERO real exposure, no credentials
+#   live    = real orders (gated by the PR20-PR25 safety stack)
+# An empty value normalizes to "off"; any other value (e.g. a typo like "dryrun") is a
+# hard startup error — it is never silently treated as "off".
+mode = "off"
+
+[execution.recovery]
+# Ambiguous-mutation recovery window (PR19): when a PlaceOrder/CancelOrder response times
+# out, the outcome is UNKNOWN — the order-executor never blindly retries the mutation, it
+# probes read-only (GET_ORDER) with bounded exponential backoff + jitter until the real
+# outcome is discovered OR this window is exhausted (then: NEEDS_RECONCILE, lock held).
+# Durations are integer milliseconds. Zero/omitted fields take these safe defaults; negative
+# or out-of-bounds values (max_attempts > 100, max_delay > 1h, total_timeout > 24h,
+# max_delay < initial_delay) are hard startup errors.
+max_attempts = 6
+initial_delay_ms = 1000    # first retry after ~1s (jittered in [d/2, d])
+max_delay_ms = 30000       # backoff cap: 1s, 2s, 4s, ... capped at 30s
+total_timeout_ms = 300000  # give up (NEEDS_RECONCILE) after 5 minutes overall
+
+# Per-exchange overrides for venues with slower order visibility. A PARTIAL override
+# inherits every omitted field from the [execution.recovery] values above (never from
+# hard-coded defaults). Example:
+# [execution.recovery.per_exchange.nobitex]
+# max_attempts = 10
+# total_timeout_ms = 900000

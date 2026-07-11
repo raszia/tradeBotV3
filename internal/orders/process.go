@@ -30,6 +30,13 @@ type FollowupPayload struct {
 	Purpose            string `json:"purpose"`
 	LocalClientOrderID string `json:"local_client_order_id,omitempty"`
 	CycleID            int64  `json:"cycle_id,omitempty"`
+	// Attempt bounds the ambiguous-cancel recovery loop (PR19 round 2 #3): each read-only probe
+	// that still finds the order OPEN re-issues the cancel with Attempt+1; after a bounded number
+	// of attempts the order goes to NEEDS_RECONCILE instead of looping forever.
+	Attempt int `json:"attempt,omitempty"`
+	// FirstProbeAt (unix millis) is stamped on the FIRST recovery probe and carried across
+	// re-probes so the recovery window's TotalTimeout is measured from the start (PR19 round 4 #5).
+	FirstProbeAt int64 `json:"first_probe_at,omitempty"`
 }
 
 // PlaceAckParams is the input to OnPlaceAck.
