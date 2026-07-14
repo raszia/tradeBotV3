@@ -314,6 +314,12 @@ canonical `markets` row; `canonical_symbol` is denormalized and must equal
 `markets.canonical_symbol` when `market_id` is set (both stored, relationship
 unambiguous).
 
+**`exchange_cooldowns` (migration 033, PR20 correction).** One row per exchange holding a
+DURABLE rate-limit park deadline: `exchange_id` (PK, FK→exchanges ON DELETE CASCADE),
+`cooldown_until`, `reason`, `source`, `updated_at`, plus `idx_exchange_cooldowns_until`.
+Written extend-only (`GREATEST`), reloaded by the order-executor at startup. Holds no secrets
+(reason = category/code, source = which signal identified it). See §16c.
+
 ## 6. Migration rules
 
 All schema/reference-data changes ship as embedded `internal/migrate/migrations/
@@ -532,6 +538,11 @@ lose what we were about to send / have sent).
   (atomic with the cycle/order rows that justify it). A duplicate
   `idempotency_key` is rejected by the UNIQUE index and surfaced as
   `ErrDuplicateIdempotencyKey` (rule #8).
+- **Parked-exchange gate (PR20).** Before claiming for an exchange the executor checks
+  its REACTIVE rate-limit cooldown (§16c): a parked exchange is **skipped entirely** —
+  nothing is claimed, so no request of any type can reach it until the cooldown expires.
+  It is poll-driven (the next tick re-checks), so there is no busy loop and no goroutine
+  sleeps holding claims.
 - **Claim algorithm** (cross-process safe — rule #3/#4): on a single pinned
   connection, take a **per-exchange advisory lock** (`GET_LOCK`), then in one
   transaction: count in-flight (`CLAIMED`+`IN_FLIGHT`), compute free slots vs the
@@ -542,8 +553,26 @@ lose what we were about to send / have sent).
   processes; SKIP LOCKED is belt-and-suspenders. (Verified by a concurrent-claimer
   test.)
 - **Retry/backoff:** `ScheduleRetry` bumps `retry_count`, sets
-  `RETRY_SCHEDULED` with exponential capped backoff, or → `DEAD` at max_retries.
-- **`MarkInFlight` is the pre-send boundary + is GUARDED (PR7 correction):** the
+  `RETRY_SCHEDULED` with exponential capped backoff, or → `DEAD` at max_retries. It
+  **refuses mutating requests** — a PLACE/CANCEL is never rescheduled by the generic
+  retry path.
+- **`Release` (PR20)** returns a `CLAIMED` row to `QUEUED` (`WHERE id=? AND
+  status='CLAIMED'`). It is the safe **pre-send defer**: the row was claimed but never
+  reached `IN_FLIGHT`, so nothing was sent. The executor uses it when an exchange gets
+  parked between the claim and the send.
+- **`RequeueProvenUnexecuted` (PR20)** is the ONLY sanctioned retry of a *mutating*
+  request. The caller must have PROOF from the venue's documented contract that the
+  request was rejected **before execution** (`RateLimitInfo.DefiniteRejection`, §16c);
+  it sets `RETRY_SCHEDULED` with `next_retry_at` at the cooldown deadline, is bounded by
+  `max_retries`, and on exhaustion dead-letters conservatively (`DEAD` + the owning order
+  `NEEDS_RECONCILE`) rather than sending again. Because `next_retry_at` is **persisted**,
+  a restart during the cooldown cannot duplicate the mutation.
+- **`MarkInFlight` at the REAL network boundary + GUARDED (PR7 + PR20 correction, round 8):** ALL
+  THREE private adapters (Nobitex, Wallex, Bitpin) implement `MutationPreparer`; every pre-send
+  step — credentials, symbol, payload, AND the final `http.Request` — runs BEFORE MarkInFlight, so
+  the row becomes IN_FLIGHT only immediately before the actual order/cancel `http.Do` (bind context
+  + send, nothing fallible in between). A crash during preparation (token acquisition or an
+  in-memory credential read) leaves it CLAIMED, never "maybe sent". Guard unchanged: the
   executor commits `MarkInFlight` (`CLAIMED→IN_FLIGHT`) BEFORE sending a mutating
   request. The update is `WHERE id=? AND status='CLAIMED'` and checks `RowsAffected`:
   zero rows → `ErrRequestNotClaimed`, and the executor MUST NOT call
@@ -569,7 +598,14 @@ lose what we were about to send / have sent).
   method/CLI that sends an order directly** (rule #1, asserted by a reflection
   test). Outcome handling:
   - read-only success → `SUCCEEDED`; retryable error → `RETRY_SCHEDULED`;
-    non-retryable → `FAILED`.
+    non-retryable → `FAILED`. A **rate-limit** error additionally parks the exchange
+    (§16c), so the reschedule naturally lands after the cooldown.
+  - **rate-limited mutating (PR20, checked BEFORE the branches below):** a throttle
+    signal parks the exchange, then splits on proof — a venue-PROVEN pre-execution
+    rejection → `RequeueProvenUnexecuted` (retry after the cooldown, never blind); ANY
+    other rate-limit-looking response, **including HTTP 200 with a throttle body** →
+    treated as AMBIGUOUS (never success, never retried) and resolved by the §10d
+    read-only recovery probe with the symbol lock HELD.
   - mutating: `MarkInFlight` → send → on **success** complete the request AND
     advance the order (`QUEUED→SUBMITTED`, stamping `exchange_order_id`) in **one
     transaction** (rule #9; if the order transition fails the whole tx rolls back
@@ -577,6 +613,11 @@ lose what we were about to send / have sent).
     (clear 4xx / insufficient balance) → `FAILED` (order unchanged); on an
     **ambiguous** outcome (timeout/network/5xx/unknown) → `DEAD` + order
     `NEEDS_RECONCILE`.
+- **A refused mutating request is never just "failed" (PR20).** When the live gate denies (or
+  a payload/market cannot be resolved), the executor resolves it through the official state
+  path — buy → FAILED + lock released, sell → NEEDS_RECONCILE + lock held, cancel → DEAD +
+  NEEDS_RECONCILE + lock held — so no order is left `QUEUED` with no executable request. See
+  §16c.
 - **Live-execution guard (rule #2):** `Config.AllowLiveExecution` defaults
   **false**; with it off the executor claims only read-only request types, so a
   dev service can never place a real order by inserting a row. The PR7
@@ -1331,7 +1372,9 @@ regime modules never depend on private credentials (rule #8):
 
 Normalized models: `domain.{OrderBook,Level,Balance,SymbolRules}`,
 `exchanges.NormalizedMarket`, `exchanges.NormalizedAPIError` (+ `ErrorCategory`,
-wraps `execution.Err*` sentinels), and `execution.{OrderRequest,OrderAck,
+wraps `execution.Err*` sentinels, and — PR20 — carries `RateLimit *RateLimitInfo`
+for throttle responses; see the rate-limit block below), and
+`execution.{OrderRequest,OrderAck,
 OrderStatus,Fill,NormalizedOrderState,NormalizedOrderEvent}`. Both WebSocket and
 polling results convert into the **same** `NormalizedOrderEvent`
 (`EventFromStatus`/`EventFromAck`), so PR10's processor has one code path.
@@ -1358,6 +1401,21 @@ polling results convert into the **same** `NormalizedOrderEvent`
   prices/quantities are decoded as `json.Number` and parsed with `decimal.NewFromString`
   (never `NewFromFloat`); Rial→Toman multipliers are exact `decimal.RequireFromString("0.1")`
   literals. Price/quantity/balance/fee are decimal end-to-end.
+- **Rate-limit normalization (PR20 — `internal/exchanges/ratelimit.go`):** each adapter
+  turns its venue's DOCUMENTED throttle signals into `Category=CatRateLimit` +
+  `RateLimitInfo{RetryAfter, Source (status|header|body|code), DefiniteRejection, Code}`,
+  wrapping `execution.ErrRateLimited`. Detection is **never HTTP-429-only**: it considers
+  the status, the structured venue error code, JSON body fields, the body message, the
+  `Retry-After` header, `X-RateLimit-Remaining:0` + `X-RateLimit-Reset`, and **successful
+  HTTP responses carrying a business-level throttle error**. Shared parsers:
+  `ParseRetryAfter` (delta-seconds or HTTP-date; malformed/non-positive → 0 so the caller
+  applies its configured fallback), `RetryAfterFromHeaders`, `ApplyRateLimitSignals`, and
+  the deliberately-narrow `LooksLikeRateLimitMessage` fallback (matches only unambiguous
+  throttle phrases, so it can never fire on "limit order" / "price limit"). Any
+  venue-supplied wait is capped at 15m. **`DefiniteRejection` is established per exchange
+  and per operation from a reliable contract — never inferred globally** — and is what
+  entitles a mutating request to be re-queued (§8/§16c). The rules are ported from the
+  owner's proven iranArb system where it had them (Nobitex, Bitpin).
 - **Factory**: each adapter self-registers in `init()` via `Register(...)` with
   its capability matrix + public/private constructors. `NewPublicClient` /
   `NewPrivateClient` build by code; unknown ops return a typed `ErrUnsupported`.
@@ -1382,12 +1440,23 @@ the price REFERENCE; the strategy never trades on it), Nobitex, Wallex, Bitpin
 - **Binance** read-only here; WS delivers `depth20@100ms` partial-book snapshots.
 - **Nobitex** quotes in RIAL (×0.1 → IRT); Token auth (no signing); `clientOrderId`
   ≤32 chars; multipart-form placement, JSON reads; 200-with-`status:failed`
-  business errors; private/book WS (Centrifuge) deferred → polling.
+  business errors; private/book WS (Centrifuge) deferred → polling. **Throttling
+  (PR20):** the documented `{"status":"failed","code":"TooManyRequests","backOff":N}`
+  envelope arrives on **429 AND on HTTP 200** — `backOff` is in **SECONDS**
+  (iranArb-verified), capped at 15m; a parsed envelope is a **definite pre-execution
+  rejection** (`status:"failed"` is Nobitex's documented not-performed contract), while a
+  bare 429 with no parseable envelope is NOT.
 - **Wallex** orders are **keyed by `client_id`, not an exchange order id** (cancel/
-  get take the client id); TMN→IRT; `x-api-key` auth; WS deferred → polling.
+  get take the client id); TMN→IRT; `x-api-key` auth; WS deferred → polling. Throttling
+  is detected from the status + standard headers, and from a `success:false` 200 body
+  only via the conservative phrase fallback; never a proven rejection (no documented
+  contract). iranArb had no reactive Wallex rule (proactive pacing only), so nothing is
+  guessed here.
 - **Bitpin** JWT access/refresh token flow (cached ~14m); rate-limit sensitive
-  (429 back-off); underscore symbols (`BTC_IRT`); `identifier` = client order id;
-  WS deferred → polling.
+  (429 back-off — `Retry-After` integer seconds, else the DRF body regex
+  `"available in N seconds"`; iranArb-proven parsers, reused for the order paths, where a
+  429 is **not** a proven rejection); underscore symbols (`BTC_IRT`); `identifier` =
+  client order id; WS deferred → polling.
 - **Ramzinex** order book keyed by numeric pair-id (resolved from the pairs
   endpoint); RIAL (×0.1 → IRT); Centrifuge WS deferred.
 - **Tabdeal / Exir** public-only price sources, TOMAN/IRT, no markets-list
@@ -1427,9 +1496,35 @@ additive enhancement for a later PR. Binance order-book WS is implemented.
 - **Snapshot** — an immutable point-in-time view: per-market config
   (`MarketConfig` = the four `enabled_for_*` flags from `exchange_markets` LEFT
   JOIN the trading params from `symbol_configs`), per-exchange config
-  (concurrency/timeouts), fees, retention settings, and the active
+  (concurrency/timeouts/rate limits), fees, retention settings, and the active
   `config_version`. `Store.LoadSnapshot` builds it; a missing active version is
   tolerated (`Version = 0`, the "unconfigured" state).
+- **Per-exchange operational fields — who actually consumes them (PR20).** A config field
+  that looks active but is ignored is a safety hazard (an operator "tightens" a limit that
+  does nothing), so the current wiring is stated exactly:
+
+  | `exchange_configs` field | Consumed at runtime by | Status |
+  |---|---|---|
+  | `rate_limit_per_sec` | order-executor PROACTIVE pacer (§16c) | **wired in PR20** |
+  | `retry_backoff_ms` | order-executor REACTIVE fallback cooldown (§16c) | **wired in PR20** |
+  | `balance_poll_interval_seconds` | `cmd/balance-sync` per-exchange cadence | wired (PR13) |
+  | `max_concurrent_requests` | nothing — `executor.Config.LimitFor` is unwired, so the effective claim limit is **1 per exchange per tick** | **NOT consumed (§18)** |
+  | `request_timeout_ms` | nothing — a request's `timeout_ms` is stamped at enqueue from `symbol_configs.order_timeout_ms` | **NOT consumed (§18)** |
+  | `max_retries` | nothing — a request's `max_retries` is stamped at enqueue from `symbol_configs.max_retries` | **NOT consumed (§18)** |
+
+  The order-executor reads the wired fields live through the copy-on-write cache
+  (`Config.ExchangeTuningFor`), so an edit takes effect on the next reload without a
+  restart, and a DB blip retains the last good snapshot. PR20's mandate covered the two
+  rate fields; the three remaining dead fields are recorded in §18 rather than left to look
+  active.
+- **Every reload is validated before it is swapped in (PR20 correction).** The initial load
+  is validated synchronously at startup (§16c). The PERIODIC refresh is validated too:
+  `Cache.RunValidated` calls the SAME validator on each reload and only replaces the active
+  snapshot if it passes; an invalid or incomplete reload (a removed `exchange_configs` row for
+  a wired live exchange, or a negative value) is rejected and the **last known-good snapshot
+  keeps serving** — an invalid reload can never silently disable pacing. `RunValidated` also
+  performs NO immediate reload at start (the validated startup load already ran), removing a
+  redundant, potentially-unvalidated second load right after startup.
 - **Fees scoped per exchange (PR6 correction)** — defaults live in
   `DefaultFeesByExchangeID` (keyed by `exchange_id`) and market-specific overrides in
   `FeesByMarketID` (keyed by `exchange_market_id`). A single map keyed by
@@ -2005,10 +2100,12 @@ eventual consistency, crashes, adapter quirks, and cross-instance drift:
   "provably-not-placed" and failed cleanly; otherwise it goes to NEEDS_RECONCILE (lock held).
 - **"Accepts a client id on place" ≠ "can look an order up by client id".** These are separate
   capabilities: `ClientOrderID` (accepted on placement) vs **`LookupByClientOrderID`** (GetOrder
-  resolves by client id — true only for Wallex, whose GetOrder IS keyed by client id; false for
-  Nobitex/Bitpin, which accept a client id on place but query by exchange id). Recovery/reconciler
-  probe by client id ONLY when `LookupByClientOrderID` is true — never passing a client id into an
-  exchange-id-only endpoint, never treating such a venue's "not found" as proof.
+  can resolve an order by client id). All three private venues set `LookupByClientOrderID: true`,
+  each via its own mechanism: **Wallex** — GetOrder IS keyed by the client id; **Bitpin** —
+  `GET /odr/orders/identifier/<id>/` resolves by the `identifier` (= our client id); **Nobitex** —
+  `GetOrderByClientOrderID` lists recent orders and matches the reliable `clientOrderId`. Recovery
+  goes through the `ClientOrderLookup.GetOrderByClientOrderID` capability and never passes a client
+  id into an exchange-id-only endpoint, nor treats a "not found" as proof of non-placement.
 - **Crash-after-send recovery.** If the process crashes after the exchange accepted a PLACE/CANCEL
   but before the response was handled (so no `ErrAckTimeout` probe was persisted), the executor's
   sweep (`recoverStaleMutating`) converts each stale IN_FLIGHT mutation — mode-scoped — into a
@@ -2102,11 +2199,16 @@ strict, explicit caps + a global kill switch + per-exchange/per-symbol live flag
 credential availability + an audit trail, with the final gate **inside the
 order-executor** (never relying on the engine alone). Safe by default at every layer.
 
-**Split.** The real **credential decryption + real-adapter wiring is deferred to PR20a**
-(a dedicated credential PR — encrypted-credential loading, in-memory decryption, key
-versioning, masking). Until then live mode wires **no real client** and
-`AllowLiveExecution` stays false, so nothing is sent. PR20 delivers and fully tests the
-live **safety machinery** with a fake (no-network) client.
+**These controls sit in front of REAL exchange mutations.** The accepted parent already
+contains the real-client wiring (§16d, PR20a: encrypted-credential loading, in-memory
+decryption, real adapters via the factory) and PR22's provisioning. So in `live` mode
+`cmd/order-executor` **builds real private clients with decrypted credentials and can
+perform real sends** — every PLACE/CANCEL below is a real venue mutation the moment all
+guards pass. Nothing here is a harness: PR20's guard is the last thing between the queue
+and a real order. (An earlier draft of this section described the wiring as "deferred to
+PR20a" with "no real client"; that is obsolete and is corrected here.) The only reasons
+live mode still sends nothing are operational, not architectural, and are listed under
+"Current limitations" below.
 
 **Activation rules.** Bootstrap `[execution] mode` must be **explicitly** `live` (default
 `off` is safe; `dry_run` keeps using `simexec`). No default live behaviour, no runtime
@@ -2114,51 +2216,571 @@ env var. Beyond the mode, live trading does **not start** unless the DB controls
 configured (see caps) and the kill switch is disengaged.
 
 **Cap model (`live_controls` singleton + per-scope flags; migration 020).** The
-`live_controls` row holds the global caps; **every cap is required** — if any is missing
-(`Configured()` false) live is denied. Caps: `max_open_cycles`, `max_daily_orders`,
-`max_daily_quote`, `max_order_notional`, `max_base_qty`, `max_consecutive_failures`,
-`max_unresolved_reconcile`. Scope is opt-in via `exchanges.live_enabled` and
-`exchange_markets.live_enabled` (both default 0). The kill switch (`live_controls.
-kill_switch`) **defaults engaged (1)**.
+`live_controls` row holds the global caps; **every required cap must be set** — if any is
+missing (`Configured()` false) live entries are denied. Caps: `max_open_cycles`,
+`max_order_notional`, `max_base_qty`, `max_consecutive_failures`,
+`max_unresolved_reconcile`. **OWNER DECISION (PR20 correction): there are NO daily trading
+limits** — the historical `max_daily_orders` / `max_daily_quote` columns remain in the
+table (dropping them would be a needless destructive migration) but are not read, not
+required, and never influence a buy or sell decision. Scope is opt-in via
+`exchanges.live_enabled` and `exchange_markets.live_enabled` (both default 0). The kill
+switch (`live_controls.kill_switch`) **defaults engaged (1)**. **SINGLE-INSTANCE DESIGN
+(owner decision): exactly one bot instance runs** — cap checks are plain reads with no
+cross-process reservation/coordination layer, deliberately; DB persistence and restart
+safety are unchanged.
 
-**Kill switch.** When engaged: no new buy cycle may start (engine `AllowNewBuyCycle`
-denies) and no new **buy** PLACE may be sent (executor gate denies). Risk-reducing paths
-continue: **sell** PLACE (exiting existing inventory), CANCEL, and GET_ORDER/status are
-still allowed so open cycles are safely managed.
+**A guard denial never strands a cycle (PR20 correction).** A refused request must not leave
+`order=QUEUED` + `cycle` open + `lock` HELD with no executable request — that is a permanently
+stuck cycle. Every denial (nil Guard, unconfirmable mode, unresolvable market, or the guard's
+own verdict) resolves through the OFFICIAL state path, chosen by what is at risk:
+- **entry buy denied** — nothing was sent and no exposure exists → `rejectBuyCleanly`: request
+  FAILED, order + cycle FAILED, **symbol lock RELEASED**.
+- **exit sell denied** — real inventory may exist → `rejectSellToReconcile`: request FAILED,
+  order + cycle **NEEDS_RECONCILE**, **lock HELD**. The position stays visible and recoverable,
+  never abandoned.
+- **cancel denied** — the venue order may be OPEN → `deadReconcile`: request DEAD, order +
+  cycle **NEEDS_RECONCILE**, **lock HELD**, so the open order stays under explicit management.
+
+**Proven entry buys (PR20 correction).** Before a real buy, `checkEntryBuyIdentity` runs ONE
+authoritative query (`loadSendOrder`) joining the order → its cycle → its `exchange_market` →
+that market's exchange, so a missing relationship yields NO ROW and therefore a denial. It
+proves together, from the database and never from the payload: `role='entry_buy'`,
+`state='QUEUED'`, `dry_run=0`, the order belongs to the REQUEST's cycle AND exchange, the market
+belongs to that same exchange, the caller-resolved market matches the order's, the request
+symbol equals the registered market's canonical symbol, and both exchange and market are
+live-enabled. Any query error, missing row, NULL, or mismatch → **no PlaceOrder call**. The
+executor's own market lookup (`orderMarket`) returns an error instead of a silent `0`: market
+id 0 previously slipped past the symbol-level live-enabled check, so an unidentifiable market
+could reach a real send.
+
+**The payload that will be SENT must equal the persisted order (PR20 correction).** Identity is
+not enough: the queued mutation payload and the registered order are two INTERNAL values, and
+if they disagree we do not know what we are actually placing (a stale, mis-routed, or tampered
+payload). So `matchPayloadToOrder` additionally proves, for BOTH entry buys and exit sells:
+quantity, limit price, order type, **time-in-force with EXACT NULL semantics** (a DB NULL/empty
+TIF means the strategy chose the venue default — the payload must then ALSO be empty; a non-empty
+payload TIF like `FOK` is a mismatch; a DB-recorded TIF must match exactly), local client order
+id, and that the side agrees with the order's role. The exit-sell **symbol is mandatory** (an
+empty payload symbol is an unproven route, not "no opinion" — it must be present AND equal the
+registered market's canonical symbol). This is **not** venue-response matching (§10d), which
+deliberately tolerates venue rounding/normalization — here no tolerance applies, the two internal
+values must be equal. Comparison is by decimal VALUE, so a `DECIMAL(36,18)` round-trip (`0.50`
+vs `0.5`) is not a spurious mismatch, and it is exact — never a float epsilon. The executor
+builds the `execution.OrderRequest` FIRST and derives the checked payload from it
+(`buildPlacePayload`), so the guard proves precisely the values `PlaceOrder` will send rather
+than a parallel re-derivation that could drift.
+
+**The EXACT sent client-order-id is validated, persisted, and sent unchanged (PR20 correction).**
+Some adapters normalize/truncate the client id (`ClientOrderIDForSend`), so the value SENT can
+differ from the intent's local id. The flow prepares that value BEFORE the final guard and never
+transforms it afterwards: normalize → verify non-empty (an empty normalization fails closed, no
+send) → set it on the `OrderRequest` → **persist it to `client_order_id_sent` before the final
+guard** → the final guard proves the payload's `ClientOrderIDSent` equals the persisted column →
+`PlaceOrder` sends exactly that value. The early guard leaves the sent-id empty (nothing is
+persisted yet); the final guard, which runs after persistence, enforces it — so the value proven
+and stored is the value the venue receives.
+
+**Proven cancels (PR20 correction).** A queue payload's `exchange_order_id` is never trusted on
+its own. `checkCancelTarget` proves from the DB that the order belongs to this request's
+exchange AND cycle, that its stored `exchange_order_id` is present and EQUAL to the payload's,
+and that its state is one a cancel can legally act on (`SUBMITTED`/`ACKED`/`PARTIALLY_FILLED`/
+`CANCEL_PENDING`/`NEEDS_RECONCILE` — never `QUEUED`, which never reached the venue, and never a
+terminal state). Any missing/unreadable/mismatched field → **no CancelOrder call**.
+
+**Kill switch + entry/exit separation (PR20 correction).** When engaged: no new buy cycle
+may start (engine `AllowNewBuyCycle` denies) and no new **buy** PLACE may be sent (executor
+gate denies). Risk-reducing paths continue: a **sell** PLACE that PROVABLY exits
+already-acquired inventory, CANCEL, and GET_ORDER/status remain allowed so open cycles are
+safely managed. A sell is **never blindly classified risk-reducing**: `checkExitSell`
+proves it from DB state — exact order/cycle/exchange ownership (`role='exit_sell'`), the
+order is QUEUED (state-machine legality), the FULL payload equals the registered order
+(quantity/price/type/TIF/client-id/side — see above), the owning cycle is real (`dry_run=0`),
+the cycle's entry buys actually FILLED a positive quantity, and the sell fits the remaining
+inventory. It also proves the sell is routed to the market where the inventory was ACQUIRED
+(`exitMarketMatchesInventory` compares the sell's exchange+market+symbol against the cycle's
+filled entry buy): a sell in the wrong market or symbol is not a risk-reducing exit — it opens
+NEW exposure somewhere we hold nothing. **The oversell math counts fills from CANCELLED sells (PR20
+correction):** a sell that partially filled before being cancelled has removed those units
+forever, so excluding an order by its final state would permit an oversell. The condition is
+
+    already_sold + remaining_active_commitments + this_request <= acquired_inventory
+
+where `already_sold` sums `filled_quantity` across ALL other exit sells of the cycle (any
+state, cancelled included) and `remaining_active_commitments` sums `quantity - filled_quantity`
+for only those that can still execute (a terminal order's remainder can never execute and
+contributes 0; `NEEDS_RECONCILE` is deliberately counted as still-active because its remainder
+may be resting on the venue). Worked example: bought 1.0, a cancelled sell filled 0.4 → a new
+1.0 sell is DENIED (would total 1.4) while a 0.6 sell is allowed (totals exactly 1.0). Proven exits are deliberately exempt from entry-side controls
+(kill switch, open-cycle cap, canary ack, configured entry caps, live-enable flags,
+failure/reconcile counters): blocking a proven exit strands real inventory and increases
+risk.
 
 **Executor-side live guard (the load-bearing gate).** The final live check is in
-`order-executor`, immediately before each mutating send (`liveGatePlace` /
-`liveGateCancel`). Before a real PLACE/CANCEL the `live.Guard` verifies: mode is `live`,
-`AllowLiveExecution` true, request **not** dry-run, exchange + symbol live-enabled, caps
-pass (notional/qty/open-cycles/daily-orders/daily-quote/consecutive-failures/
-unresolved-reconcile), active credentials exist, kill switch off (for buys), and the
-order/cycle state is still valid. A denial **fails the request without sending** and is
-audited. The engine performs a first `AllowNewBuyCycle` check; the executor re-checks —
-belt and suspenders.
+`order-executor`, immediately before each mutating send (`gatePlace` / `gateCancel`, run as
+an early pre-pacing pre-filter and a FINAL guard immediately before `MarkInFlight`). Before a
+real PLACE/CANCEL the `live.Guard` verifies: mode is `live`,
+`AllowLiveExecution` true, request **not** dry-run, exchange + symbol live-enabled (buys),
+caps pass (notional/qty/open-cycles/consecutive-failures/unresolved-reconcile — buys),
+active credentials exist, kill switch off (for buys), and the order/cycle state is still
+valid. A denial **fails the request without sending** and is audited. The engine performs
+a first `AllowNewBuyCycle` check; the executor re-checks — belt and suspenders.
+PR20 corrections hardening this gate:
+- **live mode + nil Guard fails CLOSED** — an unguarded live executor denies every
+  place/cancel (the old `Guard == nil → allow` hole is gone);
+- **every safety query fails CLOSED** — `openCycles`, `unresolvedReconcile`,
+  `consecutiveFailures`, `credentialsAvailable`, `live()` all return their errors
+  explicitly and ANY database error denies the live operation (a condition that cannot be
+  evaluated never reads as \"0, therefore fine\");
+- **durable allow-audit** — the ALLOW for a real PLACE is committed to `live_audit`
+  BEFORE the send; if the audit insert fails the decision flips to DENY (fail closed). A
+  risk-reducing CANCEL uses the opposite policy: an audit outage never blocks it — the
+  decision is logged (safe fields) for later reconstruction instead.
 
 **No blind resend (unchanged).** All prior safety holds in live: `MarkInFlight` commits
 before the send; an ambiguous mutating result → order/cycle `NEEDS_RECONCILE`, request
 `DEAD` (never re-sent); a missing order is not proof of zero fill; an `IN_FLIGHT`
 mutating timeout is never blindly retried.
 
+**Comprehensive exchange rate-limit detection (PR20 correction; rules ported from the
+owner's proven iranArb system).** Rate limiting is NOT detected from HTTP 429 alone. Each
+adapter normalizes every documented throttle signal into a `NormalizedAPIError` with
+`Category=rate_limit` plus STRUCTURED metadata (`exchanges.RateLimitInfo`): `retry_after`
+(venue-provided wait), `source` (status | header | body | code), the venue `code`, and
+`definite_rejection` — true ONLY when the venue's documented contract proves the request
+was rejected BEFORE execution (never inferred globally). Per venue:
+- **Nobitex** — HTTP 429 AND the HTTP-200 business envelope both carry the documented
+  `{"status":"failed","code":"TooManyRequests","backOff":N}` shape; `backOff` is SECONDS
+  (iranArb-verified unit), capped at 15m; `status:"failed"` is Nobitex's documented
+  not-performed contract, so a parsed TooManyRequests envelope IS a definite pre-execution
+  rejection (a bare 429 with no envelope is NOT). An HTTP-200 throttle body is never
+  mis-classified `CatBadRequest` and never treated as a successful mutation.
+- **Bitpin** — 429 with `Retry-After` header (integer seconds) or the DRF body
+  `"available in N seconds"` regex (iranArb-proven parser, default 30s at the auth layer);
+  order-path 429s carry the wait but are NOT definite (no verified contract).
+- **Wallex** — 429 by status (+ standard headers when present); HTTP-200 `success:false`
+  bodies use ONLY the conservative phrase fallback; never definite.
+- **Public adapters (Binance/Ramzinex/Tabdeal/Exir)** — 429 → `CatRateLimit` wrapping
+  `ErrRateLimited` + `Retry-After`/`X-RateLimit-Remaining:0`+`Reset` header parsing.
+Generic text matching is a tightly-scoped fallback (`LooksLikeRateLimitMessage`) that can
+never fire on harmless words like "limit" (limit order / price limit).
+
+**Per-exchange reactive cooldown (PR20 correction).** Any normalized rate-limit signal
+PARKS the affected exchange only: the executor's claim loop skips a parked exchange
+entirely (nothing is claimed → order/cancel/status/balance all deferred before any network
+call), and a request claimed just before the park is Released back to QUEUED unsent.
+Deadlines are absolute and EXTEND-ONLY (a longer later wait extends; a shorter one never
+shortens — iranArb-proven), prefer the venue-provided duration, fall back to the
+exchange's configured `retry_backoff_ms` then a 60s default, and are bounded (15m default
+cap). Mutex-guarded for in-process concurrency (single-instance design), poll-driven (no
+busy loop), and observable via safe logs: exchange, reason (category/code only), source,
+cooldown-until — never credentials, tokens, signatures, or response bodies.
+
+**A SUCCESSFUL response can still carry throttle information (PR20 correction).** Two cases
+that must never be confused:
+- **The operation succeeded, but the quota is now exhausted** (HTTP 200 + a real success body +
+  `X-RateLimit-Remaining: 0` / `Retry-After`). The completed operation stays successful and its
+  result is preserved — a filled or accepted order is NEVER downgraded to a failure or an
+  ambiguity because the budget ran out. Only FUTURE requests pause: a shared transport observer
+  reports the signal to the executor's `RateLimitSink`, which parks the exchange exactly like
+  any other cooldown (and persists it). The observer is read-only with respect to the response
+  and lives at the transport because these headers are HTTP-standard rather than venue-specific
+  — one implementation covers every adapter and operation and cannot be forgotten by a future
+  adapter. `DefiniteRejection` is meaningless here: nothing was rejected.
+- **HTTP 200 whose BODY says the venue did not perform the operation** (Nobitex's
+  `status:"failed"` + `TooManyRequests` + `backOff`). Not a success: classified per venue and
+  operation — a documented not-performed contract permits a re-queue after the cooldown, and
+  anything else is ambiguous → read-only probe. Never a blind retry.
+
+The sink is a standalone object (`executor.NewRateLimitSink`), not a method on the Executor:
+rule #1's reflection guard requires the Executor's ONLY exported method to be `Run`, so no
+exported surface can ever send an order. A sink can only park an exchange.
+
+**Rate limits never cause blind mutation retries (PR20 correction).** For read-only
+requests a throttle simply reschedules (and the park defers everything else). For
+PlaceOrder/CancelOrder: `definite_rejection=true` (venue-proven, pre-execution — e.g.
+Nobitex's envelope) re-queues the SAME persisted request for after the cooldown
+(`RequeueProvenUnexecuted`: RETRY_SCHEDULED, bounded by max_retries, dead-letters
+conservatively when exhausted) — the only sanctioned mutating retry, and it is not blind;
+ANY other rate-limit-looking response — crucially including HTTP 200 with a throttle body
+— is an AMBIGUOUS outcome: never marked successful, never retried, persisted and resolved
+through the standard read-only recovery probes with the symbol lock HELD.
+
+**Exchange rate config is WIRED (PR20 correction #7).** The previously-dead
+`exchange_configs.rate_limit_per_sec` and `retry_backoff_ms` fields are now consumed by
+the order-executor via the live configstore cache (`Config.ExchangeTuningFor`):
+`rate_limit_per_sec` drives a PROACTIVE per-exchange minimum-interval pacer (prevents
+exceeding a known budget); `retry_backoff_ms` is that exchange's REACTIVE fallback cooldown
+when a throttled venue provides no wait. Proactive pacing and reactive cooldown are
+deliberately separate mechanisms; a valid, longer server-provided backoff always takes
+precedence over the fallback.
+
+**Startup order is a safety property (PR20 correction).** Everything a real send depends on is
+loaded and validated **synchronously, before the first claim**, and any failure aborts instead
+of degrading to defaults:
+
+    resolve exchange ids → StartupLoad (exchange tuning: load + validate)
+      → load durable cooldowns → start the cooldown persister → only THEN claim/send
+      → (periodic config refresh starts afterwards, and may fail safely)
+
+Loading tuning in the background would let the first requests run with **uninitialized zeros**
+(`rate_limit_per_sec = 0` → no pacing at all; `retry_backoff_ms = 0` → the wrong reactive
+fallback), and loading cooldowns late would let a restart send to a still-throttled venue. In
+`live` mode `validateTuning` additionally requires an `exchange_configs` row for every wired
+exchange — a missing row would silently mean "no pacing", which is not a safe default when real
+money is at stake — and rejects negative values. A failure at any of these steps returns from
+`Run`, so the binary exits and **no real mutation happens with unloaded config**. The periodic
+refresh is the only asynchronous part, and a failed reload keeps the last good snapshot.
+
+**Two guards around pacing: early pre-filter, final authoritative (PR20 correction).** The
+initial guard can go STALE while a request waits in the pacer (kill switch, live session,
+preflight/ack, exchange/market enable flags, credential, order/cycle state can all change). So
+a live PLACE/CANCEL is gated TWICE. An EARLY guard runs before pacing — a cheap pre-filter so a
+locally-invalid request never consumes a pacing slot; it audits denials but writes NO allow
+audit. The FINAL guard runs after pacing, immediately before `MarkInFlight`: it re-checks every
+time-sensitive condition against the state AT SEND TIME, writes the durable allow-audit (the one
+committed before the send), and proves the persisted sent-id. Any DB error, missing row, changed
+state, or disabled setting at the final guard denies with the no-stranding disposition (buy →
+FAILED + lock released; sell → NEEDS_RECONCILE + lock held; cancel → DEAD + NEEDS_RECONCILE +
+lock held). Every terminal decision is audited exactly once (early guard audits its denials; the
+final guard audits the allow, or a deny that only appeared at send time).
+
+**One authoritative disposition, derived from the ORDER, never an unrelated cycle (PR20
+correction).** Every terminal disposition of a mutating request that must not / did not execute
+— buy denial, sell denial, cancel denial, malformed/pre-handler failure, and retry exhaustion —
+goes through ONE function, `orders.DisposeDeniedMutation`. It reads the ORDER `FOR UPDATE`,
+**derives the authoritative cycle from `order.cycle_id`** (never the queue request's claimed
+`cycle_id`), and reads that cycle `FOR UPDATE`. It then proves the full
+request↔order↔cycle↔exchange relationship: the request's claimed `cycle_id`/`exchange_id` must
+equal the order's real ones. It releases the symbol lock ONLY for an ENTRY BUY whose zero
+exposure is proven (`order.state=QUEUED`, `filled_quantity=0`, `exchange_order_id IS NULL`, and
+the cycle still pre-send: `NEW`/`SIGNAL_DETECTED`/`BUY_REQUEST_QUEUED`) AND whose relationship is
+consistent — then request/order/cycle FAILED, **lock RELEASED**, all on the ACTUAL cycle.
+Anything else — a sell/cancel (inventory / possibly-open order), an entry buy whose exposure
+cannot be disproven (a concurrent recovery advanced it to `SUBMITTED`/`ACKED`/
+`PARTIALLY_FILLED`, an exchange id appeared, a fill landed), OR an inconsistent relationship
+(the claimed `cycle_id` points at a DIFFERENT cycle B) — holds the lock and marks the ACTUAL
+order+cycle `NEEDS_RECONCILE` (request `DEAD`). An inconsistent request can therefore never
+fail, reconcile, or unlock an unrelated cycle B; only the order's real cycle A is touched.
+`OnBuyDenied` is a thin `KindEntryBuy` façade over this.
+
+**Nothing synchronous runs between the final guard and MarkInFlight (PR20 correction).** The
+final guard is the LAST thing before `MarkInFlight`. The PR24 first-order checklist — which
+does synchronous DB work — was previously recorded inside the gate, between the final guard and
+`MarkInFlight`; state could change during it, making the "final" allow stale. It is now recorded
+AFTER the exchange operation (in `recordFirstOrderChecklist`, on the success path), off the
+critical window. Ordering: `pacing → final guard → MarkInFlight → sendContext → exchange call`.
+
+**Pre-network failures are DEFINITELY-NOT-SENT, never ambiguous (PR20 correction).** Before any
+HTTP request leaves the process the adapter (and the executor) do local work — load/decrypt
+credentials, acquire/refresh an auth token (Bitpin's `authenticate`/`refresh_token`), validate
+the symbol, build the payload/HTTP request. A failure there means the mutation DEFINITELY did not
+reach the venue, so it must NOT become an ambiguous outcome (no read-only recovery probe, no
+NEEDS_RECONCILE-from-ambiguity). The private adapters mark these with `execution.ErrNotSent`
+(`NotSent` for transient failures like a credential-DB blip or an auth-endpoint 429/timeout,
+`NotSentPermanent` for deterministic ones like an invalid symbol/request), making ZERO order-
+endpoint calls. **Bitpin's token path**: any failure of `bearerToken` (a fresh auth 429, a token
+timeout/network error, an invalid token response) is wrapped `ErrNotSent` and the order endpoint
+is never called; an auth 429 preserves its rate-limit inside the wrapper so the executor still
+arms Bitpin's cooldown. Immediately before the client call the executor also checks
+`sendCtx.Err()`: an already-cancelled/expired send context (e.g. shutdown) is treated the same.
+The executor classifies `execution.IsNotSent(err)` BEFORE any ambiguous handling. Disposition:
+- a PERMANENT not-sent is terminal via `DisposeDeniedMutation` (buy → exposure-proof clean fail;
+  sell/cancel → NEEDS_RECONCILE, lock held);
+- a TEMPORARY not-sent re-queues via the sanctioned atomic path with the RIGHT backoff (below);
+- **pre-handler failures** (a transient `order.role` read error in `dispatchPlace`, a malformed
+  `CANCEL_ORDER` payload) never fail only the queue row: a transient one re-queues
+  (`RequeueClaimedUnsent`, since the request is still CLAIMED), a permanent/malformed one goes
+  through `DisposeDeniedMutation` (order+cycle NEEDS_RECONCILE, lock held) — never stranding the
+  cycle.
+The recovery DB work detaches to a fresh bounded context when the parent is already cancelled,
+so a shutdown-cancelled send still records its definitely-unsent recovery rather than stranding
+`IN_FLIGHT`.
+
+**Temporary-not-sent backoff is distinct from a venue cooldown (PR20 correction).** The retry
+deadline is chosen by cause, NOT uniformly from the cooldown: a VENUE RATE LIMIT (a proven
+pre-execution rejection, or a Bitpin auth 429) arms the cooldown and retries at the
+`cooldown_until` deadline; an ordinary TEMPORARY local not-sent (e.g. a credential-DB blip, whose
+cooldown is 0) uses a bounded EXPONENTIAL backoff with jitter (base = the exchange's
+`retry_backoff_ms`, else 1s; doubled per prior attempt; capped) — so it never burns all
+`max_retries` in a second. A PERMANENT local failure is not retried at all. `last_error` and the
+logs always preserve the REAL failure reason — a credential failure is never labelled
+"rate-limited".
+
+**Mutating requests require both `cycle_id` and `order_id` (PR20 correction).** A PLACE/CANCEL
+without an order can never be safely dispatched or recovered — it would strand its cycle. So
+`Queue.Enqueue`/`EnqueueScheduled` REJECT a mutating request missing either id
+(`ErrMalformedMutation`), and `Queue.Claim` refuses to return a mutating row whose `order_id` or
+`cycle_id` is NULL (defending against historical/manually-written rows that predate the check).
+A malformed (or inconsistent) row that already exists is finalized by `sweepMalformedMutations`,
+whose ownership and execution mode are derived from the AUTHORITATIVE persisted order — NEVER the
+untrusted queue metadata (round 9 #1/#3). It selects non-terminal mutating rows that are malformed
+(NULL `order_id` or `cycle_id`) OR inconsistent (a valid order whose claimed `cycle_id`/`exchange_id`
+does not match the order's), and for each:
+- **valid `order_id`** → `orders.DisposeDeniedMutation` derives the cycle FROM THE ORDER (a NULL or
+  mismatched claimed cycle is treated as "no claim — derive it"): request DEAD, the ACTUAL order +
+  cycle → NEEDS_RECONCILE, lock HELD, any unrelated cycle/lock untouched. **Scoped to the ORDER's
+  cycle mode** (so a live NULL-`cycle_id` row is finalized by the LIVE executor even though the queue
+  row names no cycle);
+- **no order, valid `cycle_id`** → `orders.DisposeMalformedMutation` (request DEAD, that cycle →
+  NEEDS_RECONCILE, lock HELD). Scoped to the CLAIMED cycle's mode;
+- **neither trustworthy** → request DEAD only; NO cycle/lock is touched.
+
+Only the executor whose mode matches the authoritative cycle finalizes a row, so a live and a
+dry-run executor can never mutate each other's cycles or locks. An `off` executor finalizes nothing.
+The mode filter is applied INSIDE the SQL, BEFORE the `LIMIT`, with deterministic `ORDER BY er.id`
+(round 10 #1): a Go-side skip after `LIMIT n` would let n rows of the OTHER mode fill the window on
+every sweep and permanently starve this executor's own rows (50 dry-run rows ahead of one live row
+would hide the live row forever). A row with no trustworthy ownership is mode-independent (only the
+request is finalized). The DEAD transition uses `MarkDeadMalformed` (`DenialParams.BroadTerminal`)
+so it works even on a still-QUEUED row. One finalizer per row (`FOR UPDATE SKIP LOCKED`).
+
+**The mutation network boundary: `PreparePlace/PrepareCancel` → order pacing → final guard →
+`MarkInFlight` → `PreparedMutation.Send` (PR20 correction, round 8).** ALL THREE private adapters —
+**Nobitex, Wallex and Bitpin** — implement `exchanges.MutationPreparer`. Every piece of
+definitely-pre-network work — credential load/decrypt, symbol validation/normalization, payload
+construction, and the FINAL `http.Request` construction — happens in `PreparePlace`/`PrepareCancel`
+BEFORE the executor commits `MarkInFlight`. `MarkInFlight` is then committed and immediately
+followed by `PreparedMutation.Send`, which does the smallest possible send-boundary work: it binds
+the send context to the already-built request (`req.WithContext`) and performs the single order/
+cancel `http.Client.Do`. Nothing fallible — no credential/token/symbol/payload/request
+construction — happens after `MarkInFlight` (`internal/exchanges/prepared.go` `doPreparedRequest`,
+plus each adapter's `bitpinPrepared`/`nobitexPreparedPlace`/`wallexPreparedPlace` etc.). So a crash
+DURING preparation (e.g. a Bitpin token refresh, or a Nobitex/Wallex in-memory credential read)
+leaves the row CLAIMED (swept back to QUEUED, never sent) — not a false "maybe sent"; a preparation
+failure is definitely-not-sent while still CLAIMED (the CLAIMED-guarded requeue / disposition).
+
+**Pacing counts actual network calls, not preparation-method invocations (round 8 #3).** The
+executor no longer paces before `PreparePlace`/`PrepareCancel`. Instead it passes a pacing hook to
+the adapter (`WithNetworkPacer` in the prepare context); the adapter reserves a per-exchange slot
+ONLY when it is about to perform an authentication/refresh HTTP call. The order/cancel send is
+paced separately by the executor, immediately before `MarkInFlight`. Consequently:
+Nobitex/Wallex (in-memory credential, no auth endpoint) and Bitpin reusing a still-fresh cached
+token make ZERO preparation network calls and consume exactly ONE slot (the order send); Bitpin
+that must authenticate or refresh makes one auth call plus one order call and consumes exactly TWO
+slots. Pacing reservations equal actual HTTP calls.
+
+**Bitpin must not send an order after auth is rate-limited, and the retry waits the REAL venue
+deadline (PR20 correction, round 6 + round 9 #4).** `bearerToken` is strict for mutations: an active
+auth throttle window, a fresh auth 429, or an auth 200 carrying `X-RateLimit-Remaining: 0` all fail
+preparation as a definitely-not-sent RATE LIMIT — the order endpoint is never called in the same
+invocation, even when a cached token exists. Crucially, `bitpinAuthRateLimited` now populates
+`RateLimitInfo.RetryAfter` with the ACTUAL deadline for every case: the parsed `Retry-After`/body
+duration for a fresh 429, `time.Until(authThrottledUntil)` for an already-active window, and the
+`X-RateLimit-Reset` duration for an exhausted-quota 200. The executor (`notSentRetryAt` →
+`armRateLimit`) therefore schedules the queue retry at the real venue deadline — NOT the short
+configured `retry_backoff_ms` fallback that would fire every second and exhaust `max_retries` before
+the throttle expired. And while the window is active, a cached-token mutation returns the remaining
+duration WITHOUT re-hitting the auth endpoint, so a known throttle never repeatedly burns retry
+attempts. (Reads keep the lenient behaviour — a cached token during a throttle window is fine for a
+GET.)
+
+**Stale candidate discovery is order-authoritative and mode-scoped (PR20 correction, round 9
+#1/#2).** `recoverStaleMutating` finds stale `IN_FLIGHT` mutations by JOINing the persisted order and
+its cycle, and scoping by the ORDER's cycle mode (`c.dry_run` = this executor's mode) — NEVER the
+queue row's `exchange_id`/`cycle_id`. The old per-exchange loop keyed on `er.exchange_id` and an
+`EXISTS(cycles WHERE id = er.cycle_id AND dry_run = ?)` filter, which HID rows whose queue metadata
+was missing or wrong: a NULL claimed `cycle_id` (never matched the EXISTS), an unwired/foreign
+claimed `exchange_id` (no executor iterated it), or a cross-mode claimed cycle (the wrong-mode
+executor would pick it up). The order-JOIN discovery finds every such row through its real order and
+routes it to exactly the executor that owns the order's cycle mode, so an unwired claimed exchange
+can never strand a mutation `IN_FLIGHT` forever, and a dry-run executor can never discover (or touch)
+a live order's mutation. NULL-`order_id` rows have no order to JOIN and are handled by
+`sweepMalformedMutations` instead. An `off` executor discovers nothing.
+
+The discovery query also RETAINS the authoritative ownership on each candidate (round 10 #2):
+`o.cycle_id`, `o.exchange_id` and the order's cycle mode are stored in the stale candidate at
+discovery time. If the later authoritative re-read (`orderRecoveryInfo`) fails persistently until
+the recovery window expires, `finalizeStaleAuthoritative` resolves the request using ONLY those
+retained values: request → DEAD, the ACTUAL order + ACTUAL cycle → NEEDS_RECONCILE, lock HELD — the
+queue row's claimed `cycle_id` is NEVER used to mutate cycle/order/lock state when a persisted order
+exists (it may point at an unrelated cycle B while the order belongs to cycle A; B stays untouched).
+A genuinely-missing order row (ErrNoRows) reconciles the retained actual cycle (there is no order
+state left to change).
+
+**Every discovered stale mutating `IN_FLIGHT` request reaches a terminal decision, and only with
+proven ownership (PR20 correction, round 8 #4).** `recoverOneStaleMutation` never returns silently
+and never builds a probe from mismatched metadata. It re-loads the AUTHORITATIVE order via
+`orderRecoveryInfo`, which returns the order's OWN `cycle_id` and `exchange_id`. Then:
+- **no order id at all** → `finalizeStaleConservative` (request DEAD, the queue row's cycle, if any,
+  → NEEDS_RECONCILE, lock HELD) — nothing is derivable;
+- **order missing / temporary DB error** → ErrNoRows or past the recovery hard limit (the request's
+  `inflight_at` age vs the recovery TotalTimeout, min 5m) finalizes conservatively; a genuinely
+  temporary error is retried on the next sweep, bounded by that limit;
+- **ownership mismatch** (the queue row's claimed cycle ≠ the order's cycle, or the queue row's
+  exchange ≠ the order's exchange) **or a NULL claimed cycle_id with a valid order_id** →
+  `orders.DisposeDeniedMutation` with `Kind=Unknown` (always conservative, never releases the lock):
+  the cycle is DERIVED FROM THE ORDER, the request goes DEAD, the ACTUAL order + cycle go
+  NEEDS_RECONCILE, the lock is HELD, and NO unrelated cycle/lock is touched. No probe is ever
+  created with mixed ownership (e.g. an order from cycle A can never be probed under a claimed cycle
+  B — B stays untouched);
+- **ownership proven consistent** → BEFORE any probe is created, the executor verifies the ORDER's
+  exchange has a USABLE read-only recovery path (round 10 #3): a wired client in this executor's
+  client map AND `exchanges.enabled = 1` — because `Claim`'s SQL refuses disabled exchanges and the
+  claim loop only iterates wired clients, a probe without both would sit QUEUED forever
+  (unclaimable), leaving the order/cycle unresolved and the lock held indefinitely. With a usable
+  client, the read-only probe is scheduled using the ORDER's authoritative cycle and exchange
+  (place → look up by client-order-id; cancel → by exchange-order-id) and the request is marked
+  DEAD. WITHOUT one (no client constructed at startup, no credential, or the exchange is disabled),
+  NO probe is created — the request is finalized conservatively instead (`finalizeStaleAuthoritative`:
+  request DEAD, ACTUAL order + cycle NEEDS_RECONCILE, lock HELD → manual reconciliation). The
+  `enabled` check fails CLOSED (a DB error checking it → conservative finalization, never an
+  unclaimable probe). No recovery probe can remain permanently QUEUED.
+
+A creation-time check alone is NOT sufficient (round 11): an exchange can be disabled, lose its
+credential, or simply not have its client constructed AFTER a `GET_ORDER` recovery probe was already
+committed as `QUEUED` (typically across a restart). The claim loop never iterates a missing client
+and `SweepStuck` only touches stale `CLAIMED`/`IN_FLIGHT` rows, so such a probe — and the
+order/cycle/lock behind it — would sit stuck forever. Two mechanisms close this:
+- **`sweepUnclaimableRecoveryProbes`** runs at STARTUP (before the first claim) and PERIODICALLY. It
+  finds non-terminal (`QUEUED`/`RETRY_SCHEDULED`) `GET_ORDER` requests whose ORDER's exchange is not
+  usable in this executor — disabled or unwired — deriving ownership and mode from the PERSISTED
+  order (never the probe row's claimed cycle_id/exchange_id) and SQL-filtering by the order's cycle
+  mode BEFORE `LIMIT` (so the other mode's probes cannot starve this one). Each is finalized
+  atomically: probe → DEAD, ACTUAL order + cycle → NEEDS_RECONCILE, lock HELD; unrelated cycles/locks
+  untouched. It re-verifies unusability inside the finalizer (a race could re-enable the exchange, in
+  which case the probe is left QUEUED for the claim loop), and is idempotent (single finalizer via
+  `FOR UPDATE SKIP LOCKED`).
+- The ambiguous-outcome paths (`recoverAmbiguousPlace`/`recoverAmbiguousCancel`) RE-CHECK the
+  exchange's usable recovery path (`usableRecoveryClientByCode`) immediately before scheduling a
+  probe; if it was lost during the send, they reconcile (`deadReconcile` → ACTUAL order/cycle
+  NEEDS_RECONCILE, lock HELD) instead of queueing an unclaimable probe.
+
+Together these guarantee no `GET_ORDER` recovery request can remain permanently `QUEUED`.
+
+Every branch runs inside `WithTx` under a `FOR UPDATE SKIP LOCKED` single-finalizer guard, so
+exactly one instance converts each row and concurrent sweepers are safe. No stale mutating request
+can sit `IN_FLIGHT` indefinitely, and none can apply a fill or transition to the wrong cycle.
+
+**The definitely-unsent retry is atomic, status-guarded, and its exhaustion is
+operation-specific (PR20 correction).** The sanctioned mutating retry runs in ONE transaction
+that locks the row (`SELECT ... FOR UPDATE`), requires the status to be exactly the expected
+pre-execution status — `IN_FLIGHT` for `RequeueProvenUnexecuted` (post-MarkInFlight),
+`CLAIMED` for `RequeueClaimedUnsent` (a pre-handler failure) — enforces the retry limit, and
+transitions with a status-conditioned `UPDATE ... WHERE id=? AND status=?` that must affect
+exactly one row. A request another actor already moved to DEAD/FAILED/SUCCEEDED can never be
+resurrected; two concurrent callers can never both increment the retry count. At the retry
+limit the queue runs an executor-supplied `onExhaust` callback INSIDE the same transaction,
+which applies `DisposeDeniedMutation` for the operation: an **entry buy** with proven zero
+exposure → request DEAD, order+cycle FAILED, **lock RELEASED**; an **exit sell** or **cancel**
+→ request DEAD, order+cycle NEEDS_RECONCILE, **lock HELD** (inventory / possibly-open order).
+So exhaustion resolves request + order + cycle + lock atomically — never leaving the cycle
+inconsistent.
+
+**The exchange-call timeout starts at the network boundary (PR20 correction).** The per-request
+timeout context (`sendContext`) is created AFTER pacing, the final guard, and `MarkInFlight` —
+never before local processing. Creating it earlier would let the pacing wait consume the network
+timeout: a request delayed only inside the process could reach `PlaceOrder` with an
+already-expired context and be mis-classified as an ambiguous exchange mutation. Now the timeout
+measures the real venue call, and a request that never left the process is never made ambiguous
+by internal delay.
+
+**Where pacing happens (PR20 correction).** The pacer waits at the real network boundary
+(`paceSend`), i.e. AFTER decode → validation → DB loads → live guard → pre-send persistence →
+audit, so a request rejected locally never consumes a slot of a scarce per-exchange budget. It
+sits immediately BEFORE `MarkInFlight` rather than after it, deliberately: a crash or
+cancellation while pacing then leaves the row `CLAIMED` (swept back to `QUEUED`, nothing sent)
+instead of `IN_FLIGHT`, which would be treated as "maybe sent" and pushed to NEEDS_RECONCILE for
+a request that never left the process. Each request consumes **exactly one** pacing slot
+(a duplicate reservation silently halves the exchange's rate budget and adds a full interval of
+latency; the executor's tests assert the slot count exactly). `paceSend` **returns an error**
+when the wait is cut short by shutdown: the caller then does not `MarkInFlight` and does not
+call the client at all — a request that never left the process is DEFINITELY unsent, and
+recording it as ambiguous would be a false ambiguity.
+
 **First live phase is tiny.** The intended first rollout is one exchange, one symbol,
 very small `max_order_notional`/`max_base_qty`, `max_open_cycles=1` — enforced purely by
-the configured caps + the single `live_enabled` exchange/symbol; the dashboard keeps the
-dry-run comparison and a live warning visible. Broad multi-exchange live is **not**
-enabled here.
+the configured caps + the single `live_enabled` exchange/symbol, and surfaced by the
+order-executor's startup safety summary (the dashboard has no live view in this lineage —
+§18). Broad multi-exchange live is **not** enabled here.
 
 **Audit (`live_audit`; migration 020).** Every live mutating decision (allow or deny) is
 persisted: exchange, symbol/market, cycle, order, request id, action/side, notional,
 decision, reason, execution mode, config version, timestamp. No secrets.
 
-**Dashboard live visibility (`GET /api/live`).** Read-only: execution mode (`LIVE`),
-kill-switch state, the caps, live-enabled exchanges + symbols, today's order count + open
-cycles (remaining allowance), credential **status only** (never key material),
-unresolved-reconcile count, and the last live allow/deny from the audit.
+**Live visibility — DB + logs, not a dashboard endpoint (corrected).** The dashboard in
+the current lineage (§14/§14a) exposes **no** `/api/live*` route: live state is observed
+through `live_audit` (every allow/deny), `app_logs`, and the startup safety summary
+(`live.BuildSafetySummary`, logged by the order-executor: mode, kill switch, caps,
+live-enabled scope, credential status — never key material). Earlier drafts of this
+section described a `GET /api/live` read-only view; it is **not implemented here**, and
+this paragraph is corrected rather than describing it as delivered. See §18.
 
-**What remains after PR20.** PR20a — real credential decryption + real private-client
-wiring (so live mode actually sends, gated by this same guard). Until PR20a, `live` mode
-is a fully-tested safety harness with no real client.
+**Files (PR20 correction).** `internal/live/{live.go,session.go}` (guard, exit proof,
+durable audit), `internal/exchanges/ratelimit.go` (+`ratelimit_test.go`) — the normalized
+rate-limit model + shared parsers, `internal/executor/cooldown.go`
+(+`cooldown_test.go`) — the per-exchange cooldown registry, the proactive pacer,
+`noteRateLimit`, and `requeueProvenRejected`; per-adapter detection lives in each
+`internal/exchanges/<venue>.go`; `internal/queue/queue.go` gains `Release` +
+`RequeueProvenUnexecuted`; `cmd/order-executor/main.go` wires `ExchangeTuningFor` from
+the configstore cache.
+
+**Cooldowns are DURABLE (migration 033 `exchange_cooldowns`).** A park deadline must outlive
+the process — otherwise a restart resumes sending to a venue that is still throttled. The row
+is `(exchange_id PK, cooldown_until, reason, source, updated_at)`. EXTEND-ONLY is enforced in
+SQL (`cooldown_until = GREATEST(cooldown_until, VALUES(cooldown_until))`, with reason/source
+assigned FIRST so they only change when the deadline actually extends), so even a re-ordered or
+concurrent write can never shorten an active longer cooldown. The row holds NO secrets:
+`reason` is a category/code (`rate_limit:TooManyRequests`), `source` is which signal identified
+it. The pacer stays in-memory by design (a rate budget, not a safety deadline). Both are
+per-process — the single-instance decision above is the precondition.
+
+**Graceful shutdown flushes pending cooldowns (PR20 correction).** Because persistence is
+asynchronous, an armed-but-unwritten park would be lost if the process exited between the arm
+and the worker's write. On graceful shutdown `Run` stops claiming, waits for the persistence
+worker to stop (no new persistence events), then runs a FINAL flush of all pending parks with a
+SEPARATE bounded context (`ShutdownFlushTimeout`, default 5 s) — so a restart restores them. The
+flush cannot hang: if the DB is unavailable it logs the unflushed count and returns within the
+timeout. **A HARD crash (kill -9, power loss) cannot be made perfectly durable with asynchronous
+persistence** — a park armed microseconds before the crash may be lost; on the next throttle it
+is simply re-detected and re-parked (safe, not silent). Making the arm synchronous is not an
+acceptable fix (it would risk turning a confirmed mutation into an ambiguous one — see below).
+
+**Persistence is ASYNCHRONOUS and never sits in an exchange response path (PR20 correction).**
+Arming a cooldown is pure memory: `armRateLimit` takes a mutex, updates the deadline, marks the
+entry pending, and returns. It does **no I/O**. This is a safety property, not an optimisation:
+the sink is called from the adapter's HTTP transport, so a slow cooldown write would delay a
+**successful** PlaceOrder response back to the caller, and a caller-side timeout would turn a
+mutation the venue ALREADY PERFORMED into an ambiguous one — the exact outcome the rest of this
+system spends its complexity avoiding. Durability is owned by a separate worker
+(`runCooldownPersister`, started by `Run`), which writes pending rows with bounded backoff
+(250 ms → 10 s) and is nudged non-blockingly on each arm.
+
+**Persistence retry is tracked independently of deadline extension (PR20 correction).** The
+pending set is derived from the invariant `persistedUntil == until`, never from "this call
+extended the deadline". Deriving it from extension loses writes: if the first write fails and
+the next signal carries an equal/shorter deadline (`extended == false`), the entry would never
+be retried and a restart would silently lose the park. A failed write therefore stays pending
+**forever** — through any number of non-extending signals — until it succeeds or the failure
+policy fires. Entries whose deadline has already expired are dropped from the pending set
+(durability for a park that no longer parks anything is pointless).
+
+**Cooldown persistence failure policy — per exchange, entry-buys only (PR20 correction).**
+While a park is un-persisted the in-process park still holds, so nothing is sent to that venue
+*now*; what is lost is only the guarantee that a restart would still honour it. If that state
+lasts beyond `Config.CooldownPersistGrace` (default 30 s) for an exchange, that EXCHANGE's live
+ENTRY BUYS are disabled — `gatePlace` denies a buy on `cooldownDurable(code)==false`, routed
+through the no-stranding disposition — with an ERROR log naming the outage. Durability health is
+tracked in a PER-EXCHANGE map (`durabilityFailed[code]`) maintained by the persister, so an
+outage on exchange A never disables exchange B; A re-enables automatically once its writes catch
+up (or its park expires). Two paths stay available even for the affected exchange: **proven exit
+sells** (risk-reducing — an outage is never a reason to strand inventory) and **CANCEL** (same
+asymmetry as the audit-outage policy). A genuinely global DB outage is handled independently by
+the fail-closed DB guards; it is not modelled as one exchange's persistence failure.
+
+**Current limitations (not future work — the state of the code).**
+- **No real venue order has executed yet.** The wiring exists and the guard is enforced;
+  what remains is operational: a real master key in the bootstrap config, a provisioned +
+  validated credential, `live_enabled` on the exchange + symbol, configured caps, a
+  deliberate kill-switch disengage, a passing preflight + active acknowledgement, and a
+  started canary session. Rule #3 keeps every test venue-free, so no automated test proves
+  an end-to-end real order.
+- **Live mode fails closed on missing prerequisites rather than degrading**: an absent or
+  invalid master key disables credential loading (no clients, `AllowLiveExecution` stays
+  false, nothing is sent, warning logged); a startup tuning/cooldown load failure aborts
+  the binary (see "Startup order"); a cooldown durability outage beyond the grace period
+  disables live sends (see "Cooldown persistence failure policy").
+- Cooldown/pacing state is per-process (single-instance assumption); the dashboard exposes
+  no live surfaces in this lineage (§18).
 
 ## 16d. Credential decryption & real private-client wiring (PR20a — `internal/secrets`, `internal/credentials`)
 
@@ -2412,7 +3034,15 @@ and the audit path (`live_audit` present). Freshness windows live in `live_contr
 **Preflight config hash + acknowledgement.** `ConfigHash` hashes the **config-relevant**
 inputs (mode, caps, live flags, canary scope, credential identity, freshness windows,
 ack requirement) — deliberately EXCLUDING ephemeral values (market freshness, balances, the
-kill switch), so a market tick does not invalidate an ack but a config change does. `POST
+kill switch), so a market tick does not invalidate an ack but a config change does. The
+hash is **versioned**, and the PR20 correction bumped it **`v1` → `v2`** while dropping the
+two daily-cap components (they no longer exist as live inputs). Operational consequence:
+**every acknowledgement recorded under `v1` no longer matches and is therefore inert** — an
+operator must re-run preflight and re-acknowledge before the next live buy. That is the
+intended fail-closed direction (a changed safety model invalidates prior sign-off).
+`checkCaps` likewise requires only `max_open_cycles`, `max_order_notional`, `max_base_qty`,
+`max_consecutive_failures`, `max_unresolved_reconcile` — a missing daily cap no longer
+fails `caps_configured`. `POST
 /api/live/acknowledge` (admin only) re-runs preflight, refuses unless `ready` (HTTP 409 with
 the failing checks), then records a `live_acknowledgements` row bound to the current
 `config_hash` (deactivating any prior ack) with operator, exchange, symbol, credential id,
@@ -2684,11 +3314,130 @@ stack). Rule #3 keeps automated tests venue-free.
    - if not positively identified → mark the order/cycle `NEEDS_RECONCILE`;
    - re-send only when provably safe.
 10. **Secrets never leak into logs** — masked/encrypted before storage; the
-    master key and auth headers are never logged.
+    master key and auth headers are never logged. This extends to rate-limit
+    observability: exchange, reason (category/code), source, and cooldown-until only —
+    never credentials, tokens, signatures, or response bodies.
 11. **Config changes are versioned and auditable.**
+12. **A rate limit never causes a blind mutating retry (PR20).** `PlaceOrder`/
+    `CancelOrder` may be re-sent after a throttle ONLY when the adapter can prove from the
+    venue's documented response that the request was rejected **before execution**;
+    otherwise the outcome is AMBIGUOUS and follows §10d (persist, read-only probe, lock
+    held, never re-sent). **HTTP 200 is not success**: a 200 carrying a throttle body is
+    neither a completed mutation nor a licence to retry.
+13. **Live safety evaluation fails closed (PR20).** In live mode a nil `Guard` denies and
+    sends nothing; ANY database error while evaluating a live safety condition denies the
+    operation (a condition that cannot be evaluated is never read as "0, therefore fine" —
+    and an unresolvable market is never market id 0); and an allowed real `PlaceOrder`
+    requires its audit row to be **committed before the send** — if the audit cannot be
+    persisted, the order is not sent. The one deliberate asymmetry: a risk-reducing `CANCEL`
+    is never blocked by an audit outage.
+14. **Every terminal disposition derives the cycle from the ORDER and never strands or touches
+    an unrelated cycle (PR20).** Buy/sell/cancel denial, malformed/pre-handler failure, and retry
+    exhaustion all go through `orders.DisposeDeniedMutation`, which reads the order+cycle
+    `FOR UPDATE`, derives the authoritative cycle from `order.cycle_id` (NEVER the queue's claimed
+    `cycle_id`), and proves the request↔order↔cycle↔exchange relationship. It releases the lock
+    ONLY for an entry buy with proven zero exposure AND a consistent relationship; otherwise it
+    holds the lock and marks the ACTUAL order+cycle NEEDS_RECONCILE. An inconsistent request can
+    never fail/reconcile/unlock an unrelated cycle. A definitely-not-sent PRE-NETWORK failure
+    (bad credentials/symbol/request, a Bitpin auth/token failure, or a cancelled send context) is
+    never an ambiguous outcome (no probe): a transient one re-queues via the atomic,
+    status-guarded requeue (`FOR UPDATE`, requires CLAIMED or IN_FLIGHT, one increment) whose
+    exhaustion applies the operation-specific disposition in the same transaction; a temporary
+    LOCAL failure uses exponential backoff (not the venue cooldown), a proven rate limit uses the
+    cooldown deadline, and a permanent one is not retried — logs preserve the real reason.
+15. **What is about to be mutated is PROVEN from the database (PR20).** Before a real send the
+    guard proves identity/ownership/state from DB rows, never from the queue payload: an entry
+    buy's role/state/mode/cycle/exchange/market/symbol, an exit sell's acquired market, and a
+    cancel's exact `exchange_order_id` + ownership + cancellable state. The payload's own
+    values (quantity/price/type/TIF/client-id/side) must EQUAL the persisted order exactly —
+    two internal values that disagree mean we do not know what we are placing.
+15a. **Mutating requests require `cycle_id` AND `order_id`, and every stale mutation is finalized
+    (PR20).** Enqueue rejects a mutating request missing either id; Claim refuses malformed rows;
+    a malformed/stale mutating row is finalized (DEAD + cycle NEEDS_RECONCILE + lock held) rather
+    than stranded or left IN_FLIGHT forever. `MarkInFlight` marks a mutation "maybe sent" only at
+    the real network boundary — for Bitpin, after token acquisition — so a crash during
+    preparation is definitely-not-sent, and an auth rate limit never lets the order endpoint be
+    called.
+16. **Startup loads before it sends, and every reload is validated (PR20).** Exchange tuning
+    and durable cooldowns are loaded and validated synchronously before the first claim; any
+    failure aborts startup. Every PERIODIC reload is validated too, and an invalid one keeps the
+    last known-good snapshot — an invalid reload never silently disables pacing. No real mutation
+    may use uninitialized tuning; no restart may resume sending to a venue whose cooldown is
+    still active.
+17. **The guard runs twice around pacing; the timeout starts after it (PR20).** An early guard
+    pre-filters before pacing; a FINAL guard re-checks all time-sensitive conditions immediately
+    before `MarkInFlight`, so state that went stale in the pacer (kill switch, session, enable
+    flags, credential, order/cycle state) is caught with zero exchange calls. The exchange
+    timeout is created only at the network boundary (after pacing/final guard/MarkInFlight), so
+    a request delayed only by internal pacing is never made ambiguous.
+18. **Nothing safety-critical blocks an exchange response (PR20).** Cooldown durability is
+    written by a separate worker with bounded retries; a slow write must never delay a
+    successful mutation's response and thereby make a confirmed outcome ambiguous. Durability
+    health is per exchange: a persistence outage on one exchange disables only THAT exchange's
+    entry buys (proven exits and cancels stay available), never another exchange. Graceful
+    shutdown flushes pending parks within a bounded timeout; a hard crash cannot be made
+    perfectly durable and the loss is re-detected on the next throttle.
+19. **Exits are proven, not assumed (PR20).** A sell is treated as risk-reducing only when
+    DB state proves it closes existing exposure (ownership, legal state, filled inventory,
+    no oversell/duplicate — counting fills from CANCELLED sells, which removed inventory
+    permanently). Proven exits stay available when entries are stopped.
 
 ## 18. Known limitations (current)
 
+- **Residual hard-crash window at the send boundary (all three adapters).** As of round 8, Nobitex,
+  Wallex and Bitpin all implement the two-stage `MutationPreparer`: every fallible pre-network step
+  (credentials, symbol, payload, AND the final `http.Request`) runs during preparation, before
+  `MarkInFlight`. After `MarkInFlight` commits, the only remaining work is binding the send context
+  to the pre-built request and calling `http.Client.Do` — no fallible step in between. The residual
+  is therefore reduced to a single, irreducible window: a hard process crash (SIGKILL/power loss)
+  in the microseconds BETWEEN the `MarkInFlight` commit and the `http.Do` return. Because the
+  request may or may not have hit the wire, that row is correctly left `IN_FLIGHT` and resolved by
+  the read-only recovery probe (place → look up by client-order-id; cancel → look up by
+  exchange-order-id) — never by a blind resend. This window is inherent to "persist intent, then
+  send" and cannot be closed without a second network round-trip; it is the ONLY remaining
+  ambiguity source and it is handled, not silently ignored.
+- **Three `exchange_configs` fields are still dead config.** PR20 wired
+  `rate_limit_per_sec` + `retry_backoff_ms`, but `max_concurrent_requests`,
+  `request_timeout_ms`, and `max_retries` are stored and editable while nothing reads them
+  (§13 table): the executor's per-exchange claim limit is hardcoded to 1 because
+  `Config.LimitFor` is not wired in `cmd/order-executor`, and per-request timeout/retries
+  come from `symbol_configs` at enqueue time. Nothing unsafe follows (1 is the most
+  conservative limit and the symbol-level values ARE honored), but an operator editing
+  those three fields today changes nothing. Wiring them was outside PR20's mandate and is
+  pending work.
+- **A cooldown is durable only after the persistence worker writes it (bounded hard-crash
+  window).** Arming is in-memory and immediate (by design — it runs on the exchange response
+  path), so there is a small window in which a park is active in-process but not yet in
+  `exchange_cooldowns`. A GRACEFUL shutdown flushes pending parks (bounded by
+  `ShutdownFlushTimeout`), so normal restarts lose nothing. A HARD crash (kill -9, power loss)
+  inside the window can still lose that one park; it is re-detected and re-parked on the next
+  throttle (safe, not silent). The window is otherwise bounded by the worker's retry cadence
+  (250 ms → 10 s), and staying un-persisted past the grace period disables that exchange's entry
+  buys (per exchange; proven exits and cancels continue). Making the write synchronous is NOT an
+  acceptable fix (it would risk turning a confirmed mutation into an ambiguous one).
+- **Proactive pacing (not the cooldown) is in-memory and per-process.** Rate-limit COOLDOWNS
+  are now durable (`exchange_cooldowns`, migration 033) and reloaded before the first claim, so
+  a restart keeps honoring a throttled venue. The proactive pacer's send-slot bookkeeping is
+  still per-process memory — a restart resets the budget window, which can burst up to
+  `rate_limit_per_sec` once. That is a rate budget rather than a safety deadline, and any
+  resulting throttle is detected and parks the exchange. Neither structure coordinates across
+  processes: acceptable ONLY because of the single-instance decision (§16c).
+- **`definite_rejection` is proven for Nobitex only.** Only Nobitex publishes a documented
+  contract we can rely on (`status:"failed"` + `TooManyRequests`), so it is the only venue
+  where a throttled mutation is re-queued. Every other venue's throttled PLACE/CANCEL takes
+  the conservative AMBIGUOUS path (read-only probe, lock held) — correct but slower to
+  resolve. Adding a venue means proving its contract, not pattern-matching text.
+- **The dashboard has no live/preflight/reconcile/session/credential surfaces in this
+  lineage.** Sections §14/§14a describe what the dashboard actually serves (read-only
+  trading views + login + config editing). The `/api/live`, `/api/live/preflight`,
+  `/api/live/acknowledge`, `/api/live/session`, `/api/reconcile*`, and `/api/credentials*`
+  endpoints described in §16c/§16e/§16f/§16g/§16h and their PR rows in §20 were part of an
+  earlier lineage and are **not present in the current code** — the rebuilt read-only
+  dashboard (PR16) never re-added them. The underlying packages (`internal/preflight`,
+  `internal/opreconcile`, `internal/credentials`, `live` session/ack) DO exist and are
+  enforced by the guard; only their HTTP surfaces are missing, so those operations are
+  SQL/admin-side today. Re-exposing them is pending work, tracked here so no reader
+  assumes an endpoint that does not exist.
 - **No real venue order has executed yet; PR25 ships the runbook + hardening, not a console.**
   `RUNBOOK.md` + the startup safety summary + operator warnings + the per-session audit export
   are all in place, but the first real order is an operational action still pending its
@@ -3213,23 +3962,235 @@ venue-free).
   enabled/status/key_version/algorithm/last_checked/non-secret-note — never key material
   or the encrypted blob.
 
+- **PR20 correction — owner decisions**: NO daily order-count/quote limits (columns remain,
+  never read, never block); SINGLE bot instance (no multi-instance cap coordination added).
+- **PR20 correction — rate limits are detected comprehensively and never from 429 alone**:
+  per-venue documented signals (status/code/body/headers) normalized into structured
+  `RateLimitInfo` (retry_after/source/definite_rejection/code); iranArb-proven rules (nobitex
+  backOff seconds + 15m cap; bitpin Retry-After + body regex); HTTP-200 throttle bodies are
+  rate limits, never successes and never CatBadRequest; text matching is a tight fallback that
+  cannot fire on "limit order".
+- **PR20 correction — a throttled exchange is parked, alone**: per-exchange extend-only
+  cooldown gates the claim loop (all request paths deferred pre-network), venue wait preferred
+  then configured retry_backoff_ms then 60s, bounded 15m, safe logs, no busy loop.
+- **PR20 correction — rate limits never blindly retry mutations**: only a venue-PROVEN
+  pre-execution rejection re-queues the persisted mutation after the cooldown; everything else
+  is ambiguous → read-only probes, lock held.
+- **PR20 correction — rate_limit_per_sec/retry_backoff_ms are wired**: proactive per-exchange
+  pacing + reactive fallback cooldown from the live configstore cache (fields are no longer
+  dead config).
+- **PR20 correction (round 2) — a denial must never strand a cycle**: a refused request is
+  resolved through the official state path by RISK, not uniformly: entry buy → FAILED + lock
+  released (nothing sent, no exposure); exit sell → NEEDS_RECONCILE + lock held (inventory may
+  exist); cancel → DEAD + NEEDS_RECONCILE + lock held (the venue order may be open). Failing
+  only the queue row would leave order=QUEUED + cycle open + lock held forever.
+- **PR20 correction (round 2) — prove it from the database, never from the payload**: one
+  authoritative join proves an entry buy's role/state/mode/ownership/market/symbol/live-flags,
+  and the cancel path proves the exact `exchange_order_id` + ownership + a cancellable state.
+  An unresolvable market is an ERROR, never market id 0 (which skipped the symbol-level check).
+- **PR20 correction (round 2) — cancelled sells still consumed inventory**: oversell math counts
+  `filled_quantity` from CANCELLED sells (a partial fill before cancellation is gone forever)
+  plus the unfilled remainder of still-active sells; excluding an order by its final state
+  permitted an oversell.
+- **PR20 correction (round 2) — cooldowns are durable**: the park deadline lives in
+  `exchange_cooldowns` (extend-only in SQL) and is reloaded before the first claim, so a restart
+  cannot resume sending to a still-throttled venue. Pacing stays in-memory (a budget, not a
+  safety deadline).
+- **PR20 correction (round 2) — a successful response can still throttle**: exhausted-quota
+  headers on an HTTP 200 pause FUTURE requests via a transport-level sink while the completed
+  operation stays successful with its result intact; a 200 whose BODY says not-performed is not
+  a success at all. The sink is a standalone object so the Executor's only exported method stays
+  `Run` (rule #1's reflection guard).
+- **PR20 correction (round 2) — pacing sits at the network boundary**: after guard/audit so a
+  locally-denied request never consumes a pacing slot, but BEFORE `MarkInFlight` so a crash
+  while pacing leaves the row CLAIMED (nothing sent) rather than IN_FLIGHT (maybe-sent).
+- **PR20 correction (round 7) — mutating requests require cycle_id AND order_id**: Enqueue/
+  EnqueueScheduled reject them (`ErrMalformedMutation`), Claim refuses them, and existing malformed
+  rows are finalized DEAD + cycle NEEDS_RECONCILE + lock held (never stranded).
+- **PR20 correction (round 7) — MarkInFlight at the real network boundary**: a two-stage
+  `MutationPreparer` (Bitpin) does token/auth in Prepare BEFORE MarkInFlight, so a crash during
+  token preparation leaves the row CLAIMED (definitely-not-sent), never a false ambiguity; prepare
+  and send are paced separately (two HTTP calls → two slots).
+- **PR20 correction (round 7) — Bitpin auth rate limit blocks the order**: an auth 429 (even with a
+  cached token) or an auth 200 with X-RateLimit-Remaining:0 fails preparation as a
+  definitely-not-sent rate limit — the order endpoint is never called, the cooldown is armed, and
+  the retry waits for it.
+- **PR20 correction (round 7) — every stale mutating IN_FLIGHT reaches a terminal decision**: a
+  probe, or DEAD + cycle NEEDS_RECONCILE + lock held; temporary recovery failures are bounded by
+  the recovery hard limit; one finalizer per row — none can sit IN_FLIGHT forever.
+- **PR20 correction (round 7) — the lookup-by-client-id capability doc matches the code**: all
+  three private venues implement it (Nobitex via recent-orders match, Wallex keyed by client id,
+  Bitpin via the identifier endpoint) — the earlier "Wallex only" claim was wrong.
+- **PR20 correction (round 8) — the two-stage mutation boundary is implemented for ALL THREE
+  adapters, not just Bitpin**: Nobitex and Wallex now implement `PreparePlace`/`PrepareCancel` too
+  (credentials, symbol, payload and the final `http.Request` built during preparation), so a crash
+  during their preparation leaves the row CLAIMED, never a false IN_FLIGHT. The earlier round-7
+  claim that only Bitpin needed it was wrong — the boundary property must hold for every adapter.
+- **PR20 correction (round 8) — Bitpin builds the final request BEFORE MarkInFlight**: the fallible
+  `http.NewRequestWithContext` moved into `PreparePlace`/`PrepareCancel`; `bitpinPrepared.Send`
+  only binds the send context to the pre-built request and calls `http.Do`. No token/credential/
+  symbol/payload/request construction happens after MarkInFlight (the type holds no material from
+  which a request could be rebuilt).
+- **PR20 correction (round 8) — pacing counts actual HTTP calls, not preparation-method calls**: the
+  executor stopped pacing before `PreparePlace`; the adapter reserves an auth slot only when it
+  actually makes the auth/refresh call (via the `WithNetworkPacer` hook). Fresh cached-token /
+  in-memory-credential mutations consume ONE slot (order only); auth-or-refresh + order consumes
+  TWO. Bitpin auth rate limits still stop the mutation endpoint (unchanged from round 7).
+- **PR20 correction (round 8) — stale recovery proves request/order/cycle/exchange ownership**:
+  `orderRecoveryInfo` loads the order's OWN cycle_id and exchange_id; `recoverOneStaleMutation`
+  requires the queue row's claimed cycle (when present) and exchange to equal the order's before
+  scheduling any probe. A mismatch — or a NULL claimed cycle_id with a valid order_id — is resolved
+  by `orders.DisposeDeniedMutation` (Kind=Unknown → conservative): the cycle is DERIVED from the
+  order, the request goes DEAD, the ACTUAL order + cycle go NEEDS_RECONCILE, the lock is HELD, and
+  no unrelated cycle/lock is ever touched. No probe is ever built from mixed ownership.
+- **PR20 correction (round 9) — stale/malformed candidate discovery is order-authoritative and
+  mode-scoped in the REAL production flow**: `recoverStaleMutating` JOINs the persisted order and
+  its cycle and scopes by the ORDER's cycle mode (not `er.exchange_id`/`er.cycle_id`), so a NULL
+  claimed cycle, an unwired/foreign claimed exchange, or a cross-mode claimed cycle can no longer
+  hide a row or route it to the wrong-mode executor. `sweepMalformedMutations` loads `order_id`,
+  catches malformed AND inconsistent rows, derives cycle/exchange/mode from the order (else the
+  claimed cycle), and only the executor whose mode matches the AUTHORITATIVE cycle finalizes a row
+  — a live and a dry-run executor can never mutate each other's cycles or locks. A row with no
+  trustworthy ownership is DEAD-only (no cycle touched). Previously these ran off the untrusted
+  queue metadata, so a valid-`order_id`/NULL-`cycle_id` row left the order/cycle unchanged and a
+  cross-mode row could be mutated by the wrong executor.
+- **PR20 correction (round 9) — the Bitpin auth rate-limit deadline is propagated**:
+  `bitpinAuthRateLimited` populates `RateLimitInfo.RetryAfter` (parsed 429 duration / remaining
+  `authThrottledUntil` / `X-RateLimit-Reset`), so the executor schedules the queue retry at the real
+  venue deadline instead of a 1s fallback that would exhaust `max_retries` before the throttle
+  expired; an active window returns its remaining time without re-authenticating.
+- **PR20 correction (round 10) — the malformed-sweep mode filter runs inside SQL before LIMIT**:
+  with the filter in Go after `LIMIT n`, n rows of the other mode could fill the window on every
+  sweep and permanently starve this executor's own rows; the authoritative-mode predicate (order's
+  cycle when the order exists, else the claimed cycle, else mode-independent request-only) is now
+  part of the query, with deterministic `ORDER BY er.id`.
+- **PR20 correction (round 10) — stale finalization never touches the claimed cycle when a
+  persisted order exists**: discovery RETAINS `o.cycle_id`/`o.exchange_id`/cycle mode on the
+  candidate; if `orderRecoveryInfo` fails persistently past the recovery window,
+  `finalizeStaleAuthoritative` resolves request → DEAD + ACTUAL order/cycle → NEEDS_RECONCILE +
+  lock HELD from those retained values — the untrusted claimed cycle_id is never mutated.
+- **PR20 correction (round 10) — no unclaimable recovery probe**: before scheduling a GET_ORDER
+  probe, the executor verifies the order's exchange has a wired client AND `enabled=1` (Claim
+  refuses disabled exchanges); otherwise it finalizes conservatively (DEAD + reconcile + lock held)
+  instead of queueing a probe that no claim loop would ever pick up.
+- **PR20 correction (round 11) — no recovery probe can remain permanently unclaimable**: a
+  creation-time capability check cannot cover an exchange that is disabled / loses its credential /
+  is not re-constructed AFTER a GET_ORDER probe is already QUEUED (esp. across a restart).
+  `sweepUnclaimableRecoveryProbes` (startup + periodic) finalizes such probes on the AUTHORITATIVE
+  order + cycle (DEAD + NEEDS_RECONCILE + lock HELD), mode-scoped inside SQL before LIMIT, order-
+  authoritative, idempotent; and `recoverAmbiguousPlace`/`recoverAmbiguousCancel` re-check the
+  recovery path before scheduling a probe. No unclaimable GET_ORDER stays QUEUED.
+- **PR20 correction (round 6) — one authoritative disposition, cycle derived from the order**:
+  `orders.DisposeDeniedMutation` handles buy/sell/cancel denial, malformed/pre-handler failure,
+  and retry exhaustion; it reads the order+cycle `FOR UPDATE`, derives the cycle from
+  `order.cycle_id` (never the queue's claimed cycle_id), proves request↔order↔cycle↔exchange, and
+  can never fail/unlock an unrelated cycle when the claimed relationship is inconsistent.
+- **PR20 correction (round 6) — pre-handler failures never strand**: a transient `order.role`
+  read error re-queues (`RequeueClaimedUnsent`, still CLAIMED); a malformed CANCEL payload goes to
+  NEEDS_RECONCILE + lock held — never a bare queue-row FAILED.
+- **PR20 correction (round 6) — Bitpin auth/token failures are definitely-not-sent**: a
+  `bearerToken` failure (auth 429, token timeout, invalid response) is wrapped `ErrNotSent`, the
+  order endpoint is never called, and a 429 preserves its rate-limit so the cooldown is armed —
+  no ambiguous order probe.
+- **PR20 correction (round 6) — retry exhaustion resolves request+order+cycle+lock atomically**:
+  an executor `onExhaust` callback runs `DisposeDeniedMutation` inside the requeue tx — entry-buy
+  zero-exposure releases the lock, exit-sell/cancel hold it; the cycle is never left inconsistent.
+- **PR20 correction (round 6) — temporary local not-sent uses real backoff**: exponential backoff
+  with jitter (from `retry_backoff_ms`) for a temporary LOCAL failure, the cooldown deadline for a
+  proven rate limit, no retry for a permanent one; `last_error` preserves the true reason.
+- **PR20 correction (round 5) — a denied buy releases the lock only with proven no-exposure**:
+  `orders.OnBuyDenied` reads the order+cycle `FOR UPDATE` and takes the clean-failure/lock-release
+  path ONLY when order=QUEUED + filled=0 + exchange_order_id NULL + cycle pre-send; any
+  uncertainty (a recovery advanced the order during pacing, a fill, an exchange id, a DB error)
+  holds the lock and marks NEEDS_RECONCILE.
+- **PR20 correction (round 5) — nothing synchronous runs between the final guard and
+  MarkInFlight**: the PR24 first-order checklist (synchronous DB work) moved to AFTER the send,
+  so the final guard is genuinely the last pre-send check.
+- **PR20 correction (round 5) — pre-network failures are definitely-not-sent, never ambiguous**:
+  `execution.ErrNotSent` (temporary vs permanent) marks credential/symbol/request pre-network
+  failures; the executor also checks `sendCtx.Err()` before the client call; a temporary not-sent
+  re-queues (proven-unexecuted), a permanent one fails terminally with the entry/exit disposition
+  — no recovery probe either way.
+- **PR20 correction (round 5) — RequeueProvenUnexecuted is atomic and status-guarded**: one
+  transaction, `FOR UPDATE`, requires `IN_FLIGHT`, one retry increment, exhaustion → DEAD +
+  order NEEDS_RECONCILE in the same tx; a terminal request can never be resurrected and two
+  concurrent handlers produce exactly one retry.
+- **PR20 correction (round 5) — the PR history statuses reflect the real accepted lineage**:
+  PR1–PR19 are the accepted committed chain (parent `7ced7f5` = accepted PR19), PR20 is in
+  review, and PR21+ are planned (rebuilt onto accepted PR20 later) rather than mislabelled
+  accepted.
+- **PR20 correction (round 4) — every tuning reload is validated**: the periodic refresh
+  validates each snapshot with the same rules as startup and keeps the last known-good on
+  failure; `RunValidated` also drops the redundant immediate reload after the validated startup
+  load. An invalid/incomplete reload can never silently zero out pacing.
+- **PR20 correction (round 4) — the guard runs again after pacing**: the initial guard can go
+  stale in the pacer, so a FINAL fail-closed guard runs immediately before `MarkInFlight`,
+  re-checking every time-sensitive condition at send time and writing the durable allow-audit
+  there; the early guard is a cheap pre-filter that audits only denials.
+- **PR20 correction (round 4) — the exchange timeout starts at the network boundary**: created
+  after pacing/final-guard/MarkInFlight so the pacing wait never consumes the network timeout and
+  a request delayed only inside the process is never mis-classified as an ambiguous mutation.
+- **PR20 correction (round 4) — cooldown durability health is per exchange**: a persistence
+  outage on exchange A disables only A's entry buys (proven exits and cancels stay available) and
+  never touches exchange B; A auto-recovers when its writes catch up.
+- **PR20 correction (round 4) — graceful shutdown flushes pending cooldowns**: a bounded final
+  flush writes armed-but-unwritten parks so a restart restores them; a hard crash cannot be made
+  perfectly durable (documented), and the loss is re-detected on the next throttle.
+- **PR20 correction (round 4) — the payload proof is complete**: the exit-sell symbol is
+  mandatory (empty is denied), time_in_force NULL semantics are exact (DB-null ⇒ payload must be
+  empty), and the EXACT adapter-normalized client-order-id is verified non-empty, persisted, and
+  proven by the final guard as the value that will be sent — no transformation after the guard.
+- **PR20 correction (round 3) — the architecture doc must not describe superseded plans**: the
+  §16c "deferred to PR20a / no real client" split was written before PR20a landed and had become
+  actively misleading — it told a reader the guard was a harness when it is the last check in
+  front of real money. Superseded plan text is a bug in its own right.
+- **PR20 correction (round 3) — a successful venue response must never wait on our bookkeeping**:
+  arming a cooldown is pure memory (the sink runs on the adapter's HTTP path); a slow durability
+  write would delay a successful mutation's response, and a caller-side timeout would turn a
+  CONFIRMED fill into an ambiguous outcome. Durability is a separate worker with bounded retries.
+- **PR20 correction (round 3) — persistence retry is tracked by state, not by event**: pending is
+  `persistedUntil != until`, never "this call extended the deadline" — otherwise a failed write
+  followed by equal/shorter signals is never retried and a restart silently loses the park. When
+  durability cannot be restored within the grace period, live sends are DISABLED (cancels are
+  not) rather than continuing while pretending the cooldown is durable.
+- **PR20 correction (round 3) — startup loads synchronously before it can send**: exchange tuning
+  (loaded AND validated — in live mode a missing `exchange_configs` row is a startup failure, not
+  "no pacing") and durable cooldowns are loaded before the first claim; failure aborts the
+  binary. Only the periodic refresh is async.
+- **PR20 correction (round 3) — the payload must equal the persisted order**: identity is not
+  enough. Quantity/price/type/TIF/client-id/side of the request we are about to SEND are proven
+  equal to the registered order (exact, no tolerance — unlike venue-response matching), and an
+  exit must be routed to the market where the inventory was acquired.
+- **PR20 correction (round 3) — pacing is exactly once and abortable**: one slot per request (a
+  duplicate halves the rate budget), and a cancellation during pacing sends nothing and never
+  marks a definitely-unsent request as ambiguous.
+- **PR20 correction — guard hardening**: live+nil Guard denies; every safety query fails
+  closed on DB errors; exits are DB-proven risk-reducing and exempt from entry controls;
+  the allow-audit is durable before a real PLACE (failure ⇒ deny) while a cancel is never
+  blocked by an audit outage.
 - **PR20 — limited live is a safety PR with the final gate in the executor**: the
   `live.Guard` is the load-bearing check immediately before each real PLACE/CANCEL (mode/
   AllowLiveExecution/not-dry-run/exchange+symbol live-enabled/caps/credentials/kill-switch/
   state); the engine's `AllowNewBuyCycle` is a first check, not the only one. A denial
   fails the request without sending and is audited (`live_audit`).
 - **PR20 — safe by default at every layer**: mode must be explicitly `live`; the kill
-  switch defaults engaged (1); every cap in `live_controls` is required (any missing →
-  denied); `exchanges.live_enabled` + `exchange_markets.live_enabled` default 0. Caps:
-  open-cycles, daily-orders, daily-quote, order-notional, base-qty, consecutive-failures,
-  unresolved-reconcile (migration 020).
+  switch defaults engaged (1); every REQUIRED cap in `live_controls` must be set (any
+  missing → denied); `exchanges.live_enabled` + `exchange_markets.live_enabled` default 0.
+  Required caps (migration 020): open-cycles, order-notional, base-qty,
+  consecutive-failures, unresolved-reconcile. (The `max_daily_orders`/`max_daily_quote`
+  columns from migration 020 are RETAINED but no longer read — see the owner decision
+  above.)
 - **PR20 — kill switch is asymmetric**: it blocks new buy cycles + new buy PLACEs (new
-  exposure) but allows sell PLACEs (inventory exit), cancels, and status polls so open
-  cycles stay safely managed.
-- **PR20 — real credentials are deferred to PR20a**: live mode wires no real client and
-  `AllowLiveExecution` stays false until credential decryption lands, so `live` is a
-  fully-tested safety harness that sends nothing yet; the safety machinery is exercised
-  with a fake (no-network) client and `live_audit` proves allow/deny decisions.
+  exposure) but allows DB-PROVEN exit sell PLACEs (inventory exit — see the correction
+  entry above), cancels, and status polls so open cycles stay safely managed.
+- **PR20 — the guard sits in front of REAL sends (superseded split)**: PR20 was originally
+  written expecting credential decryption to land later (PR20a), i.e. `live` wired no real
+  client. That is no longer the case: the accepted parent contains PR20a's real-client
+  wiring and PR22's provisioning, so `live` builds real clients with decrypted credentials
+  and CAN send. The guard is the last thing between the queue and a real venue mutation —
+  every decision below is enforced against real money, not a harness. What keeps live safe
+  is operational readiness (master key, credential, live flags, caps, kill switch,
+  preflight + ack + session), not the absence of wiring.
 - **PR20 — no-blind-resend preserved in live**: ambiguous live PLACE → order/cycle
   `NEEDS_RECONCILE`, request `DEAD`; tested end-to-end with the `place_timeout` scenario.
 
@@ -3290,8 +4251,9 @@ venue-free).
   an early miss; only a `ReliableNotFound` venue lets an exhausted probe conclude provably-not-placed
   (else NEEDS_RECONCILE).
 - **PR19 round 3 — lookup-by-client-id is a distinct capability from client-id-on-place**:
-  `LookupByClientOrderID` (Wallex only) vs `ClientOrderID`; recovery/reconciler probe by client id
-  ONLY when the venue's GetOrder genuinely accepts one, never passing a client id to an
+  `LookupByClientOrderID` (Nobitex via recent-orders match, Wallex keyed by client id, Bitpin via
+  the `identifier` endpoint — all three private venues) vs `ClientOrderID`; recovery/reconciler
+  probe by client id ONLY when the venue's capability is set, never passing a client id to an
   exchange-id-only endpoint.
 - **PR19 round 3 — crash-after-send is recovered read-only**: the sweep converts a stale IN_FLIGHT
   PLACE/CANCEL (crashed after the exchange accepted, before the response) into a persisted read-only
@@ -3773,33 +4735,39 @@ venue-free).
 
 ## 20. PR history / implementation phases
 
+**Accepted lineage (this branch).** The current branch `pr20-limited-live` is ONE commit (PR20,
+**in review**) on top of the accepted committed chain PR1…PR19 (its parent is `7ced7f5`, the
+accepted PR19). So PR1–PR19 are **accepted**, PR20 is **in review**, and PR21–PR27 are
+**planned** designs to be rebuilt onto accepted PR20 in later branches — they are ahead of this
+lineage and are NOT yet accepted here, despite being described in full below.
+
 | PR | Branch | Status | Summary |
 |---|---|---|---|
 | PR1 | `pr1-project-skeleton` | **accepted** | Project skeleton & shared foundation: module layout, all 9 binaries bootable, **file-only bootstrap config** (no env; `-config` flag; secret redaction), slog logging, `db.Store`+pool+`WithTx`, Redis wrapper, in-code migration runner (GET_LOCK + checksum + DDL/DML rules) with `schema_migrations` + `001_app_meta`, scaffold packages, tests, this document. No trading logic. |
 | PR2 | `pr2-database-schema` | **accepted** | Full trading schema (migrations `002`–`007`, 29 tables): reference/discovery, encrypted credentials + audit, versioned config + audit, trading core (cycles/orders/fills/events, composite-scope symbol_locks, exchange_requests queue), observability (balances/health/logs/comparison/signals), market_discovery_runs. Offline SQL unit tests + gated MariaDB integration tests (tables/indexes/FKs/uniques/enum/no-plaintext-creds/active-lock uniqueness). Schema only — no behaviour. |
 | PR3 | `pr3-state-machine` | **accepted** | `internal/state`: CycleState/OrderState/RequestStatus enums, authoritative transition maps (no self-loops, no terminal exits, NEEDS_RECONCILE entry-only), `Validate*Transition`, `Apply{Cycle,Order}Transition` (tx + version-guarded CAS + atomic event insert + replay/stale/mismatch/missing disambiguation). Minimal `internal/models` (Cycle/Order/StateEvent). Table-driven transition tests + sqlmock Apply tests + real-MariaDB integration test. No trading behaviour; functions not yet wired into services. |
 | PR4 | `pr4-exchange-abstraction` | **accepted** | Exchange abstraction layer (copy & adapt from iranArb): normalized `domain`/`execution` models, split `exchanges.PublicClient`/`PrivateClient` interfaces, `Capabilities`, `CredentialProvider`, `NormalizedAPIError`, factory registry, centralized secret-masking IO logger (+ migration `008`), tuned HTTP client. Adapters: Binance (public), Nobitex/Wallex/Bitpin (public+private), Ramzinex/Tabdeal/Exir (public). WS deferred for Iranian venues (capability flags honest). Fake private client for tests/dry-run. 77 exchange test funcs (httptest only, no live calls) + masking proof. No trading behaviour; adapters not wired into services. |
-| PR5 | `pr5-collector-ws-reconnect` | **in review** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. **Correction:** an unexpected WS close while ctx is active reconnects with capped exponential backoff (never silently abandons a target; only ctx-cancel stops it; counted as a health failure + `WSFailureCount`); `market_event` is published ONLY after both `SaveOrderBook` and `SavePrice` succeed; REST `received_at` is stamped after a successful `GetOrderBook`. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only, **ws-reconnect-on-unexpected-close**, **no-publish-when-save-book/price-fails**), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; collector uses only PublicClient; no trading/order/cycle/credential code. |
-| PR6 | `pr6-config-fee-scope-validation` | **in review** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. **Corrections:** default fees are scoped per exchange (`DefaultFeesByExchangeID` keyed by exchange_id + `FeesByMarketID` keyed by exchange_market_id) with `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (market override → THIS exchange's default, never another's) — replaces the unsafe single map where every default collided at key 0; `UpdateMinSpreadBps` validates BEFORE the tx (negative spread activates no version / mutates no symbol_config / writes no audit); `ActiveVersion` returns `ErrMultipleActiveVersions` instead of silently picking the latest; integration tests use per-run suffixes (repeat-safe). Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, FeeFor scoping/priority (offline), gated fee-scoping/invalid-write-rejected/multiple-active-rejected + repeat-safe full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
-| PR7 | `pr7-queue-recovery-guards` | **in review** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. **Corrections:** `SweepStuck` also recovers stale `CLAIMED` (never sent → requeued to QUEUED, claim cleared); `MarkInFlight` checks `RowsAffected` → `ErrRequestNotClaimed` (executor does not send); `MarkSucceeded/Failed/Dead` are status-guarded (`WHERE status IN ('CLAIMED','IN_FLIGHT')` + `RowsAffected`) → `ErrRequestNotActive` on a conflicting newer status, idempotent no-op on same status; definite `PlaceOrder` rejection moves the order out of `QUEUED` to `FAILED` via `ApplyOrderTransition` (already correct); ambiguous → `DEAD` + order `NEEDS_RECONCILE` (already correct). Tests: queue sqlmock + gated MariaDB (concurrent claimers, **stale-CLAIMED recovery**, **MarkInFlight zero-row**, **terminal status guards + idempotency**), executor classifiers + reflection no-send guard + gated end-to-end with fake clients (**MarkInFlight-failure-blocks-send**, definite-rejection-out-of-QUEUED, ambiguous-NEEDS_RECONCILE). Order/cycle state only via `internal/state`; nothing trades yet. |
-| PR12 | `pr12-reconciler-safeclose-guards` | **in review** | Cut from accepted PR11 (`pr11-ambiguous-lifecycle-safety`, `1333f09`); PR6–PR11 fixes preserved (FeeFor, queue guards, DB-role dispatch, buy/sell validation, empty-id safety, sell-rejection-keeps-lock, guarded PnL close — full sweep green). **Corrections:** (#2) exchange status `REJECTED` is NO LONGER advanced to a clean terminal — it is an execution anomaly → `NEEDS_RECONCILE` (never safe-close/lock-release; sell rejection keeps the lock); (#3) `safeClose` now checks, in the close tx, for any active `exchange_request` (QUEUED/CLAIMED/IN_FLIGHT/RETRY_SCHEDULED) and refuses to close / release the lock when one exists; (#4) `applyOrderOutcome` never silently skips an illegal transition — it diverts the order to `NEEDS_RECONCILE` (report never claims a non-advance). `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
-| PR8 | `pr8-engine-signal-only` | **in review** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **SIGNAL-ONLY: the only writes are `comparison_events` + `signals` — no exchange calls, no cycle/order/exchange_request/symbol-lock writes, EVEN for a trading-enabled market with a passing signal.** Buy-cycle preparation is gated behind `Config.PrepareBuyCycles` (default FALSE) and is PR9's transactional `buyflow`. **The `cmd/trade-engine` binary leaves `PrepareBuyCycles: false` in PR8 — the real executable is signal-only; PR9 enables it.** **Corrections:** removed the unconditional `prepareBuy`/`buyflow` call from the signal path (now flag-gated, off by PR8 default); set `cmd/trade-engine` `PrepareBuyCycles: false` + a static invariant (script check #7 + `audit.TestTradeEngineSignalOnlyInPR8`) that fails the build if the binary enables it; fees via `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak); `market_events` subscription resilient — an unexpected close while ctx is active resubscribes with capped backoff and only stops on ctx-cancel (never silently returns nil); a `USDT/IRT` quote-rate tick re-evaluates all signal-enabled rial-quoted markets on the same exchange; corrected the stale doc/comments that claimed PR8 refreshes pending buy intent. Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients; **PrepareBuyCycles off — signal-only**). Tests: offline spread/quote/targets-quote-rate-dependents/subscription-reconnect/no-client/**trade-engine-signal-only-static-invariant** + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing, disabled-for-signal, IRT conversion, fee-adjusted, per-exchange-default-fee + override, **signal-only-EVEN-when-trading-enabled (0 cycles/orders/requests/locks)**, USDT/IRT-reevaluates-dependent-IRT, config-stamp; PR9-gated cycle-creation tests enable the flag). |
-| PR9 | `pr9-buyflow-refresh-guards` | **in review** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. Cut from accepted PR8 (`pr8-engine-signal-only`); `cmd/trade-engine` now sets `PrepareBuyCycles: true` (PR9 enables buy prep; the engine library still defaults it false as the gate). Fees come from `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak — PR6). **Corrections:** (5) `RefreshActiveCycleBuy` now refreshes the FULL cycle signal snapshot (signal_time/prices/spread/fee_adjusted/buy_size/config_version), so cycle+order+request describe the same intent; (6) refresh is guarded on lock ACTIVE + cycle BUY_REQUEST_QUEUED + order QUEUED + request QUEUED (SELECT … FOR UPDATE), each guarded UPDATE re-asserts state and checks RowsAffected==1; (7) non-positive price/qty rejected (CreateBuyCycle errors, Refresh no-op) — venue tick/step/min validated at send, rejection handled cleanly by executor (PR7); (8) originating signal linked to the created/refreshed cycle (`signals.cycle_id`) in-tx. Removed the PR8-only "cmd must not enable PrepareBuyCycles" static invariant; tightened invariant #3 / `TestNoDirectStateUpdates` to flag state ASSIGNMENTS only (not the new guarded WHERE-clause state checks). On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
-| PR10 | `pr10-place-validation-fill-safety` | **in review** | `internal/orders` (buy-side order/fill processing) + executor wiring. Cut from accepted PR9 (`pr9-buyflow-refresh-guards`), preserving PR1–PR9 fixes (FeeFor, queue guards, subscription reconnect, buyflow refresh guards — verified by the full sweep). **Corrections:** (5) `BuyIntentPayload.Validate()` runs BEFORE MarkInFlight/PlaceOrder — a malformed/zero price/qty, wrong side/type/non-IOC, or empty client id is never sent (→ clean `OnPlaceRejected`: request+order+cycle FAILED, lock released); (6) a place ack with empty `ExchangeOrderID` schedules NO blind cancel/status → order+cycle NEEDS_RECONCILE, lock HELD; (7) a full/partial fill needs a usable cost basis — `usableAvgPrice` derives `ExecutedQuote/FilledQty` when `AvgPrice`≤0, and a full fill with neither is Ambiguous→NEEDS_RECONCILE (lock held, no fill row with zero price); (8) scheduled CANCEL/GET_ORDER keep `retry_count=0` (planned step, not a retry) — documented + tested. **Round 2:** (#1) an UNDECODABLE buy payload (with order/cycle context) now resolves via `OnPlaceRejected` (request+order+cycle FAILED, lock RELEASED) instead of only failing the request — no more stuck order/cycle/lock; (#2) PLACE_ORDER is dispatched by the **DB order role** (`entry_buy`/`exit_sell`), never `payload.side` — a wrong-side payload on a buy order routes to the buy handler and is rejected by `Validate()`, never slipping into the sell handler; `PayloadSide` removed; sell gets its own `SellIntentPayload.Validate` (bad sell → FAILED + NEEDS_RECONCILE, lock held). Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
-| PR11 | `pr11-sell-validation-pnl-safety` | **in review** | Cut from accepted PR10 (`pr10-place-validation-fill-safety`, `622668b`); PR6–PR10 fixes preserved (FeeFor, PR7 queue guards, PR8 subscription reconnect + USDT/IRT, PR9 buyflow refresh guards, PR10 DB-role dispatch + buy validation + empty-id + cost-basis — all green in the full sweep). **Corrections:** (#2/#3) sell `PLACE_ORDER` is routed by DB order role (not `payload.side`) and the sell payload is validated before MarkInFlight/PlaceOrder (`SellIntentPayload.Validate`); invalid/undecodable/wrong-side sell → request FAILED + order/cycle NEEDS_RECONCILE, lock held. (#4) empty sell `ExchangeOrderID` → NEEDS_RECONCILE, lock held, no blind follow-up (also guarded in `ensurePoll`/`RepriceSell`). (#5) sell fill needs a usable cost basis (derive `ExecutedQuote/FilledQty`, else ambiguous → NEEDS_RECONCILE, no fill). (#6) `closeCycleWithPnL`/`writeCloseAccounting` check all query errors + validate buy/sell qty+quote positive + qty tolerance (`ErrIncompleteCloseAccounting`) → don't close with missing/invalid accounting (automatic path diverts to NEEDS_RECONCILE). (#7) `RepriceSell` with an empty resting-sell `exchange_order_id` → NEEDS_RECONCILE, lock held, no blind `CancelOrder("")`. `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
-| PR13 | `pr13-balance-sync-per-exchange` | **in review** | Cut from accepted PR12 (`pr12-reconciler-safeclose-guards`, `ac3abdb`); PR10–PR12 fixes preserved (DB-role dispatch, buy/sell validation, empty-id safety, cost-basis ambiguity, sell-rejection-keeps-lock, reconciler safe-close guards incl. stored REJECTED/FAILED — full sweep green). **Corrections:** (a) `balance-sync` is NOT a skeleton — `cmd/balance-sync` wires real DB-decrypted read-only credential clients (idles safely without a master key); (b) **per-exchange, rate-limit-aware cadence wired end-to-end** — `balance.Config.IntervalFor` + `MinInterval` floor + per-exchange due-tracking, driven from the DB via new `exchange_configs.balance_poll_interval_seconds` (migration 026 + `configstore.ExchangeConfig.BalancePollIntervalSeconds`), so venues poll on their own cadence (default for all when unset). `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
-| PR14 | `pr14-health-monitor-readonly-private` | **in review** | Cut from accepted PR13 (`pr13-balance-sync-per-exchange`, `3b110ed`); PR11–PR13 fixes preserved (sell-rejection-keeps-lock, executor empty-id boundary, reconciler safe-close guards incl. stored REJECTED/FAILED, per-exchange balance cadence, real read-only balance clients, failed-sync-doesn't-zero, missing-asset-not-zeroed) and invariant scripts (`scripts/check-critical-invariants.sh`, `scripts/local-dryrun-check.sh`) intact — full sweep green. **Correction (#3):** **private health is wired read-only (Option A)**, consistent with PR13 balance-sync — `cmd/health-monitor` builds the authenticated probe via `Builder.BuildPrivate` → `Provider.ProbePrivateHealth(code, BalanceReader)`; the narrow read-only `BalanceReader` makes place/cancel unreachable (tested `credentials.TestProbePrivateHealthIsReadOnly`); an exchange with no active credential / no master key falls back to public-only with `private_status` UNKNOWN — a **deliberate safe fallback, not an accidental omission**; stale/contradictory "private accidentally missing / wired in a later PR" doc + comments removed. **Correction (round 2):** the continuous private probe must NOT invalidate a credential on a transient error — new `Provider.ProbePrivateHealth` marks `status='invalid'` ONLY on a definite auth error (`isDefiniteAuthError` = `execution.ErrAuthFailed` or `NormalizedAPIError` category `auth`); timeout/network/rate-limit/429/exchange-5xx/unknown leave the credential `active` and untouched (surfacing only as private health UNAVAILABLE/DEGRADED/RATE_LIMITED, `last_success_at` preserved), so a brief incident can't permanently disable a valid credential (`BuildPrivate` builds only from `active`). Strict `Provider.Validate` retained for one-shot operator checks. Tests: `TestProbePrivateHealthCredentialPolicy` (auth→invalid; timeout/ack-timeout/network/rate/5xx/unknown→active), `TestProbePrivateHealthSuccessAfterTemporaryFailure`, `TestProbePrivateHealthIsReadOnly`, `TestValidateStillStrictForManualCheck`, offline `TestIsDefiniteAuthError`. `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read via `Validate` when creds exist) — no place/cancel reachable (reflection guard `TestMonitorHoldsNoOrderClient`); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
-| PR15 | `pr15-market-regime-history-validation` | **in review** | Cut from accepted PR14 (`pr14-health-monitor-readonly-private`, `9f76cc4`); PR11–PR14 fixes preserved (sell-rejection-keeps-lock, executor empty-id, reconciler safe-close incl. stored REJECTED/FAILED, per-exchange balance cadence + real read-only clients, health-monitor read-only private health that never invalidates a credential on a transient error) + invariant scripts intact — full sweep green. **Corrections:** (#2) `market_regime_history` now stores `state_hash` + `stale_reason` (migration 027) and `WriteResult` inserts them, so history is self-describing (a changed UNKNOWN reason is visible, not just "something changed"); a history row's `state_hash` equals current's at that point (`TestHistoryStoresStateHashAndStaleReason`). (#3) `WriteResult` no longer ignores `SELECT state_hash` errors — only `sql.ErrNoRows` → changed; any other error is returned, never a misleading insert (`TestWriteResultReturnsRealSelectError`). (#4) regime config validated in BOTH layers — migration 027 CHECK constraints (symbol/timeframe weight>0, timeframe seconds>0, interval/neutral>=0, moderate>=neutral, strong>=moderate) + `Basket.Validate` called by `LoadBaskets` returning `ErrInvalidBasketConfig` so invalid config yields no regime (`TestBasketValidate`, `TestRegimeConfigCheckConstraints`, `TestLoadBasketsRejectsInvalidConfig`). `internal/regime` + migration 015/016/027 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue/lock writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure, decimal math): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` appended per distinct FULL-FIELD `state_hash` (direction/level/confidence/score/timeframe_scores/symbol_contributions/stale_reason/config_version); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix + config-validation matrix + no-order-client guard; gated (load config, current-upsert + history-on-change + full-evolution + state_hash/stale_reason stored, select-error-returned, config CHECK rejections, LoadBaskets rejects invalid, calculator samples+persists, redis-miss no-crash/no-fabricate). |
-| PR16 | `pr16-dashboard-readonly-errors` | **in review** | Cut from accepted PR15 (`pr15-market-regime-history-validation`, `1996b07`); PR14/PR15 fixes preserved (health-monitor read-only private health that never invalidates a credential on a transient error; regime history state_hash/stale_reason + WriteResult select-error handling + config validation + migration 027) and invariant scripts intact — full sweep green. **Reconstructed as STRICTLY read-only:** the config-editing/auth/live/preflight/session/credential-admin handlers are **removed from PR16** (they belong to later PRs; config editing = PR17 with explicit safety controls), so `Handler()` registers ONLY GET routes. **Corrections:** (#6) `/api/cycles/{id}` error-checks EVERY sub-query (orders/fills/exchange_requests/cycle_state_events/order_events/symbol_locks/app_logs) → 500 on any failure, never a partial 200 (cycle-not-found → 404). (#7) `/api/config` error-checks every config query (markets/exchanges/fees/regime_baskets/active-version) → 500 on any failure, never incomplete config with 200. (#8) `app_logs` are masked before display (message + fields + any string), same defence-in-depth as `api_call_logs` — both the `/api/logs` endpoint and cycle-detail `logs`. `internal/dashboard` + `cmd/dashboard`: Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any POST/PUT/PATCH/DELETE is 405; no place/cancel/cycle/order/queue/lock/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot incl. regime baskets), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). **Round 2:** (1) `doc.go` + architecture no longer claim PR16 edits config — strictly read-only, config editing = PR17 (auth/authz/audit/validation). (2) WebSocket `CheckOrigin` is **same-origin only** (`sameOriginOnly`): foreign Origin → 403, missing Origin (non-browser) allowed + documented, malformed/opaque rejected — no more `CheckOrigin=true`. (3) `snapshot()` returns an error and checks EVERY query; any failure → generic `snapshot_error` event (raw DB details logged, never exposed), never a partial normal snapshot; `stale` normalized to bool (consistent with HTTP). WebSocket snapshot-only (open cycles/health/regime/balances) — drains + ignores incoming messages, no command handler. Separate binary (restart isolates). Tests: offline (no-order-client guard, exhaustive POST/PUT/PATCH/DELETE→405 over all routes, same-origin matrix, step_kind, mask-secrets) + gated (endpoints missing-data 200, seeded cycle detail + maker/taker + 404, cycle-detail 500-on-each-subquery-failure, /api/config 500-on-each-query-failure, app_logs masked + cycle-detail logs masked, ws foreign-origin-403/same-origin/missing-origin, ws snapshot_error-on-each-query-failure, ws stale-is-bool, ws-ignores-commands-no-mutation, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). |
-| PR17 | `pr17-config-editing-login` | **in review** | Cut from accepted PR16 (`pr16-dashboard-readonly-errors`, `58d2429`); all PR16 read-only/deploy-safety fixes preserved. `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + migration 028: **real login/session auth** + authenticated, authorized, versioned, audited, validated, **concurrency-safe** config EDITING. Still no trading: no place/cancel, and no cycle/order/queue/lock/credential mutation route. **Login:** `dashboard_users` (PBKDF2-SHA256 password hash — never plaintext — role, active, last_login_at) + `dashboard_sessions` (only sha256(token) stored, never the token; expiry/revoke). `POST /login`/`/logout`; HttpOnly + SameSite + Secure-when-HTTPS cookie. EVERY route except `/healthz`+`/login` (UI, `/api/*`, mutations, `/ws`) needs a valid session → 401. Roles viewer/config_operator/admin; editing needs config_operator+ (viewer → 403). Session resolution **joins dashboard_users** for the LIVE role + `active=1`, so disabling a user breaks their existing sessions (401) and role changes apply without a re-login. Bootstrap via `dashboard -create-user user:role` (**password read from a hidden prompt/stdin, never a CLI arg**). **Optimistic concurrency + single-active:** every edit body carries `expected_config_version`; the tx locks ALL active config_version rows FOR UPDATE (no LIMIT) + the target row FOR UPDATE, requiring exactly one active (0→ErrNoActiveVersion, **2+→ErrMultipleActiveVersions/409**, refusing to edit) and 409s on version mismatch (`ErrStaleConfigVersion`) — concurrent editors serialized (exactly one wins, loser 409; deadlock retried so never 500). **Sell-manage guard:** disabling `enabled_for_sell_manage` with open exposure (**BUY_REQUEST_QUEUED/BUY_SUBMITTED**/BUY_PARTIALLY_FILLED/BUY_FILLED/SELL_*/CANCEL_PENDING/NEEDS_RECONCILE) → 409 (`ErrSellManageExposed`); high-risk switches (enable trading / disable sell-manage) require admin. **Fees:** `UpsertFee` returns real previous-fee read errors (only ErrNoRows = none) and validates `exchange_market_id` belongs to `exchange_id` (else 400) — no version/audit on rejection. **Audit:** each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (real old/new/reason/`changed_by`=authenticated session user, NEVER client input); **non-empty reason mandatory** (else 400). **Strict JSON:** DisallowUnknownFields + exactly-one-object (2nd decode io.EOF) → trailing/garbage/unknown → 400. Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries sane, taker_mode=ASK, fees≥0) → 400; enable-flag hierarchy trading⊆signal⊆collection; no-op → 400. Editable: symbol config, market flags, exchange config, fees; read `GET /api/audit`, `/api/me`. exchange_markets has no config_version col → version on config_versions+audit. Hot reload via configstore.Cache; active cycles keep stamped config_version. Regime + credential editing deferred to later PRs. Tests: offline (password hash round-trip, role ranking, 405 matrix, same-origin) + gated (login valid/wrong-pw/disabled/unknown, logout invalidates, all routes 401 w/o login, WS 401 w/o login, viewer read-not-edit, secrets-not-plaintext; versioned+audited edit w/ session changed_by + real old value, stale→409 + rollback leaves active, concurrent→1 ok/1 conflict + 1 active version, sell-manage disable blocked-by-exposure(3 states)/allowed-no-exposure, high-risk-requires-admin, reason mandatory + can't-impersonate, strict-JSON trailing/garbage/unknown; disabled-user-loses-session, role-change-applies-to-existing-session, multiple-active-versions→409-no-mutation, UpsertFee-returns-read-error, fee-market-ownership-validated; trading-requires-sell_manage(400), offset-bps-upper-bound[0,10000), fee-audit-identifies-market vs exchange, and buyflow CreateBuyCycle-rejects-when-trading/sell-manage-disabled + real-UpdateMarketFlags-concurrency (both orderings, no deadlock/orphan over 25 rounds); fee no-op→ErrNoChanges (decimal-equal) + per-changed-field audit). |
-| PR18 | `pr18-retention-worker` | **in review** | Rebuilt on accepted PR17 (`a2938db`); all PR14–PR17 work preserved (full sweep green). `internal/retention` + `cmd/retention-worker` + migrations 018/029: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable. **Correction #2 — one pinned `*sql.Conn` for the whole run:** GET_LOCK + load settings + counts + batch DELETEs + app_logs report all run on the SAME pinned connection, with RELEASE_LOCK before close — correct under `SetMaxOpenConns(1)` (no self-hang) and lock stays tied to the deleting connection (no two-worker overlap); lock released on every exit incl. errors. **Correction #3 — safe bounds:** retention_days∈[1,3650], batch_size∈[1,50000], max_batches_per_run∈[1,10000], pause_ms∈[0,60000], validated at runtime (out-of-range → per-table validation error, no DELETE, others continue — never defaulted) + DB CHECK (migration 029); overflow-safe cutoff via `AddDate(0,0,-days)`. **Correction #4 — lock-skip reported + logged:** a lock-blocked run returns a completed report (`LockAcquired=false`, `SkippedReason`) AND writes an app_logs entry; a run with any table error logs at `warn` not `info`. Missing/NULL/<1 days → not configured (do nothing); disabled → skip. Batched DELETE…LIMIT (short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. No Redis, no exchange calls; file-config + `-dry-run` flag only (no runtime env). Binary runs once then every 6h. Tests: offline whitelist/permanent guard + bounds-validate matrix (boundary accept + all out-of-range reject); gated missing/disabled/dry-run no-op, batch-only-old + recent-preserved, batch/max honored, permanent-never-targeted, one-table-failure→warn+continue, invalid-setting→skip+continue, DB-bounds-reject, MaxOpenConns(1)-no-hang, two-workers-no-overlap, lock-released-on-error, lock-skip-reported+logged, run-recorded, ctx-cancel-clean. |
-| PR19 | `pr19-dry-run` | **in review** | Rebuilt on accepted PR18 (`a8a7036`); all PR14–PR18 work preserved (full sweep green). `internal/simexec` + migrations 019/030 + config `[execution] mode` + engine/buyflow/executor/queue/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. **Correction #5 — mode strictly validated:** exactly off/dry_run/live; empty→off; a typo (dryrun/DRY_RUN/…) is a hard startup error (config.Validate), never silently off; both config examples ship explicit `[execution] mode="off"`. **Correction #3 — off creates no executable state:** engine wired `PrepareBuyCycles=false` in off mode → strictly signal-only (records comparison/signal but NO cycle/order/PLACE_ORDER-request/symbol-lock; never calls CreateBuyCycle). **Correction #2 — strict dry/live separation (two guards):** `queue.Claim` takes a dry_run filter joining cycles (mode-scoped in-flight count too), so a dry-run executor claims only dry_run=1 requests and a live executor only dry_run=0; a final pre-send `abortOnModeMismatch` refuses any mismatched PlaceOrder/CancelOrder and leaves the request untouched (sweeper reverts). **Correction #4 — simexec PERSISTENT (migration 030 sim_exchange_orders):** order state survives restarts + is shared across instances (keyed by SIM-<client_order_id> + stored scenario), so a follow-up GET_ORDER on a new instance resolves deterministically instead of ErrOrderUnknown→NEEDS_RECONCILE; in dry_run the reconciler is wired READ-ONLY simexec clients so dry-run cycles are reconciled (not skipped). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills. **Round 2 — ambiguous execution (7 blockers): (1)** simexec models accepted-but-timed-out PLACE (`place_timeout_accepted_{open,partial_fill,full_fill}` persist first then ErrAckTimeout WITHOUT the exchange id; `place_timeout_not_accepted` persists nothing) with an explicit mutable lifecycle (`status`,`filled_quantity`); **(2)** GetOrder resolves by exchange_order_id OR `client_order_id` (migration 030 adds `UNIQUE(exchange_code, client_order_id)`); **(3)** an ambiguous PLACE/CANCEL DEAD-letters the mutating request and schedules a read-only GET_ORDER recovery probe (`ambiguous_place_probe` by client_order_id → resume ack flow / provably-not-placed→clean-fail; `ambiguous_cancel_probe` → record actual fill & continue), NEVER a blind retry, NEEDS_RECONCILE only after bounded recovery; **(4)** cancel-timeout scenarios (`cancel_timeout_{but_canceled,still_open,partial_then_canceled,filled_before_cancel}`) mutate then time out; still-open → bounded proven re-cancel; **(5)** reconciler holds BOTH real+sim client sets and routes strictly by `cycle.dry_run` (never mixes; absent client → skip safely); **(6)** the final live guard fails closed on any cycle-mode DB error/missing/NULL (`cycleDryRun (bool,error)`) → send nothing, request stays recoverable; **(7)** immutable simexec idempotency (identical re-place → same order, no second row; different payload → conflict). Migration 031 `idx_cycles_dry_run_state`. Fills idempotent (`UNIQUE(order_id,exchange_fill_id)` + deterministic id) → no double-apply across instances. Tests: offline + gated — simexec accepted/cancel-timeout matrix, idempotency, client-id lookup; executor place/cancel-timeout recovery (full/open/partial/not-accepted, canceled/filled/partial/still-open-bounded), cross-instance recovery, no-double-fill, fail-closed live guard; reconciler routes-by-dry-run-never-mixes + skips-when-mode-client-absent. **Round 3 — ambiguous-execution hardening (8 blockers, migration 032; verified on MariaDB 10.6): (1)** a first `ErrOrderUnknown` is NOT proof of non-placement — bounded read-only retries with backoff (sim `hidden_probes` models eventual-consistency delayed visibility), lock HELD, cycle NOT failed; only a `ReliableNotFound` venue after bounded probes → provably-not-placed (else NEEDS_RECONCILE); **(2)** new capability `LookupByClientOrderID` (Wallex-only) distinct from `ClientOrderID` (place) — recovery/reconciler probe by client id only when GetOrder truly accepts one, never into an exchange-id-only endpoint; **(3)** crash-after-send recovery: the sweep converts a stale IN_FLIGHT PLACE/CANCEL into a persisted read-only probe (`recoverStaleMutating`), never a blind resend; **(4)** the EXACT `adapter.ClientOrderIDForSend(local)` (e.g. Nobitex 32-char truncation) is committed to `client_order_id_sent` BEFORE the send, recovered by it, and a mismatched recovered order (side/qty/symbol) is never attached; **(5)** simexec CancelOrder/GetOrder use the order's OWN persisted scenario + stored immutable fields (order_type/tif), deterministic across instances; **(6)** a mutating request never reaches an exchange without a cycle+order — mode-scoped claim clause + pre-send fail-closed guard (runtime, not a CHECK, keeping the generic queue decoupled); **(7)** terminal recovered states recorded DIRECTLY (`RecoverBuy/SellPlace|Cancel`) — no redundant cancel/GET_ORDER; **(8)** claim index justified on the real 10.6 `EXPLAIN` (idx_exreq_claim serves the per-status index-ordered scan; the OR-filesort measured ~0.1ms/3334 rows, split 1.06x → left as-is; idx_cycles_dry_run_state proven used by the dry_run subquery). Tests: delayed-visibility recovery, reliable-vs-unreliable negative, crash-place/crash-cancel recovery, persist-client-id-before-send, mismatched-order-not-attached, deterministic-cancel-across-instances, immutable-fields-include-type/tif, cycleless-mutating-fails-closed. **Round 4 — recovery hardening (5 blockers; verified on MariaDB 10.6): (1)** stale-mutation recovery is ATOMIC (`SELECT … FOR UPDATE SKIP LOCKED` claim + status re-check + schedule probe + mark DEAD in one tx) and `SweepStuck` no longer touches mutating IN_FLIGHT — exactly one probe, never a premature reconcile (concurrency test with two recoverers + the sweeper); **(2)** real-venue recovery via a dedicated `ClientOrderLookup.GetOrderByClientOrderID` (Wallex client-id GetOrder; Bitpin `?identifier=`; Nobitex list-recent-orders + match the reliable `clientOrderId`), `LookupByClientOrderID` true iff implemented (adapter tests for Bitpin + Nobitex); **(3)** the simulator looks up FIRST and replays the order's OWN persisted scenario (not the current instance's) — a different-instance re-place follows the original scenario, no second row; **(4)** recovered-order identity = reliable id + symbol + side (quantity is NOT an exact-identity requirement); **(5)** per-exchange configurable recovery timing (`RecoveryConfig` max_attempts/initial/max/total) with bounded exponential backoff + jitter — window-expiry → NEEDS_RECONCILE, lock HELD, no resend; and `client_order_id_sent` persistence verifies EXACTLY ONE row updated (else fail closed). Tests: two-instance-recovery-plus-sweeper-no-race, cross-instance-persisted-scenario, Bitpin/Nobitex client-id lookup, wrong-side-not-attached, configurable window-expiry. **Round 4 correction (4 fixes; verified on MariaDB 10.6): (1)** the recovery window is RUNTIME-configured — `[execution.recovery]` + `[execution.recovery.per_exchange.<code>]` in the bootstrap TOML (documented safe defaults 6/1s/30s/5m), validated at startup (max_attempts>0, initial>0, max>=initial, total>0, safety bounds ≤100/≤1h/≤24h; negatives/violations = hard error), wired via `recoveryFromConfig` into `executor.Config`; partial per-exchange overrides inherit the CONFIGURED global (config resolution AND the executor merge — never hard defaults); **(2)** transient cancel-probe lookup failures (timeout/network/rate-limit/5xx/context) consume attempts of the SAME persisted window (attempt + FirstProbeAt + jittered exp backoff + TotalTimeout), never `q.ScheduleRetry`/queue max_retries (probe rows keep retry_count=0); **(3)** window exhaustion = DEAD probe + NEEDS_RECONCILE in ONE tx (`deadReconcile`), no crash window; **(4)** `SweepStuck` doc updated (mutating IN_FLIGHT is skipped for `recoverStaleMutating`, never dead-lettered here). Tests: config parse/defaults/validation matrix, cmd wiring incl. partial-inherit, transient-window-not-queue-retries (probe-row count, retry_count=0, 1 CANCEL_ORDER only, lock ACTIVE, atomic DEAD+NEEDS_RECONCILE), TotalTimeout expiry, executor-side partial inherit + backoff cap/jitter bounds. Full `go test -p 1 ./...`, `go vet`, invariants all green on MariaDB 10.6. |
-| PR20 | `pr20-limited-live` | **accepted** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every cap required (any missing → denied); live_enabled flags default 0. Caps: max open cycles / daily orders / daily quote / order notional / base qty / consecutive failures / unresolved reconcile. Executor `liveGatePlace`/`liveGateCancel` run `live.Guard.CheckPlace`/`CheckCancel` immediately before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Dashboard `GET /api/live`: LIVE mode, kill switch, caps, live-enabled exchanges/symbols, daily-order/open-cycle allowance, credential STATUS only (no key material), unresolved-reconcile count, last live allow/deny. **Real credential decryption + real-adapter wiring deferred to PR20a** — until then `live` wires no real client (`AllowLiveExecution` false) and sends nothing; the safety machinery is fully exercised with a fake (no-network) simexec client. Tests: offline none new; gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-sell+cancel, cancel-needs-creds, AllowNewBuyCycle caps, daily-order cap) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend) + gated dashboard `/api/live` (LIVE/kill-switch/controls/credential-status-no-secrets). |
+| PR5 | `pr5-collector-ws-reconnect` | **accepted** | Redis market-data layer + collector. `internal/events` (BookSnapshot/PriceSnapshot/MarketEvent with timestamps), `internal/redis` market store (orderbook:/price: keys + TTL, `market_events` pub/sub, ErrNotFound), `internal/collector` (Collector using only PublicClient; WS-or-poll; DB-driven targets; DB health recorder; `MarketStore`/`HealthRecorder` interfaces), `FakePublicClient`, cmd/collector wired. **Correction:** an unexpected WS close while ctx is active reconnects with capped exponential backoff (never silently abandons a target; only ctx-cancel stops it; counted as a health failure + `WSFailureCount`); `market_event` is published ONLY after both `SaveOrderBook` and `SavePrice` succeed; REST `received_at` is stamped after a successful `GetOrderBook`. Tests: events, collector (fakes: poll/WS/health/shutdown/public-only, **ws-reconnect-on-unexpected-close**, **no-publish-when-save-book/price-fails**), sqlmock targets+health, gated real-Redis round-trip. Redis stays cache-only; collector uses only PublicClient; no trading/order/cycle/credential code. |
+| PR6 | `pr6-config-fee-scope-validation` | **accepted** | `internal/configstore`: DB-backed versioned trading config. `Snapshot` (MarketConfig merging exchange_markets flags + symbol_configs params, ExchangeConfig, fees, retention, active version), `Store.LoadSnapshot`/`ActiveVersion`, copy-on-write `Cache` + background `Run` reloader (non-blocking; keeps good config on reload failure), `ActivateVersion` + audited `UpdateMinSpreadBps` (version+audit in one tx, no secrets), validation (value sanity + enable-flag hierarchy), version-stamping helpers. **Corrections:** default fees are scoped per exchange (`DefaultFeesByExchangeID` keyed by exchange_id + `FeesByMarketID` keyed by exchange_market_id) with `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (market override → THIS exchange's default, never another's) — replaces the unsafe single map where every default collided at key 0; `UpdateMinSpreadBps` validates BEFORE the tx (negative spread activates no version / mutates no symbol_config / writes no audit); `ActiveVersion` returns `ErrMultipleActiveVersions` instead of silently picking the latest; integration tests use per-run suffixes (repeat-safe). Tests: sqlmock loaders/version/audit, cache COW/reload/concurrent-read, validation, FeeFor scoping/priority (offline), gated fee-scoping/invalid-write-rejected/multiple-active-rejected + repeat-safe full-path. File-only bootstrap unchanged; no env config; not yet wired into a binary. |
+| PR7 | `pr7-queue-recovery-guards` | **accepted** | `internal/queue` (DB-backed priority queue): Enqueue (idempotency-rejected), cross-process-safe Claim (GET_LOCK + count + FOR UPDATE SKIP LOCKED; priority/next_retry_at/per-exchange-limit/enabled/type filters), MarkInFlight, MarkSucceeded/Failed/Dead, ScheduleRetry (capped backoff→DEAD), conservative SweepStuck (read-only requeue / mutating→DEAD+order NEEDS_RECONCILE). `internal/executor` (order-executor): claim+dispatch loop, read-only & mutating handlers, conservative ambiguous→DEAD+reconcile, atomic complete+order-transition (rollback-safe), `AllowLiveExecution` guard (default off), NO direct-send path. **Corrections:** `SweepStuck` also recovers stale `CLAIMED` (never sent → requeued to QUEUED, claim cleared); `MarkInFlight` checks `RowsAffected` → `ErrRequestNotClaimed` (executor does not send); `MarkSucceeded/Failed/Dead` are status-guarded (`WHERE status IN ('CLAIMED','IN_FLIGHT')` + `RowsAffected`) → `ErrRequestNotActive` on a conflicting newer status, idempotent no-op on same status; definite `PlaceOrder` rejection moves the order out of `QUEUED` to `FAILED` via `ApplyOrderTransition` (already correct); ambiguous → `DEAD` + order `NEEDS_RECONCILE` (already correct). Tests: queue sqlmock + gated MariaDB (concurrent claimers, **stale-CLAIMED recovery**, **MarkInFlight zero-row**, **terminal status guards + idempotency**), executor classifiers + reflection no-send guard + gated end-to-end with fake clients (**MarkInFlight-failure-blocks-send**, definite-rejection-out-of-QUEUED, ambiguous-NEEDS_RECONCILE). Order/cycle state only via `internal/state`; nothing trades yet. |
+| PR12 | `pr12-reconciler-safeclose-guards` | **accepted** | Cut from accepted PR11 (`pr11-ambiguous-lifecycle-safety`, `1333f09`); PR6–PR11 fixes preserved (FeeFor, queue guards, DB-role dispatch, buy/sell validation, empty-id safety, sell-rejection-keeps-lock, guarded PnL close — full sweep green). **Corrections:** (#2) exchange status `REJECTED` is NO LONGER advanced to a clean terminal — it is an execution anomaly → `NEEDS_RECONCILE` (never safe-close/lock-release; sell rejection keeps the lock); (#3) `safeClose` now checks, in the close tx, for any active `exchange_request` (QUEUED/CLAIMED/IN_FLIGHT/RETRY_SCHEDULED) and refuses to close / release the lock when one exists; (#4) `applyOrderOutcome` never silently skips an illegal transition — it diverts the order to `NEEDS_RECONCILE` (report never claims a non-advance). `internal/reconciler` (read-only; never auto-sends — holds a `ReadOnlyClient` with no Place/Cancel): `ReconcileStartup` + idempotent `RunPeriodic`; pure decision matrix (`decide.go`); capability-based known/unknown-exchange-order-id paths (unknown→never resend, positively-identify-or-NEEDS_RECONCILE); cycle decisions Continue/SafeClose/NEEDS_RECONCILE; **clean zero-fill safe-close → CANCELLED (NO_FILL) + lock release, NOT FAILED** (correction); missing/unknown order ≠ proof of no fill; decisions logged to app_logs; state via state machine. `internal/symbollock` read/release helpers (Acquire is PR9). cmd/reconciler wired (no clients). Tests: pure decide unit + gated MariaDB (decision matrix, safe-close+lock-release, ambiguous-keeps-lock, client-id attach, idempotent repeat, stuck-reporting, rollback, no-mutating-call guard). Completes the safety core (PR1–PR7 + PR12). |
+| PR8 | `pr8-engine-signal-only` | **accepted** | `internal/engine` (trade-engine signal loop): subscribe `market_events`; read Redis books/prices + configstore snapshot; **owner-defined spread implemented as planned** = (Binance best bid − Iranian best ask)/ask×10000, fee-adjusted (taker buy + maker sell); USDT direct / IRT-IRR convert via same-exchange `USDT/IRT` rate (missing/stale → no signal); freshness + enable-flag + config-v0 gating; write `comparison_events` (every computable comparison) + `signals` (passed), config-version stamped, quote_unit + reference_rate audited. **SIGNAL-ONLY: the only writes are `comparison_events` + `signals` — no exchange calls, no cycle/order/exchange_request/symbol-lock writes, EVEN for a trading-enabled market with a passing signal.** Buy-cycle preparation is gated behind `Config.PrepareBuyCycles` (default FALSE) and is PR9's transactional `buyflow`. **The `cmd/trade-engine` binary leaves `PrepareBuyCycles: false` in PR8 — the real executable is signal-only; PR9 enables it.** **Corrections:** removed the unconditional `prepareBuy`/`buyflow` call from the signal path (now flag-gated, off by PR8 default); set `cmd/trade-engine` `PrepareBuyCycles: false` + a static invariant (script check #7 + `audit.TestTradeEngineSignalOnlyInPR8`) that fails the build if the binary enables it; fees via `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak); `market_events` subscription resilient — an unexpected close while ctx is active resubscribes with capped backoff and only stops on ctx-cancel (never silently returns nil); a `USDT/IRT` quote-rate tick re-evaluates all signal-enabled rial-quoted markets on the same exchange; corrected the stale doc/comments that claimed PR8 refreshes pending buy intent. Migration 009 (audit columns); `MarketConfig.ExchangeID`. cmd/trade-engine wired (no private clients; **PrepareBuyCycles off — signal-only**). Tests: offline spread/quote/targets-quote-rate-dependents/subscription-reconnect/no-client/**trade-engine-signal-only-static-invariant** + gated MariaDB+Redis (USDT signal, below-threshold, stale/missing, disabled-for-signal, IRT conversion, fee-adjusted, per-exchange-default-fee + override, **signal-only-EVEN-when-trading-enabled (0 cycles/orders/requests/locks)**, USDT/IRT-reevaluates-dependent-IRT, config-stamp; PR9-gated cycle-creation tests enable the flag). |
+| PR9 | `pr9-buyflow-refresh-guards` | **accepted** | `internal/buyflow` (+ `symbollock.Acquire`): first code that creates trading rows. Cut from accepted PR8 (`pr8-engine-signal-only`); `cmd/trade-engine` now sets `PrepareBuyCycles: true` (PR9 enables buy prep; the engine library still defaults it false as the gate). Fees come from `Snapshot.FeeFor(exchangeID, exchangeMarketID)` (per-exchange default, no key-0 leak — PR6). **Corrections:** (5) `RefreshActiveCycleBuy` now refreshes the FULL cycle signal snapshot (signal_time/prices/spread/fee_adjusted/buy_size/config_version), so cycle+order+request describe the same intent; (6) refresh is guarded on lock ACTIVE + cycle BUY_REQUEST_QUEUED + order QUEUED + request QUEUED (SELECT … FOR UPDATE), each guarded UPDATE re-asserts state and checks RowsAffected==1; (7) non-positive price/qty rejected (CreateBuyCycle errors, Refresh no-op) — venue tick/step/min validated at send, rejection handled cleanly by executor (PR7); (8) originating signal linked to the created/refreshed cycle (`signals.cycle_id`) in-tx. Removed the PR8-only "cmd must not enable PrepareBuyCycles" static invariant; tightened invariant #3 / `TestNoDirectStateUpdates` to flag state ASSIGNMENTS only (not the new guarded WHERE-clause state checks). On an accepted signal for a trading-enabled, fresh market it runs ONE transaction — insert cycle (config-stamped + signal context + execution mode) → acquire symbol lock (dup scope → `ErrSymbolLocked` → rollback, no orphan) → insert entry_buy order (`local_client_order_id`, limit, TIF NULL) → state machine cycle `NEW→SIGNAL_DETECTED→BUY_REQUEST_QUEUED` + order `NEW→REGISTERED→QUEUED` → enqueue `PLACE_ORDER` (deterministic idempotency key, full intent payload) → commit. Owner-defined maker-first/taker-fallback decision (`buyflow.Decide`, pure): maker limit below ask by `maker_price_offset_bps`, taker at ask after `maker_attempts_before_taker` maker attempts within `maker_signal_window_seconds`; persists intended mode/attempt/offset/ask. One shared attempt counter advances on create AND on refresh of the active scope (resets on window expiry). No-duplicate via the lock; the active cycle's still-QUEUED buy is **refreshed in place and re-decided** (so the SAME request escalates MAKER_FIRST→MAKER_RETRY→TAKER_FALLBACK without a duplicate); cycle-tied requests never deleted; CLAIMED/IN_FLIGHT never mutated. **Executes nothing** (no private client, no place/cancel/query, no fills, no lock release). Migration 010 (symbol_configs maker/taker cols + orders/cycles exec-mode cols); configstore loads the policy. Tests: offline Decide + gated (atomic create, rollbacks, dup-lock-blocks, maker→retry→taker across cycles, window reset, refresh-advances-attempt-and-escalates, refresh-window-expiry-resets, refresh-no-dup, CLAIMED/IN_FLIGHT untouched, idem-key unique, config stamp, flags/stale block, state-machine events, no private client). |
+| PR10 | `pr10-place-validation-fill-safety` | **accepted** | `internal/orders` (buy-side order/fill processing) + executor wiring. Cut from accepted PR9 (`pr9-buyflow-refresh-guards`), preserving PR1–PR9 fixes (FeeFor, queue guards, subscription reconnect, buyflow refresh guards — verified by the full sweep). **Corrections:** (5) `BuyIntentPayload.Validate()` runs BEFORE MarkInFlight/PlaceOrder — a malformed/zero price/qty, wrong side/type/non-IOC, or empty client id is never sent (→ clean `OnPlaceRejected`: request+order+cycle FAILED, lock released); (6) a place ack with empty `ExchangeOrderID` schedules NO blind cancel/status → order+cycle NEEDS_RECONCILE, lock HELD; (7) a full/partial fill needs a usable cost basis — `usableAvgPrice` derives `ExecutedQuote/FilledQty` when `AvgPrice`≤0, and a full fill with neither is Ambiguous→NEEDS_RECONCILE (lock held, no fill row with zero price); (8) scheduled CANCEL/GET_ORDER keep `retry_count=0` (planned step, not a retry) — documented + tested. **Round 2:** (#1) an UNDECODABLE buy payload (with order/cycle context) now resolves via `OnPlaceRejected` (request+order+cycle FAILED, lock RELEASED) instead of only failing the request — no more stuck order/cycle/lock; (#2) PLACE_ORDER is dispatched by the **DB order role** (`entry_buy`/`exit_sell`), never `payload.side` — a wrong-side payload on a buy order routes to the buy handler and is rejected by `Validate()`, never slipping into the sell handler; `PayloadSide` removed; sell gets its own `SellIntentPayload.Validate` (bad sell → FAILED + NEEDS_RECONCILE, lock held). Simulated IOC as queued work (no worker sleeps): PLACE ack → `OnPlaceAck` (order QUEUED→SUBMITTED→ACKED, cycle →BUY_SUBMITTED, schedule CANCEL at `now+maker_wait`) → CANCEL ok/definite-reject → `OnCancelResult` (order →CANCEL_PENDING, schedule GET_ORDER) → `ProcessFinalStatus` (classify → fills + transitions + lock). Pure `Classify` (full/partial/zero/ambiguous); missing order ≠ zero fill; zero-fill → CANCELLED (`SIMULATED_IOC_ZERO_FILL`, lock released) not FAILED; partial → continue filled qty (lock held); full → BUY_FILLED (lock held); ambiguous (incl. ambiguous cancel/place) → order+cycle NEEDS_RECONCILE (lock held, never re-sent); definite place-rejection → `OnPlaceRejected` (FAILED + lock released). Fill accounting (filled/remaining/avg/quote/fee/fee_asset/`actual_execution_mode`/`fill_result`/`last_normalized_status`) + idempotent aggregate `fills` row (deterministic id). All state via `internal/state`; queue+state+fill+lock in one tx (never SUCCEEDED if state failed). Native IOC never forced (TIF empty). `queue.EnqueueScheduled`; `execution.OrderStatus.Liquidity`; migration 011; `BuyIntentPayload` moved to `internal/orders`. Tests (fake clients only): offline Classify matrix + gated (place→cancel→final scheduling, zero/partial/full, missing-not-zero, ambiguous-cancel→reconcile, place-rejected-clean, fee/avg, maker/taker, idempotent repeat, rollback) + executor end-to-end IOC loop. |
+| PR11 | `pr11-sell-validation-pnl-safety` | **accepted** | Cut from accepted PR10 (`pr10-place-validation-fill-safety`, `622668b`); PR6–PR10 fixes preserved (FeeFor, PR7 queue guards, PR8 subscription reconnect + USDT/IRT, PR9 buyflow refresh guards, PR10 DB-role dispatch + buy validation + empty-id + cost-basis — all green in the full sweep). **Corrections:** (#2/#3) sell `PLACE_ORDER` is routed by DB order role (not `payload.side`) and the sell payload is validated before MarkInFlight/PlaceOrder (`SellIntentPayload.Validate`); invalid/undecodable/wrong-side sell → request FAILED + order/cycle NEEDS_RECONCILE, lock held. (#4) empty sell `ExchangeOrderID` → NEEDS_RECONCILE, lock held, no blind follow-up (also guarded in `ensurePoll`/`RepriceSell`). (#5) sell fill needs a usable cost basis (derive `ExecutedQuote/FilledQty`, else ambiguous → NEEDS_RECONCILE, no fill). (#6) `closeCycleWithPnL`/`writeCloseAccounting` check all query errors + validate buy/sell qty+quote positive + qty tolerance (`ErrIncompleteCloseAccounting`) → don't close with missing/invalid accounting (automatic path diverts to NEEDS_RECONCILE). (#7) `RepriceSell` with an empty resting-sell `exchange_order_id` → NEEDS_RECONCILE, lock held, no blind `CancelOrder("")`. `internal/sellflow` (exit sell create/reprice/Manager) + `internal/orders` sell processing + executor routing + engine driver. Sell on the ACTUAL filled inventory (`bought − sold`, step-floored), never the requested qty; partial buys sell their filled part (`BUY_PARTIALLY_FILLED→SELL_REQUEST_QUEUED`). Price `floor(binanceRef×(1−sell_offset_bps/10000), tick)`, min-order enforced; offset/tick/step/min are DB config (loaded into `MarketConfig`). `CreateSell` one tx (insert sell order → cycle→SELL_REQUEST_QUEUED + order NEW→REGISTERED→QUEUED → enqueue sell PLACE; rollback on failure; no-duplicate via active-sell guard). Resting place (`OnSellPlaceAck`, no auto-cancel) + Manager-driven `sell_status` poll (`ProcessSellStatus`): partial→SELL_PARTIALLY_FILLED (manage remainder), full→SELL_FILLED→CLOSED + PnL + lock release, ambiguous/missing→NEEDS_RECONCILE. Repricing cancel→replace, interval-gated (`reprice_interval_seconds`/`last_reprice_at`), skipped while a sell place/cancel is CLAIMED/IN_FLIGHT; cancel's final status always read before reselling; ambiguous→NEEDS_RECONCILE. Close writes exit accounting + `realized_quote` (fees netted only when quote-denominated; migration 012). All state via `internal/state`; queue+state+fill+lock atomic; engine never calls exchanges (executor only). Tests (fake clients): pure price/tick/step/min + gated sellflow (create full/partial, no-dup, below-min, tick-snap, rollback, reprice interval/in-flight/no-resting, Manager-creates-sell) + gated orders sell (place-ack-rests, partial-manages, full-closes+PnL, missing-ambiguous, idempotent, reprice-cancel partial/raced-full) + executor end-to-end sell loop. |
+| PR13 | `pr13-balance-sync-per-exchange` | **accepted** | Cut from accepted PR12 (`pr12-reconciler-safeclose-guards`, `ac3abdb`); PR10–PR12 fixes preserved (DB-role dispatch, buy/sell validation, empty-id safety, cost-basis ambiguity, sell-rejection-keeps-lock, reconciler safe-close guards incl. stored REJECTED/FAILED — full sweep green). **Corrections:** (a) `balance-sync` is NOT a skeleton — `cmd/balance-sync` wires real DB-decrypted read-only credential clients (idles safely without a master key); (b) **per-exchange, rate-limit-aware cadence wired end-to-end** — `balance.Config.IntervalFor` + `MinInterval` floor + per-exchange due-tracking, driven from the DB via new `exchange_configs.balance_poll_interval_seconds` (migration 026 + `configstore.ExchangeConfig.BalancePollIntervalSeconds`), so venues poll on their own cadence (default for all when unset). `internal/balance` + `cmd/balance-sync`: continuous read-only balance sync. Narrow `BalanceClient` (only `Name`+`GetBalances` — no place/cancel reachable). Per poll, per exchange/asset: content hash `sha256(asset\|available\|locked\|total)` over canonical decimals; `wallet_balance_history` row only when the hash changes (no dup spam); `wallet_balances_current` upserted every observation with fresh `last_seen_at` (migration 013). Decimal end-to-end into `DECIMAL(36,18)` (never float; 18-dp preserved); `total` derived as available+locked when omitted. Bounded concurrency + per-exchange timeout; one exchange's failure/timeout is isolated and NEVER wipes/zeros prior balances; a missing asset is never zeroed/deleted (its row survives, `last_seen_at` goes stale). Changes no cycles/orders/queue. Binary wires no clients yet (credential decryption later) and idles safely; no secrets logged. Tests (fake read-only clients): offline hash + read-only-interface guard + no-clients startup; gated (first-obs current+history, unchanged-no-dup, changed-avail/locked add history, missing-asset-not-zeroed, failure-isolation-keeps-previous, precision, timeout-keeps-previous, context-cancel-stops). |
+| PR14 | `pr14-health-monitor-readonly-private` | **accepted** | Cut from accepted PR13 (`pr13-balance-sync-per-exchange`, `3b110ed`); PR11–PR13 fixes preserved (sell-rejection-keeps-lock, executor empty-id boundary, reconciler safe-close guards incl. stored REJECTED/FAILED, per-exchange balance cadence, real read-only balance clients, failed-sync-doesn't-zero, missing-asset-not-zeroed) and invariant scripts (`scripts/check-critical-invariants.sh`, `scripts/local-dryrun-check.sh`) intact — full sweep green. **Correction (#3):** **private health is wired read-only (Option A)**, consistent with PR13 balance-sync — `cmd/health-monitor` builds the authenticated probe via `Builder.BuildPrivate` → `Provider.ProbePrivateHealth(code, BalanceReader)`; the narrow read-only `BalanceReader` makes place/cancel unreachable (tested `credentials.TestProbePrivateHealthIsReadOnly`); an exchange with no active credential / no master key falls back to public-only with `private_status` UNKNOWN — a **deliberate safe fallback, not an accidental omission**; stale/contradictory "private accidentally missing / wired in a later PR" doc + comments removed. **Correction (round 2):** the continuous private probe must NOT invalidate a credential on a transient error — new `Provider.ProbePrivateHealth` marks `status='invalid'` ONLY on a definite auth error (`isDefiniteAuthError` = `execution.ErrAuthFailed` or `NormalizedAPIError` category `auth`); timeout/network/rate-limit/429/exchange-5xx/unknown leave the credential `active` and untouched (surfacing only as private health UNAVAILABLE/DEGRADED/RATE_LIMITED, `last_success_at` preserved), so a brief incident can't permanently disable a valid credential (`BuildPrivate` builds only from `active`). Strict `Provider.Validate` retained for one-shot operator checks. Tests: `TestProbePrivateHealthCredentialPolicy` (auth→invalid; timeout/ack-timeout/network/rate/5xx/unknown→active), `TestProbePrivateHealthSuccessAfterTemporaryFailure`, `TestProbePrivateHealthIsReadOnly`, `TestValidateStillStrictForManualCheck`, offline `TestIsDefiniteAuthError`. `internal/health` + `cmd/health-monitor`: read-only per-exchange health. Monitor invokes only caller-supplied read-only `ProbeFunc`s (public `GetMarkets`; private balance read via `Validate` when creds exist) — no place/cancel reachable (reflection guard `TestMonitorHoldsNoOrderClient`); no cycle/order/queue writes. `Classify(err)` → normalized Status (HEALTHY/DEGRADED/UNAVAILABLE/AUTH_FAILED/RATE_LIMITED/UNKNOWN) + Category (timeout/network/exchange_5xx/exchange_4xx/auth/rate_limit/unsupported/invalid_response/unknown) from execution sentinels + NormalizedAPIError + ErrUnsupported + json errors; `context.Canceled` not recorded. `Recorder` upserts `exchange_health_current` (per-kind status, latency, last_success/failure, consecutive_failures reset-on-success, error/timeout/rate/auth counters, last_error_category/message) + appends `exchange_health_samples` (no FK, timestamp-indexed). Public/private tracked separately; auth error → api_key_status invalid; transient failure never wipes last_success; bounded concurrency + per-probe timeout isolate failures. Migration 014 (normalized status + failure-tracking cols); no secrets logged/stored. Tests (fake read-only probes): offline Classify matrix + read-only guard + no-targets startup; gated (healthy public, timeout/auth/rate/network/5xx/invalid classified+counted, private-auth→key-invalid, failure isolation, consecutive-then-reset, last-success preserved, context-cancel-stops). |
+| PR15 | `pr15-market-regime-history-validation` | **accepted** | Cut from accepted PR14 (`pr14-health-monitor-readonly-private`, `9f76cc4`); PR11–PR14 fixes preserved (sell-rejection-keeps-lock, executor empty-id, reconciler safe-close incl. stored REJECTED/FAILED, per-exchange balance cadence + real read-only clients, health-monitor read-only private health that never invalidates a credential on a transient error) + invariant scripts intact — full sweep green. **Corrections:** (#2) `market_regime_history` now stores `state_hash` + `stale_reason` (migration 027) and `WriteResult` inserts them, so history is self-describing (a changed UNKNOWN reason is visible, not just "something changed"); a history row's `state_hash` equals current's at that point (`TestHistoryStoresStateHashAndStaleReason`). (#3) `WriteResult` no longer ignores `SELECT state_hash` errors — only `sql.ErrNoRows` → changed; any other error is returned, never a misleading insert (`TestWriteResultReturnsRealSelectError`). (#4) regime config validated in BOTH layers — migration 027 CHECK constraints (symbol/timeframe weight>0, timeframe seconds>0, interval/neutral>=0, moderate>=neutral, strong>=moderate) + `Basket.Validate` called by `LoadBaskets` returning `ErrInvalidBasketConfig` so invalid config yields no regime (`TestBasketValidate`, `TestRegimeConfigCheckConstraints`, `TestLoadBasketsRejectsInvalidConfig`). `internal/regime` + migration 015/016/027 + trade-engine wiring: market-regime calculation from Binance prices read ONLY from Redis (no Binance calls; structural guard asserts no order client; no cycle/order/queue/lock writes). DB-configurable baskets (`market_regime_baskets`/`_basket_symbols`/`_timeframes`): symbols+weights, timeframes+weights, neutral/moderate/strong thresholds, update interval, config version. `regime.Calculate` (pure, decimal math): multi-timeframe momentum from a rolling per-symbol price series — per-symbol bps change vs ~T-ago reference, weighted across symbols then timeframes → score; direction (BULLISH/BEARISH/NEUTRAL/UNKNOWN) + level (STRONG/MODERATE/WEAK/FLAT/UNKNOWN) from thresholds; confidence = fresh-symbol-frac × timeframe-coverage-frac. Stale/missing symbol excluded (lower confidence); no fresh data → UNKNOWN + stale_reason (never fabricated); Redis miss records nothing (no crash). `market_regime_current` upserted (idempotent); `market_regime_history` appended per distinct FULL-FIELD `state_hash` (direction/level/confidence/score/timeframe_scores/symbol_contributions/stale_reason/config_version); both config-version-stamped, FK-light + timestamp-indexed. Calculator samples Redis into the series + recomputes per basket interval; engine hosts it + provides the PriceSource (binance mid/bid). Tests: offline calc matrix + config-validation matrix + no-order-client guard; gated (load config, current-upsert + history-on-change + full-evolution + state_hash/stale_reason stored, select-error-returned, config CHECK rejections, LoadBaskets rejects invalid, calculator samples+persists, redis-miss no-crash/no-fabricate). |
+| PR16 | `pr16-dashboard-readonly-errors` | **accepted** | Cut from accepted PR15 (`pr15-market-regime-history-validation`, `1996b07`); PR14/PR15 fixes preserved (health-monitor read-only private health that never invalidates a credential on a transient error; regime history state_hash/stale_reason + WriteResult select-error handling + config validation + migration 027) and invariant scripts intact — full sweep green. **Reconstructed as STRICTLY read-only:** the config-editing/auth/live/preflight/session/credential-admin handlers are **removed from PR16** (they belong to later PRs; config editing = PR17 with explicit safety controls), so `Handler()` registers ONLY GET routes. **Corrections:** (#6) `/api/cycles/{id}` error-checks EVERY sub-query (orders/fills/exchange_requests/cycle_state_events/order_events/symbol_locks/app_logs) → 500 on any failure, never a partial 200 (cycle-not-found → 404). (#7) `/api/config` error-checks every config query (markets/exchanges/fees/regime_baskets/active-version) → 500 on any failure, never incomplete config with 200. (#8) `app_logs` are masked before display (message + fields + any string), same defence-in-depth as `api_call_logs` — both the `/api/logs` endpoint and cycle-detail `logs`. `internal/dashboard` + `cmd/dashboard`: Server holds only a `*sql.DB` (no exchange client/queue — reflection guard); all routes GET-only so any POST/PUT/PATCH/DELETE is 405; no place/cancel/cycle/order/queue/lock/config mutation. GET JSON endpoints: cycles open/closed/{id}-detail, orders, fills, requests, signals, comparisons, balances, health, regime, logs, api-logs (masked), config (read-only snapshot incl. regime baskets), `/ws`, index, healthz. Generic `jsonRows` (SELECT→JSON); `?limit=` defaulted+capped; missing data→empty array (no panic). Queue `step_kind` (RETRY_SCHEDULED rc==0→scheduled_next_step, rc>0→retry). Balances `stale` flag (never zeroed on absence). **Round 2:** (1) `doc.go` + architecture no longer claim PR16 edits config — strictly read-only, config editing = PR17 (auth/authz/audit/validation). (2) WebSocket `CheckOrigin` is **same-origin only** (`sameOriginOnly`): foreign Origin → 403, missing Origin (non-browser) allowed + documented, malformed/opaque rejected — no more `CheckOrigin=true`. (3) `snapshot()` returns an error and checks EVERY query; any failure → generic `snapshot_error` event (raw DB details logged, never exposed), never a partial normal snapshot; `stale` normalized to bool (consistent with HTTP). WebSocket snapshot-only (open cycles/health/regime/balances) — drains + ignores incoming messages, no command handler. Separate binary (restart isolates). Tests: offline (no-order-client guard, exhaustive POST/PUT/PATCH/DELETE→405 over all routes, same-origin matrix, step_kind, mask-secrets) + gated (endpoints missing-data 200, seeded cycle detail + maker/taker + 404, cycle-detail 500-on-each-subquery-failure, /api/config 500-on-each-query-failure, app_logs masked + cycle-detail logs masked, ws foreign-origin-403/same-origin/missing-origin, ws snapshot_error-on-each-query-failure, ws stale-is-bool, ws-ignores-commands-no-mutation, retry-vs-scheduled, balances stale + value-preserved + api-log masking, pagination limit, WebSocket snapshot). |
+| PR17 | `pr17-config-editing-login` | **accepted** | Cut from accepted PR16 (`pr16-dashboard-readonly-errors`, `58d2429`); all PR16 read-only/deploy-safety fixes preserved. `internal/dashboard` (auth/admin) + `internal/configstore` (admin) + migration 028: **real login/session auth** + authenticated, authorized, versioned, audited, validated, **concurrency-safe** config EDITING. Still no trading: no place/cancel, and no cycle/order/queue/lock/credential mutation route. **Login:** `dashboard_users` (PBKDF2-SHA256 password hash — never plaintext — role, active, last_login_at) + `dashboard_sessions` (only sha256(token) stored, never the token; expiry/revoke). `POST /login`/`/logout`; HttpOnly + SameSite + Secure-when-HTTPS cookie. EVERY route except `/healthz`+`/login` (UI, `/api/*`, mutations, `/ws`) needs a valid session → 401. Roles viewer/config_operator/admin; editing needs config_operator+ (viewer → 403). Session resolution **joins dashboard_users** for the LIVE role + `active=1`, so disabling a user breaks their existing sessions (401) and role changes apply without a re-login. Bootstrap via `dashboard -create-user user:role` (**password read from a hidden prompt/stdin, never a CLI arg**). **Optimistic concurrency + single-active:** every edit body carries `expected_config_version`; the tx locks ALL active config_version rows FOR UPDATE (no LIMIT) + the target row FOR UPDATE, requiring exactly one active (0→ErrNoActiveVersion, **2+→ErrMultipleActiveVersions/409**, refusing to edit) and 409s on version mismatch (`ErrStaleConfigVersion`) — concurrent editors serialized (exactly one wins, loser 409; deadlock retried so never 500). **Sell-manage guard:** disabling `enabled_for_sell_manage` with open exposure (**BUY_REQUEST_QUEUED/BUY_SUBMITTED**/BUY_PARTIALLY_FILLED/BUY_FILLED/SELL_*/CANCEL_PENDING/NEEDS_RECONCILE) → 409 (`ErrSellManageExposed`); high-risk switches (enable trading / disable sell-manage) require admin. **Fees:** `UpsertFee` returns real previous-fee read errors (only ErrNoRows = none) and validates `exchange_market_id` belongs to `exchange_id` (else 400) — no version/audit on rejection. **Audit:** each edit = ONE tx: activate new config_version + update provided fields + config_change_audit per field (real old/new/reason/`changed_by`=authenticated session user, NEVER client input); **non-empty reason mandatory** (else 400). **Strict JSON:** DisallowUnknownFields + exactly-one-object (2nd decode io.EOF) → trailing/garbage/unknown → 400. Validation (min_spread≥0, buy_size>0, unit∈{base,quote}, offsets/intervals/retries sane, taker_mode=ASK, fees≥0) → 400; enable-flag hierarchy trading⊆signal⊆collection; no-op → 400. Editable: symbol config, market flags, exchange config, fees; read `GET /api/audit`, `/api/me`. exchange_markets has no config_version col → version on config_versions+audit. Hot reload via configstore.Cache; active cycles keep stamped config_version. Regime + credential editing deferred to later PRs. Tests: offline (password hash round-trip, role ranking, 405 matrix, same-origin) + gated (login valid/wrong-pw/disabled/unknown, logout invalidates, all routes 401 w/o login, WS 401 w/o login, viewer read-not-edit, secrets-not-plaintext; versioned+audited edit w/ session changed_by + real old value, stale→409 + rollback leaves active, concurrent→1 ok/1 conflict + 1 active version, sell-manage disable blocked-by-exposure(3 states)/allowed-no-exposure, high-risk-requires-admin, reason mandatory + can't-impersonate, strict-JSON trailing/garbage/unknown; disabled-user-loses-session, role-change-applies-to-existing-session, multiple-active-versions→409-no-mutation, UpsertFee-returns-read-error, fee-market-ownership-validated; trading-requires-sell_manage(400), offset-bps-upper-bound[0,10000), fee-audit-identifies-market vs exchange, and buyflow CreateBuyCycle-rejects-when-trading/sell-manage-disabled + real-UpdateMarketFlags-concurrency (both orderings, no deadlock/orphan over 25 rounds); fee no-op→ErrNoChanges (decimal-equal) + per-changed-field audit). |
+| PR18 | `pr18-retention-worker` | **accepted** | Rebuilt on accepted PR17 (`a2938db`); all PR14–PR17 work preserved (full sweep green). `internal/retention` + `cmd/retention-worker` + migrations 018/029: controlled retention of high-volume operational tables. Fixed whitelist (api_call_logs/comparison_events/exchange_health_samples/app_logs/wallet_balance_history/market_regime_history, all created_at); permanent tables (cycles/orders/fills/signals/symbol_locks/exchange_requests) absent → never deletable. **Correction #2 — one pinned `*sql.Conn` for the whole run:** GET_LOCK + load settings + counts + batch DELETEs + app_logs report all run on the SAME pinned connection, with RELEASE_LOCK before close — correct under `SetMaxOpenConns(1)` (no self-hang) and lock stays tied to the deleting connection (no two-worker overlap); lock released on every exit incl. errors. **Correction #3 — safe bounds:** retention_days∈[1,3650], batch_size∈[1,50000], max_batches_per_run∈[1,10000], pause_ms∈[0,60000], validated at runtime (out-of-range → per-table validation error, no DELETE, others continue — never defaulted) + DB CHECK (migration 029); overflow-safe cutoff via `AddDate(0,0,-days)`. **Correction #4 — lock-skip reported + logged:** a lock-blocked run returns a completed report (`LockAcquired=false`, `SkippedReason`) AND writes an app_logs entry; a run with any table error logs at `warn` not `info`. Missing/NULL/<1 days → not configured (do nothing); disabled → skip. Batched DELETE…LIMIT (short-batch exit, optional pause) — never one huge delete. Dry-run reports cutoff + estimated rows, deletes nothing. No Redis, no exchange calls; file-config + `-dry-run` flag only (no runtime env). Binary runs once then every 6h. Tests: offline whitelist/permanent guard + bounds-validate matrix (boundary accept + all out-of-range reject); gated missing/disabled/dry-run no-op, batch-only-old + recent-preserved, batch/max honored, permanent-never-targeted, one-table-failure→warn+continue, invalid-setting→skip+continue, DB-bounds-reject, MaxOpenConns(1)-no-hang, two-workers-no-overlap, lock-released-on-error, lock-skip-reported+logged, run-recorded, ctx-cancel-clean. |
+| PR19 | `pr19-dry-run` | **accepted** | Rebuilt on accepted PR18 (`a8a7036`); all PR14–PR18 work preserved (full sweep green). `internal/simexec` + migrations 019/030 + config `[execution] mode` + engine/buyflow/executor/queue/dashboard/reconciler wiring: dry-run trading mode runs the FULL lifecycle through the REAL queue/executor/order-processing/sellflow boundaries against a SIMULATED client — no real PlaceOrder/CancelOrder ever sent. **Correction #5 — mode strictly validated:** exactly off/dry_run/live; empty→off; a typo (dryrun/DRY_RUN/…) is a hard startup error (config.Validate), never silently off; both config examples ship explicit `[execution] mode="off"`. **Correction #3 — off creates no executable state:** engine wired `PrepareBuyCycles=false` in off mode → strictly signal-only (records comparison/signal but NO cycle/order/PLACE_ORDER-request/symbol-lock; never calls CreateBuyCycle). **Correction #2 — strict dry/live separation (two guards):** `queue.Claim` takes a dry_run filter joining cycles (mode-scoped in-flight count too), so a dry-run executor claims only dry_run=1 requests and a live executor only dry_run=0; a final pre-send `abortOnModeMismatch` refuses any mismatched PlaceOrder/CancelOrder and leaves the request untouched (sweeper reverts). **Correction #4 — simexec PERSISTENT (migration 030 sim_exchange_orders):** order state survives restarts + is shared across instances (keyed by SIM-<client_order_id> + stored scenario), so a follow-up GET_ORDER on a new instance resolves deterministically instead of ErrOrderUnknown→NEEDS_RECONCILE; in dry_run the reconciler is wired READ-ONLY simexec clients so dry-run cycles are reconciled (not skipped). `simexec.Client` (no network) satisfies exchanges.PrivateClient; scenarios full/partial/zero/ambiguous/rejected/place_timeout/cancel_race. Engine never closes cycles directly. Dashboard surfaces dry_run on cycles/orders/requests/fills. **Round 2 — ambiguous execution (7 blockers): (1)** simexec models accepted-but-timed-out PLACE (`place_timeout_accepted_{open,partial_fill,full_fill}` persist first then ErrAckTimeout WITHOUT the exchange id; `place_timeout_not_accepted` persists nothing) with an explicit mutable lifecycle (`status`,`filled_quantity`); **(2)** GetOrder resolves by exchange_order_id OR `client_order_id` (migration 030 adds `UNIQUE(exchange_code, client_order_id)`); **(3)** an ambiguous PLACE/CANCEL DEAD-letters the mutating request and schedules a read-only GET_ORDER recovery probe (`ambiguous_place_probe` by client_order_id → resume ack flow / provably-not-placed→clean-fail; `ambiguous_cancel_probe` → record actual fill & continue), NEVER a blind retry, NEEDS_RECONCILE only after bounded recovery; **(4)** cancel-timeout scenarios (`cancel_timeout_{but_canceled,still_open,partial_then_canceled,filled_before_cancel}`) mutate then time out; still-open → bounded proven re-cancel; **(5)** reconciler holds BOTH real+sim client sets and routes strictly by `cycle.dry_run` (never mixes; absent client → skip safely); **(6)** the final live guard fails closed on any cycle-mode DB error/missing/NULL (`cycleDryRun (bool,error)`) → send nothing, request stays recoverable; **(7)** immutable simexec idempotency (identical re-place → same order, no second row; different payload → conflict). Migration 031 `idx_cycles_dry_run_state`. Fills idempotent (`UNIQUE(order_id,exchange_fill_id)` + deterministic id) → no double-apply across instances. Tests: offline + gated — simexec accepted/cancel-timeout matrix, idempotency, client-id lookup; executor place/cancel-timeout recovery (full/open/partial/not-accepted, canceled/filled/partial/still-open-bounded), cross-instance recovery, no-double-fill, fail-closed live guard; reconciler routes-by-dry-run-never-mixes + skips-when-mode-client-absent. **Round 3 — ambiguous-execution hardening (8 blockers, migration 032; verified on MariaDB 10.6): (1)** a first `ErrOrderUnknown` is NOT proof of non-placement — bounded read-only retries with backoff (sim `hidden_probes` models eventual-consistency delayed visibility), lock HELD, cycle NOT failed; only a `ReliableNotFound` venue after bounded probes → provably-not-placed (else NEEDS_RECONCILE); **(2)** new capability `LookupByClientOrderID` (Wallex-only) distinct from `ClientOrderID` (place) — recovery/reconciler probe by client id only when GetOrder truly accepts one, never into an exchange-id-only endpoint; **(3)** crash-after-send recovery: the sweep converts a stale IN_FLIGHT PLACE/CANCEL into a persisted read-only probe (`recoverStaleMutating`), never a blind resend; **(4)** the EXACT `adapter.ClientOrderIDForSend(local)` (e.g. Nobitex 32-char truncation) is committed to `client_order_id_sent` BEFORE the send, recovered by it, and a mismatched recovered order (side/qty/symbol) is never attached; **(5)** simexec CancelOrder/GetOrder use the order's OWN persisted scenario + stored immutable fields (order_type/tif), deterministic across instances; **(6)** a mutating request never reaches an exchange without a cycle+order — mode-scoped claim clause + pre-send fail-closed guard (runtime, not a CHECK, keeping the generic queue decoupled); **(7)** terminal recovered states recorded DIRECTLY (`RecoverBuy/SellPlace|Cancel`) — no redundant cancel/GET_ORDER; **(8)** claim index justified on the real 10.6 `EXPLAIN` (idx_exreq_claim serves the per-status index-ordered scan; the OR-filesort measured ~0.1ms/3334 rows, split 1.06x → left as-is; idx_cycles_dry_run_state proven used by the dry_run subquery). Tests: delayed-visibility recovery, reliable-vs-unreliable negative, crash-place/crash-cancel recovery, persist-client-id-before-send, mismatched-order-not-attached, deterministic-cancel-across-instances, immutable-fields-include-type/tif, cycleless-mutating-fails-closed. **Round 4 — recovery hardening (5 blockers; verified on MariaDB 10.6): (1)** stale-mutation recovery is ATOMIC (`SELECT … FOR UPDATE SKIP LOCKED` claim + status re-check + schedule probe + mark DEAD in one tx) and `SweepStuck` no longer touches mutating IN_FLIGHT — exactly one probe, never a premature reconcile (concurrency test with two recoverers + the sweeper); **(2)** real-venue recovery via a dedicated `ClientOrderLookup.GetOrderByClientOrderID` (Wallex client-id GetOrder; Bitpin `?identifier=`; Nobitex list-recent-orders + match the reliable `clientOrderId`), `LookupByClientOrderID` true iff implemented (adapter tests for Bitpin + Nobitex); **(3)** the simulator looks up FIRST and replays the order's OWN persisted scenario (not the current instance's) — a different-instance re-place follows the original scenario, no second row; **(4)** recovered-order identity = reliable id + symbol + side (quantity is NOT an exact-identity requirement); **(5)** per-exchange configurable recovery timing (`RecoveryConfig` max_attempts/initial/max/total) with bounded exponential backoff + jitter — window-expiry → NEEDS_RECONCILE, lock HELD, no resend; and `client_order_id_sent` persistence verifies EXACTLY ONE row updated (else fail closed). Tests: two-instance-recovery-plus-sweeper-no-race, cross-instance-persisted-scenario, Bitpin/Nobitex client-id lookup, wrong-side-not-attached, configurable window-expiry. **Round 4 correction (4 fixes; verified on MariaDB 10.6): (1)** the recovery window is RUNTIME-configured — `[execution.recovery]` + `[execution.recovery.per_exchange.<code>]` in the bootstrap TOML (documented safe defaults 6/1s/30s/5m), validated at startup (max_attempts>0, initial>0, max>=initial, total>0, safety bounds ≤100/≤1h/≤24h; negatives/violations = hard error), wired via `recoveryFromConfig` into `executor.Config`; partial per-exchange overrides inherit the CONFIGURED global (config resolution AND the executor merge — never hard defaults); **(2)** transient cancel-probe lookup failures (timeout/network/rate-limit/5xx/context) consume attempts of the SAME persisted window (attempt + FirstProbeAt + jittered exp backoff + TotalTimeout), never `q.ScheduleRetry`/queue max_retries (probe rows keep retry_count=0); **(3)** window exhaustion = DEAD probe + NEEDS_RECONCILE in ONE tx (`deadReconcile`), no crash window; **(4)** `SweepStuck` doc updated (mutating IN_FLIGHT is skipped for `recoverStaleMutating`, never dead-lettered here). Tests: config parse/defaults/validation matrix, cmd wiring incl. partial-inherit, transient-window-not-queue-retries (probe-row count, retry_count=0, 1 CANCEL_ORDER only, lock ACTIVE, atomic DEAD+NEEDS_RECONCILE), TotalTimeout expiry, executor-side partial inherit + backoff cap/jitter bounds. Full `go test -p 1 ./...`, `go vet`, invariants all green on MariaDB 10.6. |
+| PR20 | `pr20-limited-live` | **in review** | `internal/live` (Guard) + migration 020 (`live_controls` singleton + `exchanges`/`exchange_markets`.live_enabled + `live_audit`) + migration 033 (`exchange_cooldowns` — durable rate-limit park deadlines) + executor/engine/dashboard/cmd wiring: the limited-live SAFETY layer. Real live orders allowed ONLY under explicit caps + a global kill switch + per-exchange/per-symbol live flags + credential availability + valid state, with the FINAL gate INSIDE order-executor (not only the engine). Safe by default: mode must be explicitly `live`; kill switch defaults engaged (1); every required cap must be set (any missing → denied); live_enabled flags default 0. Required caps (after the correction below): max open cycles / order notional / base qty / consecutive failures / unresolved reconcile. Executor `gatePlace`/`gateCancel` run `live.Guard.CheckPlace`/`CheckCancel` (an early pre-pacing pre-filter + a FINAL guard immediately before MarkInFlight — round 4) before each real PLACE/CANCEL (mode/AllowLiveExecution/not-dry-run/exchange+symbol live/caps/credentials/kill-switch/state); deny → request FAILED without sending + audited; allow → sent + audited. Kill switch is asymmetric: blocks new buy cycles + buy PLACEs, allows DB-PROVEN exit sell PLACE (inventory exit) + cancel + status. Engine `AllowNewBuyCycle` is the first check (kill switch + open-cycle cap). No-blind-resend preserved (ambiguous live PLACE → order/cycle NEEDS_RECONCILE, request DEAD). Live visibility is `live_audit` + `app_logs` + the startup safety summary (mode/kill-switch/caps/live scope/credential STATUS only — no key material); the `GET /api/live` view described in the original PR20 is NOT part of this lineage's dashboard (§18). **The guard fronts REAL sends:** the accepted parent already contains PR20a's real-client wiring + PR22 provisioning, so `live` builds real private clients from decrypted credentials and can perform real venue mutations once every guard passes; tests stay venue-free (rule #3) using simexec/fake clients, and no real order has run end-to-end yet (operational readiness, not missing wiring — see §16c "Current limitations"). Tests: gated live guard (allowed-baseline+audit, denies matrix [dry-run/kill-switch/not-configured/exchange-not-live/symbol-not-live/no-credentials/oversized-notional/oversized-qty], kill-switch-allows-proven-exit+cancel, cancel-needs-creds, AllowNewBuyCycle caps) + gated executor live-gate (allow→fills+audit, kill-switch→blocked+FAILED+deny-audit, no-credentials→refused, ambiguous→NEEDS_RECONCILE+DEAD-no-resend). **Correction (rebuilt on accepted PR19 `7ced7f5`; owner decisions + 8 fixes; verified on MariaDB 10.6): (1)** NO daily trading limits — max_daily_orders/max_daily_quote removed from Guard/Configured()/LoadControls/preflight caps+hash (columns remain, never read; test proves they no longer block); **(2)** SINGLE-INSTANCE design — no multi-instance cap reservation/locking added, deliberately; **(3)** comprehensive rate-limit detection ported from iranArb — per-venue signals (Nobitex 429 AND HTTP-200 `{"status":"failed","code":"TooManyRequests","backOff":sec}` envelope [definite pre-execution rejection], Bitpin Retry-After+DRF body regex, Wallex status+headers+conservative 200-body fallback, publics 429+`Retry-After`/`X-RateLimit-Remaining:0`+Reset) normalized into `RateLimitInfo{retry_after, source, definite_rejection, code}` on NormalizedAPIError; tight phrase fallback that cannot fire on "limit order"; **(4)** per-exchange reactive COOLDOWN — a throttle parks ONLY the affected exchange (claim loop skips it; an in-batch claimed request is Released to QUEUED unsent), extend-only deadlines (never shortened), venue wait preferred, per-exchange `retry_backoff_ms` else 60s fallback, 15m bound, mutex-guarded, poll-driven (no busy loop), safe logs (exchange/reason/source/until — no secrets); **(5)** rate limits never blindly retry mutations — venue-PROVEN pre-execution rejection re-queues the same persisted request after the cooldown (`RequeueProvenUnexecuted`, bounded, dead-letters when exhausted); anything else incl. HTTP-200 throttle bodies is AMBIGUOUS → never success, read-only recovery probe, lock HELD; **(6)** structured rate-limit metadata (#3's `RateLimitInfo`); **(7)** `rate_limit_per_sec` (proactive pacer before every send) + `retry_backoff_ms` (reactive fallback) WIRED from the live configstore cache via `Config.ExchangeTuningFor`; **(8)** guard hardening — live+nil-Guard DENIES (place and cancel); every safety query (`openCycles`/`unresolvedReconcile`/`consecutiveFailures`/`credentialsAvailable`/`live`) returns errors and ANY DB error denies; entry/exit separation with DB-PROVEN risk-reducing exits (`checkExitSell`: ownership, QUEUED state, payload==registered qty, dry_run=0 routing, filled inventory, no oversell/duplicate) exempt from kill-switch/entry caps; durable allow-audit BEFORE a real PLACE (audit failure ⇒ DENY) with the opposite conservative policy for cancels (audit outage never blocks risk reduction, logged instead). **Round 2 (6 blockers):** **(1)** a guard denial never strands a cycle — official state paths by risk (buy → FAILED+lock RELEASED; sell → NEEDS_RECONCILE+lock HELD; cancel → DEAD+NEEDS_RECONCILE+lock HELD), never a bare queue-row failure; **(2)** entry buys are PROVEN by one authoritative join (role/state/dry_run/cycle+exchange ownership/market-belongs-to-exchange/resolved-market-match/symbol-match/live flags) and `orderMarket` fails closed (market id 0 was a fallback that skipped the symbol-level check); **(3)** cancels prove the exact registered `exchange_order_id` + exchange/cycle ownership + a cancellable state (never trusting the payload id); **(4)** oversell counts `filled_quantity` from CANCELLED sells + the unfilled remainder of active sells (bought 1.0, cancelled-filled 0.4 → new 1.0 DENIED, 0.6 allowed); **(5)** cooldowns are DURABLE (migration 033 `exchange_cooldowns`, extend-only via GREATEST, reloaded before the first claim — a restart cannot resume sending to a throttled venue); **(6)** throttle headers on a SUCCESSFUL response park FUTURE requests via a transport sink while the completed operation keeps its result (a 200 throttle BODY remains not-a-success); plus pacing moved to the network boundary (after guard/audit, before MarkInFlight). **Round 3 (6 blockers):** **(1)** the doc's superseded "deferred to PR20a / no real client" text removed everywhere (§16c intro/split/what-remains, decisions log, PR row, and the binary's own comments) — the accepted parent HAS the real-client wiring, so the guard fronts real venue mutations; **(2)** cooldown persistence is ASYNC — arming is pure memory on the adapter's HTTP response path, durability is a separate bounded-retry worker, so a slow DB write can never delay a successful mutation's response into a caller timeout / false ambiguity; **(3)** persistence retry is tracked by `persistedUntil != until` (not by deadline-extension), so a failed write followed by equal/shorter signals is still retried; if durability stays broken past `CooldownPersistGrace` (30s default) live PLACES are disabled (cancels exempt) and re-enable automatically; **(4)** startup loads exchange tuning (+validates: live mode requires an `exchange_configs` row per wired exchange, rejects negatives) and durable cooldowns SYNCHRONOUSLY before the first claim, failure aborts Run — only the periodic refresh is async; **(5)** the SENT payload is proven equal to the persisted order for buys AND sells (quantity/price/order_type/TIF/client-id/side, derived from the actual `execution.OrderRequest` via `buildPlacePayload` so it cannot drift) and an exit must be routed to the market where the inventory was acquired; **(6)** pacing consumes exactly ONE slot per request (a duplicate GET_ORDER reservation was halving the budget) and `paceSend` returns an error so a cancellation during pacing skips MarkInFlight and every client call — a definitely-unsent request is never made ambiguous. Tests: async persistence (successful response never waits, park immediate, pending tracked, worker persists), failed-write retried when nothing extends + still durable after restart, durability grace policy (disables live places, not cancels; auto-recovers), startup (slow loader claims/sends nothing until done; load failure → zero mutations; cooldown-load failure aborts), payload mismatch matrices (buy: qty/price/client-id/type/side/zero-values/NULL-price/TIF; sell: price/qty/client-id/type/side/symbol/foreign-exchange market/not-the-acquired market; equivalent decimal forms still match), pacing (exactly one slot per GET_ORDER — mutation-verified to fail on a duplicate; cancellation → 0 place/cancel/get calls, never IN_FLIGHT). Tests: detection matrix (429+Retry-After, non-429, 200+code, 200+backOff, remaining=0+reset, malformed, fallback, no false positives on "limit", iranArb-copied nobitex 698s + bitpin 29s shapes), round-2 (13 entry-buy identity denials incl. DB error/missing row/wrong ownership/foreign market/disabled symbol+exchange/symbol mismatch/dry-run/bad role+state; 9 cancel-target denials incl. another order's id/foreign cycle+exchange/terminal/QUEUED/no registered id/DB error; oversell matrix incl. the reviewer's 0.4-cancelled cases + multi partial/active + NEEDS_RECONCILE-counts-as-active; denied buy leaves no stranded cycle + lock released; denied cancel → DEAD+NEEDS_RECONCILE; cooldown survives restart [persisted, reloaded, no call before deadline, B unaffected, resumes after] + SQL extend-only; per-adapter 200+remaining=0 keeps the order result AND parks, 200+throttle-body not success, "limit order" text not throttled, healthy quota parks nothing), cooldown (A-parks-not-B, nothing-reaches-A, resume, extend-only/no-shorten, deferred reads, safe observability), mutation safety (rate-limited place/cancel → probe not retry, 200-body not success, proven rejection requeued-then-retried exactly once, restart-no-duplicate, lock held), live guard (nil-Guard sends nothing, closed-DB denies place/cancel/new-cycle + every helper errors, daily caps no longer block, kill switch blocks buys, proven exit passes under kill switch + exhausted entry caps, oversell/duplicate/mismatch/ownership denied, audit outage blocks place but not cancel). **Round 4 (6 blockers):** **(1)** EVERY tuning reload validated before swap (`Cache.RunValidated`) — invalid/incomplete reload keeps the last known-good snapshot, and no redundant immediate 2nd load after the validated startup load; **(2)** early guard (pre-pacing; audits denials only) + FINAL guard immediately before MarkInFlight (re-checks all time-sensitive conditions at send time, writes the durable allow-audit, no-stranding disposition on deny); **(3)** exchange timeout (`sendContext`) created only at the network boundary — after pacing/final-guard/MarkInFlight — so pacing never consumes it and a pacing-delayed request is never made ambiguous; **(4)** per-exchange cooldown durability (`durabilityFailed[code]`): A's outage disables only A's entry buys, B unaffected, A auto-recovers; **(5)** graceful-shutdown bounded flush of pending cooldowns (hard-crash residual documented); **(6)** payload proof completed — mandatory exit-sell symbol, exact `time_in_force` NULL semantics, and the adapter-normalized client-order-id validated non-empty + persisted + proven by the final guard + sent unchanged. Durability policy blocks ENTRY BUYS only; proven exit sells and cancels stay available. Round-4 tests: configstore reload validation (missing-wired-exchange/negative rejected + last-good kept + no immediate reload), final-guard-after-pacing (kill-switch & cycle-state change during pacing → 0 PlaceOrder + no stranded cycle; both mutation-verified), timeout-after-pacing (short timeout + long pacing → fresh non-expired deadline, not ambiguous; mutation-verified), per-exchange durability (A denied / B allowed / A recovers), graceful-shutdown flush (armed→flush→restart restores; bounded when DB down), normalized client-order-id (normalizer changes id → final guard sees it + DB stores it + exact value sent; empty → no send), live payload matrix (empty sell symbol denied, TIF NULL semantics, sent-id vs persisted). **Round 5 (5 blockers):** **(1)** a denied buy releases the lock ONLY when `orders.OnBuyDenied` atomically proves zero exposure (order QUEUED + filled 0 + exchange_order_id NULL + cycle pre-send, read `FOR UPDATE`); otherwise it holds the lock + marks order/cycle NEEDS_RECONCILE; **(2)** the PR24 first-order checklist moved OUT of the final-guard→MarkInFlight window to after the send (`recordFirstOrderChecklist`) — nothing synchronous runs between the final guard and MarkInFlight; **(3)** pre-network failures are `execution.ErrNotSent` (temporary vs permanent) — the adapters (nobitex/wallex/bitpin) mark credential-load + invalid-symbol failures with ZERO network calls; the executor also checks `sendCtx.Err()` before the client call and classifies `IsNotSent` BEFORE any ambiguous handling (temporary → proven-unexecuted requeue; permanent → terminal entry/exit disposition; never a recovery probe); **(4)** `RequeueProvenUnexecuted` is now one transaction with `FOR UPDATE` + a `status='IN_FLIGHT'` guard + exactly-one-row `RowsAffected` + single retry increment + atomic exhaustion→DEAD+reconcile (a terminal request can never be resurrected; two concurrent handlers ⇒ one retry); **(5)** the PR-history statuses corrected — PR1–PR19 accepted (parent `7ced7f5`), PR20 in review, PR21+ planned. Round-5 tests: OnBuyDenied matrix (QUEUED-no-exposure→clean+lock-released; ACKED/SUBMITTED/PARTIALLY_FILLED/exchange-id/filled>0→NEEDS_RECONCILE+lock-held; mutation-verified), final-guard cycle-state-change during pacing → lock held + NEEDS_RECONCILE, checklist recorded only after the send, pre-network not-sent (temporary→requeue no-probe; permanent buy→clean-fail no-probe), expired send context → 0 adapter calls + requeue, per-adapter credential-failure + invalid-symbol → ErrNotSent + 0 network calls, RequeueProvenUnexecuted status guard (DEAD/FAILED/SUCCEEDED not resurrected; IN_FLIGHT→RETRY_SCHEDULED one increment; exhaustion→DEAD+reconcile; concurrent→one retry; mutation-verified). **Round 6 (5 blockers):** **(1)** pre-handler failures never strand — a transient `order.role` read error re-queues (`RequeueClaimedUnsent`, still CLAIMED), a malformed CANCEL payload → NEEDS_RECONCILE + lock HELD (never a bare queue-row FAILED); **(2)** ONE authoritative disposition (`orders.DisposeDeniedMutation`) for buy/sell/cancel denial + malformed + exhaustion — reads order+cycle `FOR UPDATE`, derives the cycle from `order.cycle_id` (never the queue's claimed cycle_id), proves request↔order↔cycle↔exchange, and can never fail/unlock an unrelated cycle B; **(3)** Bitpin auth/token failures (`bearerToken`: auth 429, token timeout, invalid response) wrapped `ErrNotSent` → order endpoint 0 calls, no probe, a 429 arms the cooldown; all private adapters classify pre-network failures; **(4)** retry exhaustion runs an executor `onExhaust` inside the requeue tx applying the operation disposition atomically — entry-buy zero-exposure → order/cycle FAILED + lock RELEASED, exit-sell/cancel → NEEDS_RECONCILE + lock HELD; **(5)** temporary local ErrNotSent uses bounded exponential backoff w/ jitter (from `retry_backoff_ms`), a proven rate limit uses the `cooldown_until` deadline, a permanent one is not retried, and `last_error`/logs preserve the real reason (never "rate-limited" for a credential blip). Round-6 tests: inconsistent-ownership (cycle B untouched + lock B not released; actual cycle A → NEEDS_RECONCILE + lock held; request DEAD; mutation-verified), cycle-derived-from-order, exhaustion-by-kind (buy release / sell+cancel+unknown hold; mutation-verified), malformed-cancel → NEEDS_RECONCILE + lock held, temporary order-role failure recoverable (RETRY_SCHEDULED, future retry), temporary-not-sent backoff (future retry_at, reason preserved, not labelled rate-limit), proven-rate-limit uses cooldown deadline, Bitpin auth-429 not-sent + 0 order calls + rate-limit preserved, Bitpin token-timeout not-sent + 0 order calls, per-adapter credential/invalid-symbol not-sent + 0 network. **Round 7 (4 blockers):** **(1)** mutating requests require `cycle_id` AND `order_id` — `Queue.Enqueue`/`EnqueueScheduled` reject (`ErrMalformedMutation`), `Claim` refuses malformed rows, and existing malformed rows are finalized DEAD + cycle NEEDS_RECONCILE + lock HELD (`sweepMalformedMutations` + `orders.DisposeMalformedMutation`, one finalizer via `FOR UPDATE SKIP LOCKED`); **(2)** `MarkInFlight` at the REAL network boundary via `exchanges.MutationPreparer` (Bitpin `PreparePlace`/`PrepareCancel` do token/auth before MarkInFlight; `prepared.Send` is the only order call) — a crash during token prep leaves the row CLAIMED (not "maybe sent"), and prepare/send are paced as two slots; **(3)** Bitpin `bearerToken` STRICT for mutations — an auth throttle window / fresh 429 / 200-with-`X-RateLimit-Remaining:0` fails preparation as a definitely-not-sent rate limit (order endpoint never called, cooldown armed, retry after cooldown); **(4)** every stale mutating IN_FLIGHT reaches a terminal decision — probe, or `finalizeStaleConservative` (DEAD + cycle NEEDS_RECONCILE + lock held), with temporary `orderRecoveryInfo` failures bounded by the recovery hard limit — none sit IN_FLIGHT forever. Also: the lookup-by-client-id doc now matches the code (all three private venues, not "Wallex only"). Round-7 tests: Enqueue/EnqueueScheduled reject missing order/cycle; Claim refuses malformed (mutation-verified); malformed-sweep + stale-null-order/null-cycle → DEAD+reconcile+lock; finalizeStaleConservative; staleRecoveryExpired bound; Bitpin auth 429/200-remaining:0 → not-sent + 0 order calls (mutation-verified) + cancel; preparer failure leaves not-IN_FLIGHT + no probe; preparer paces two slots. **Round 8 (4 blockers):** **(1)** the two-stage `MutationPreparer` boundary is implemented for ALL THREE private adapters — Nobitex `PreparePlace`/`PrepareCancel` (in-memory API-key + multipart body + request built during prep), Wallex likewise (X-API-Key + JSON body + request), Bitpin as before — so a crash during ANY adapter's preparation leaves the row CLAIMED, never a false IN_FLIGHT; `PlaceOrder`/`CancelOrder` are thin `Prepare().Send()` wrappers; **(2)** Bitpin now builds the FINAL `http.Request` inside `PreparePlace`/`PrepareCancel` (fallible `http.NewRequestWithContext` moved before MarkInFlight); `bitpinPrepared.Send` only binds the send context (`req.WithContext`) and calls `http.Do` via the shared `doPreparedRequest` — no token/credential/symbol/payload/request construction after MarkInFlight (the type holds only `req`+`decode`); **(3)** pacing counts actual HTTP calls — the executor stopped pacing before prepare and instead threads a `WithNetworkPacer` hook that the adapter invokes ONLY when it makes an auth/refresh call; fresh cached-token / in-memory-credential mutations consume ONE slot (order only), auth-or-refresh + order consumes TWO; Bitpin auth rate limits still stop the mutation endpoint; **(4)** stale recovery proves request/order/cycle/exchange ownership — `orderRecoveryInfo` loads the order's OWN cycle_id/exchange_id; a mismatch, or a NULL claimed cycle_id with a valid order_id, is resolved by `orders.DisposeDeniedMutation` (Kind=Unknown, conservative): cycle derived from the order, request DEAD, ACTUAL order+cycle NEEDS_RECONCILE, lock HELD, unrelated cycle/lock untouched, NO probe from mixed ownership. Round-8 tests: Nobitex/Wallex prepare makes 0 HTTP + Send makes 1 (place & cancel); prepare credential failure → NotSent + 0 HTTP (both adapters, place & cancel); Bitpin prepared request pre-built before Send (method/URL/auth-header/body present, 0 order hits during prep); Bitpin adapter paces auth only when networked (fresh=1, cached=0; place & cancel); cancelled auth pacing → NotSent + 0 calls; executor end-to-end pacing (expired token=2 slots + auth=1, cached=1 slot + auth=0); two-stage credential failure never IN_FLIGHT + 0 HTTP + 0 probe (Nobitex/Wallex, place & cancel); stale ownership mismatch (order cycle A / claim cycle B) → no probe, B+lockB unchanged, order+cycle A NEEDS_RECONCILE + lock A held, request DEAD (place & cancel; mutation-verified); stale NULL-cycle valid-order → cycle derived from order, DEAD + reconcile + lock held (place & cancel); consistent stale still probes. **Round 9 (4 production-path blockers):** **(1)** valid `order_id` + NULL `cycle_id` is handled in the REAL sweep flow: `recoverStaleMutating` now JOINs the order (so a NULL claimed cycle no longer hides the row from the `EXISTS(cycles WHERE id=er.cycle_id)` filter) and `sweepMalformedMutations` loads `order_id` and derives the cycle FROM the order — request DEAD, ACTUAL order+cycle NEEDS_RECONCILE, lock HELD (never finalizing only the queue row); **(2)** stale candidate discovery no longer depends on untrusted `er.exchange_id`/`er.cycle_id` — the order-JOIN + mode scope find rows with an unwired/foreign claimed exchange (can't stay IN_FLIGHT forever) or a cross-mode claimed cycle, and route each to the executor that owns the ORDER's cycle mode; **(3)** `sweepMalformedMutations` is scoped by AUTHORITATIVE execution mode — a live executor finalizes only live-cycle rows, a dry-run executor only dry-run-cycle rows (mode taken from the order's cycle when present, else the claimed cycle), a no-ownership row is DEAD-only; live and dry-run can never mutate each other's cycles/locks (`recoverySkip` for `off`; `DenialParams.BroadTerminal` DEADs still-QUEUED rows); **(4)** `bitpinAuthRateLimited` carries the real `RateLimitInfo.RetryAfter` (parsed 429 / remaining `authThrottledUntil` / `X-RateLimit-Reset`), so the queue retry waits the venue deadline not the 1s fallback, and an active window returns its remaining time without re-authenticating. Round-9 tests: Bitpin auth fresh-429/active-window/200-quota carry RetryAfter (adapter) + executor retry_at ≈ 30s not 1s; prod sweep NULL-cycle-valid-order → DEAD+reconcile+lock (live & dry_run × place & cancel); stale unwired claimed exchange still recovered (place & cancel); cross-mode claimed cycle isolation (dry-run ignores live order; live finalizes; B unchanged — mutation-verified mode scope); malformed sweep dry-run-skips-live / live-skips-dry-run / valid-order-live-claims-dry-run.**Round 10 (3 production blockers):** **(1)** the malformed-sweep execution-mode filter moved INSIDE the SQL, BEFORE `LIMIT`, with `ORDER BY er.id` — mode derived from the order's cycle when the order exists, else the claimed cycle, else mode-independent request-only — so n other-mode rows can never fill the LIMIT window and starve this executor's rows (mutation-verified: dropping the SQL clause fails the starvation test); **(2)** stale discovery RETAINS the authoritative `o.cycle_id`/`o.exchange_id`/cycle-mode on each candidate; a persistent `orderRecoveryInfo` failure past the recovery window is finalized by `finalizeStaleAuthoritative` on those RETAINED values (request DEAD, ACTUAL order+cycle NEEDS_RECONCILE, lock HELD, claimed cycle UNTOUCHED — mutation-verified: switching to the claimed cycle fails the test); ErrNoRows reconciles the retained actual cycle; **(3)** no unclaimable probe — `usableRecoveryClient` (wired client AND `exchanges.enabled=1`, fail-closed on DB error) is checked before any GET_ORDER probe; without it the row is finalized conservatively, so no probe can sit QUEUED forever behind a missing client, missing credential, or disabled exchange. Round-10 tests: 50 dry-run rows + 1 live row → one live sweep (limit 50) processes the live row, fillers untouched (+ inverse direction); persistent-orderInfo-failure expired → DEAD + ACTUAL order/cycle A reconciled + lock A held + claimed cycle/lock B unchanged (place & cancel) + cross-mode variant (dry-run executor never sees the live order's row); no-recovery-client (place & cancel) and disabled-exchange → 0 probes + DEAD + reconcile + lock held. **Round 11 (1 production blocker):** already-QUEUED `GET_ORDER` recovery probes that BECOME unclaimable after creation (exchange disabled / credential removed / client not re-constructed across a restart) are finalized by `sweepUnclaimableRecoveryProbes` — run at STARTUP and PERIODICALLY — on the AUTHORITATIVE order + cycle (probe DEAD, order+cycle NEEDS_RECONCILE, lock HELD), mode-scoped inside SQL before `LIMIT`, order-authoritative (never the probe's claimed cycle_id/exchange_id), idempotent (`FOR UPDATE SKIP LOCKED` + re-verify unusable); `recoverAmbiguousPlace`/`recoverAmbiguousCancel` also re-check `usableRecoveryClientByCode` before scheduling a probe and reconcile instead when the path was lost. Round-11 tests: queued probe + exchange later disabled → DEAD + reconcile + lock held (place-probe & cancel-probe); queued probe + restart WITHOUT the client → same; usable-exchange probe left QUEUED; ambiguous place & ambiguous cancel losing recovery capability → 0 probes + DEAD + reconcile + lock held (mutation-verified both); cross-mode isolation (dry-run executor never touches a live order's probe; live finalizes; claimed dry-run cycle B unchanged); and (round-10 strengthening) disabled-exchange stale recovery now covers CANCEL_ORDER, and a valid-order/claims-unrelated-cycle row behind 50 fillers is reached and resolved on the ORDER's cycle under the production limit. |
 | PR20a | `pr20a-credential-decryption` | **accepted** | `internal/secrets` + `internal/credentials` + executor/balance-sync/health/reconciler/dashboard wiring: real credential decryption + real private-client wiring, gated by the unchanged PR20 guard. `secrets`: AES-256-GCM, stored `nonce||ciphertext||tag`, AES key = SHA-256(master key); only AES-256-GCM supported; Encrypt/Decrypt symmetric; empty master key → ErrNoMasterKey (safe-disable); decrypt failure → ErrDecrypt (no plaintext). `credentials.Provider` (an `exchanges.CredentialProvider`): selects the single enabled+active, highest-key_version credential, decrypts api_key/secret/passphrase IN MEMORY; disabled/non-active/old-version ignored; unsupported-algo/decrypt-failure → mark row status='error' (non-secret note) + error with no plaintext; never writes back/logs/returns plaintext. `credentials.Builder.BuildPrivate` builds via the FACTORY (`exchanges.NewPrivateClient`) injecting the Provider as Creds + DB symbol map; active-credential-only; unsupported exchange → no client; no per-exchange hardcoding; no network at construction. `Provider.Validate` = read-only balance check ONLY (BalanceReader interface; never place/cancel), stamps active/invalid. Executor (live) builds real clients for live-enabled+active-credential exchanges, AllowLiveExecution=true, guard unchanged; no/invalid master key → no clients, nothing sent. balance-sync/health-private-probe/reconciler build credentialed clients held through narrowed non-mutating interfaces (BalanceClient/BalanceReader/ReadOnlyClient). Dashboard `GET /api/credentials` (+ /api/live block): STATUS ONLY (exchange/label/status/enabled/key_version/algorithm/last_checked/non-secret-note) — never key material or blob. Master key is config-file only (no runtime env). Tests: offline crypto (roundtrip, wrong-key→ErrDecrypt-no-leak, missing-key, truncated/corrupt, algorithm guard) + narrowed-interface compile+reflection guards (no Place/Cancel) + gated credentials (decrypt-valid, wrong-master-key-marks-error, missing-key-disables, unsupported-algo-marks-error, disabled-ignored, active-over-non-active, highest-key_version-selected, factory-injects-decrypted-creds, build-refuses-without-credential, validate-is-read-only-never-place/cancel) + gated dashboard `/api/credentials` (status-only, no secret fields, blob bytes absent). No real network in any test; no PlaceOrder/CancelOrder during validation. Remaining: provisioning/rotation UI + encrypt-and-insert CLI. |
-| PR21 | `pr21-operator-reconcile` | **accepted** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button). mark_failed safety: FAILED is terminal, so with open/unknown exposure it is REFUSED (kept in NEEDS_RECONCILE, lock held, audited) unless the operator sets external_resolution_confirmed=true + a mandatory external_resolution_reason (then FAILED + lock released, audited with the flag); proven zero exposure allowed but prefers cancel_zero_exposure. Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required, mark_failed-open-exposure-refused+kept-in-reconcile, mark_failed-forced-with-external-confirmation, forced-requires-external-reason, zero-exposure-failed-warns) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). Correction: `mark_failed` refuses to strand open/unknown exposure (kept in NEEDS_RECONCILE) unless explicitly forced with `external_resolution_confirmed`+reason (migration 021 adds the audit column). |
-| PR22 | `pr22-credential-provisioning` | **accepted** | `internal/credentials.Provisioner` + dashboard endpoints + migration 022 (`credential_audit`): operator create/rotate/disable/validate of exchange credentials. Plaintext exists ONLY in memory: Create/Rotate encrypt each secret with the PR20a `secrets.Cipher` (AES-256-GCM, `nonce‖ciphertext‖tag`, key=SHA-256(master key)) and store ONLY ciphertext — never logged (log-capture test), never returned (API responds id+status only), never audited. Master key from the config file only (no runtime env); empty key → `ErrNoMasterKey` → endpoints safe-disabled (503); wrong key cannot decrypt (PR20a ErrDecrypt). Create: exchange/label/key_version/algorithm(only AES-256-GCM)/enabled/status(enum)/api_key/api_secret/optional passphrase + mandatory reason; duplicate (exchange,label) → 400. Rotate: new active at key_version+1 (derived `…#vN` label) + disable ALL previously-active in one tx → exactly one active credential (no ambiguity); PR20a provider resolves to the new secret. Disable: enabled=0/status=disabled, KEEPS the row (secrets not deleted), provider ignores it. Validate: read-only balance read via the narrow `BalanceReader` (cannot place/cancel), stamps status + audits. Authz: create/rotate/disable require `credential_operator`/`admin` (`requireCredentialOperator` → 401/403); viewer/config_operator/reconcile_operator refused. Dashboard shows status only (`GET /api/credentials`, `/api/credentials/audit`) — never key material/blob/plaintext. Audit `credential_audit` (exchange/credential/operator/action/old+new status/old+new key_version/reason; no secrets). Tests: gated credentials (create-encrypts+roundtrips+no-plaintext-in-blob/logs, wrong-master-key-cannot-decrypt, duplicate-label→400, input validation, create-audit, rotation-activates-new+disables-old+single-active+both-audited, disable-ignored-by-provider+row-kept, validate-read-only+audit, no-master-key→ErrNoMasterKey) + gated dashboard (create/disable 401/bad/403-for-viewer+config_operator+reconcile_operator, create-via-http-returns-no-secrets+stores-ciphertext, invalid→400, disable-via-http, audit-endpoint-no-secrets). No real network in any test; validation cannot place/cancel; no runtime env var. |
-| PR23 | `pr23-live-preflight` | **accepted** | `internal/preflight` + `internal/live` (canary ack gate) + dashboard endpoints + migration 023 (`live_controls` freshness/canary cols + `live_acknowledgements`): strict read-only live readiness checklist + an explicit operator acknowledgement the guard enforces, so live trading can't start accidentally even with creds/caps/controls. `preflight.Checker` (DB handle only — reflection guard: no place/cancel/balance/order; no exchange import; mutates nothing): `Run` produces a Report (per-check pass/fail/warn, failures/warnings, ready, config_hash). Checks: execution-mode-live, kill-switch known+disengaged, exchange+symbol live-enabled, caps configured+sane (+canary max_open_cycles=1), credential exists/enabled/active/validated + validation-fresh (credential_validation_max_age_minutes), private-health ok (WARN accepted when health_required=0), balance recent, market-data fresh (recent comparison_event ⇒ Binance+Iranian fresh), reconcile within cap, no stuck IN_FLIGHT mutating, no stale lock, no DEAD mutating on real cycles, recent dry-run CLOSED for the exchange/symbol, auth path (enabled token), audit path (live_audit). `ConfigHash` covers config-relevant inputs only (caps/live-flags/canary/credential-identity/freshness/mode/ack-req — excludes market freshness/balances/kill-switch). `POST /api/live/acknowledge` (admin) re-runs preflight, refuses unless ready (409), records `live_acknowledgements` bound to the config hash (operator/exchange/symbol/credential/caps/reason), deactivating any prior. Guard (require_canary_ack default 1): a live BUY must be within the canary exchange/symbol scope AND covered by an active ack whose preflight_hash == current ConfigHash AND not expired (canary_ack_max_age_minutes) AND pass a dynamic re-check (credential/market/balance freshness, reconcile cap, stuck IN_FLIGHT, dangerous queue) — missing/out-of-scope/stale/expired/dynamic-fail → deny; sells+cancels unaffected. `GET /api/live/preflight` + `GET /api/live/acknowledgements` (with an `expired` flag) read-only. No exchange mutation; preflight places/cancels nothing. PR20 guard remains mandatory. Tests: offline (checker-holds-no-exchange-client) + gated preflight (passes-when-ready, fails on credential-missing/validation-stale/kill-switch/caps-missing/market-stale/balance-stale/reconcile-over-cap/stuck-inflight/no-recent-dry-run, does-not-mutate, ack-records-operator+hash, ack-refused-when-not-ready, config-change-invalidates-ack) + gated live (canary-ack-required+stale-after-config-change, canary-scope-restricts-to-one-market, ack-required-but-scope-unset) + gated dashboard (preflight-read-only, acknowledge-requires-admin [401/403 viewer+config+credential+reconcile, 200 admin records operator+hash], not-ready→409). No real network in any test. Correction: a config-only hash is not the sole gate — the live-BUY guard also enforces ack EXPIRY (canary_ack_max_age_minutes) + a dynamic re-check (preflight.DynamicRecheck) before each buy; tests: expired-ack-denies, stale-credential/market/balance-after-ack-denies, new-reconcile/stuck-inflight-after-ack-denies, kill-switch-reengaged-denies, sell/cancel-unaffected. |
-| PR24 | `pr24-canary-session` | **accepted** | `internal/live` (run sessions) + executor + dashboard endpoints + migration 024 (`live_run_sessions` + `live_audit` correlation cols): first real canary live-run instrumentation — makes the first order observable, correlatable, and stoppable WITHOUT broadening scope (still one exchange/symbol/cycle/tiny notional, gated by the PR23 ack). `live_run_sessions` records operator/exchange/symbol/credential/preflight-hash/ack-id/caps/status/start+stop reasons/first-order-checklist. `StartSession`: verifies canary scope + a current (hash-matching, non-expired) acknowledgement + dynamic readiness + no active session, then inserts ACTIVE; contacts no exchange. The guard's live-BUY path now ALSO requires an ACTIVE session (added to canaryAckOK after ack/expiry/dynamic), so `StopSession` blocks new buys immediately while sell/cancel/status stay allowed (per-run audited complement to the kill switch). `POST /api/live/session/start|stop` require admin (start re-runs preflight → 409 if not ready; 400 on scope/ack/readiness; 409 if already active); `GET /api/live/session` read-only shows session + order count/quote used/open cycles/last order/last deny/kill switch/mode/ack status. Every live_audit row tagged with live_session_id + acknowledgement_id + preflight_hash. First real buy of a session writes a one-time first-order checklist (mode/exchange/symbol/caps-remaining/credential-status/ack/session/kill-switch/request+order+cycle ids) — no secrets, idempotent. Tests: gated live (start-requires-valid-ack, out-of-scope-rejected, failed-readiness-rejected, succeeds+recorded+single, stop-blocks-buys+allows-sell/cancel+audited, stop-without-active, no-active-session-denies-buy, live_audit-includes-session+ack+hash, first-order-checklist-written+no-secrets+idempotent) + gated dashboard (start requires admin [401/403], requires ack [400], failed-preflight [409], start→view-ACTIVE→stop→no-active + second-stop 409). No real network in any test; scope stays single-canary. |
-| PR25 | `pr25-canary-runbook` | **accepted** | `RUNBOOK.md` + `internal/live` (startup summary, dry-run gate) + `internal/preflight` (RecentDryRunOK) + cmd (startup log) + dashboard (warnings + audit export) + the asInt fix: real-canary execution runbook & production hardening, no scope change (still one exchange/symbol/cycle/tiny notional, gated by preflight+ack+session). RUNBOOK.md: provision→validate→configure caps/scope→dry-run→preflight→acknowledge→disengage kill switch→start session→watch first order→stop→kill switch→inspect/export audit→resolve NEEDS_RECONCILE, + an emergency-stop-by-cycle-state table. `live.BuildSafetySummary` (read-only, no secrets): execution mode/live-enabled/kill-switch/canary exchange+symbol/caps-configured/credential STATUS/active-session/new-live-buys-allowed (full guard verdict) — logged at startup by order-executor + trade-engine. `StartSession` now also requires a recent successful dry-run (preflight.RecentDryRunOK) for the exchange/symbol. `GET /api/live/warnings` (read-only, severity-tagged): live-mode-enabled, kill-switch-disengaged, session-active, first-order-pending/sent, unresolved-reconcile, balance/market/credential-validation stale. Emergency stop (session stop or kill switch) blocks new buys immediately + keeps sell/cancel/status + recalls nothing already sent (documented + tested per cycle state). `GET /api/live/session/export` (read-only, no secrets): session + preflight hash + acknowledgement + caps + requests + orders + allow decisions + denials + first-order checklist + stop reason (via PR24 live_audit correlation). Fixed asInt to parse driver []byte/float64 ids so session counts + export correlation work. Tests: gated live (startup-summary-no-secrets + off-mode, emergency-stop-matrix [stop blocks buys/keeps sell+cancel; kill switch same], start-requires-recent-dry-run) + gated dashboard (warnings appear in live-danger states incl. stale balance/market, audit export includes session/caps/checklist/decisions + no secrets). No real network in any test; scope stays single-canary. |
-| PR26 | `pr26-predeploy-audit` | **accepted** | `scripts/check-critical-invariants.sh` + `internal/audit/invariants_test.go` + two hardening fixes + focused tests: a read-only critical pre-deploy audit (NO deploy, NO live order, NO API key, NO scope change). Audited all safety layers — runtime-config boundary, exchange-mutation boundary, DB-commit-before-send, queue claim SQL (OR/AND precedence correct + type/enabled/concurrency filters), mutating-retry safety, state-machine enforcement, symbol-lock safety, buy/sell lifecycles, simulated-IOC classification, decimal/precision, live-guard deny matrix, credential/secret masking, dashboard authz, operator reconciliation, audit correlation, crash/restart — partly via independent read-only sub-audits of the riskiest areas. **No critical bug found; every invariant HOLDS.** Static checks (CI + `go test`): fail on runtime V3_* env, PlaceOrder/CancelOrder outside executor/adapters, direct UPDATE cycles|orders SET state outside internal/state, dashboard encrypted-blob reference, secret-named log field, read-only service main holding PrivateClient — all pass. Hardening fixes (defense-in-depth, not bugs): (1) `queue.ScheduleRetry` dead-letters a mutating request (+ order NEEDS_RECONCILE) instead of ever rescheduling — guards a future caller from blind re-send; (2) `exir` order books parse via json.Number→decimal.NewFromString (exact, no float round-trip). Tests added: audit static invariants (6), queue mutating-retry guard, exchanges mask-covers-every-adapter-secret-field (incl secret_key), dashboard asInt driver-type parsing (the PR25 []byte/float64 id bug). Remaining risks documented: a few crash-recovery scenarios are venue/fault-injection-only (conservatively handled by sweeper→DEAD+reconcile). Verification: static script exit 0; offline `go test ./...` ok; full gated `-p 1` green; build/vet/gofmt clean; go.mod unchanged. Correction: added six venue-free crash/rollback fault-injection tests (TEST-ONLY executor.faultAfterSend + opreconcile.faultBeforeCommit seams + a send-counting fake client): commit-before-send recoverable+no-dup, MarkInFlight-crash, place-completion-rollback, cancel-completion-rollback, reprice-cancel-in-flight-crash, reconcile-apply-crash — all conservative (DEAD + NEEDS_RECONCILE, never re-sent, lock held). No live order sent; no real API key used. |
-| PR27 | `pr27-deploy-packaging` | **in review** | `Dockerfile` + `docker-compose.yml` + `configs/production.example.toml` + `DEPLOY.md` + `scripts/local-dryrun-check.sh` + safe-default tests: local/staging deployment packaging with NO live trading and NO real credentials (no PlaceOrder/CancelOrder, no API key). Dockerfile builds all 9 binaries (collector/trade-engine/order-executor/reconciler/balance-sync/health-monitor/dashboard/retention-worker/migrate) into one small distroless non-root image — no config/secret baked in. docker-compose: MariaDB 10.6 + Redis 7 (health-checked) + a one-shot migrate + the 8 services, each waiting on migrate via service_completed_successfully and mounting configs/config.toml read-only; dashboard on :8080. production.example.toml: placeholders ONLY — no API key, no plaintext credential, master_key empty, [execution] mode=off (safe default; off/dry_run for local/staging). DEPLOY.md: startup order (DB -> Redis -> migrate -> services -> verify dashboard/market-data/dry-run; services fail fast on pending migrations) + a full dry-run procedure (simulated clients, zero exposure). Tests: offline production-example-is-safe-and-secret-free (mode != live, master_key empty, DSN redacted, no api_key/secret in file) + gated services-refuse-pending-migrations (EnsureCurrent) + kill-switch-defaults-engaged. Existing PR19-PR26 suites cover no-real-mutating-in-dry-run, live-disabled-without-credentials, dashboard-no-secrets. Verification: all 9 binaries build, `docker compose config` valid, scripts bash-clean, static invariant script PASS, offline `go test ./...` ok, full gated `-p 1` green, build/vet/gofmt clean, go.mod unchanged. No live order; no real API key.  |
+| PR21 | `pr21-operator-reconcile` | **planned (rebuilds onto accepted PR20)** | `internal/opreconcile` + `internal/state` (operator-only exit) + `internal/orders` (shared close) + dashboard endpoints + migration 021 (`reconcile_resolutions`): authenticated, audited, explicit operator resolution of NEEDS_RECONCILE — the ONLY exit from that state, never automatic. `state.ApplyCycleResolution`/`ApplyOrderResolution`: separate from the trading map, require From=NEEDS_RECONCILE + an explicit target whitelist (cycle: BUY_FILLED/BUY_PARTIALLY_FILLED/SELL_PARTIALLY_FILLED/SELL_FILLED/CANCELLED/FAILED/CLOSED; order: FILLED/PARTIALLY_FILLED/CANCELLED/FAILED), same CAS+event; illegal target rejected. `opreconcile.Resolver` (DB handle only — reflection guard: no Place/Cancel; no exchange import): Preview (read-only, exact proposed changes + warnings, zero mutation) then Apply (one tx: re-validate → state machine → record fill → release lock only if safe → audit). Actions: cancel_zero_exposure, attach_exchange_order_id, mark_buy_filled, mark_buy_zero_filled, mark_sell_filled (full exit → CLOSED + PnL via orders.ResolveCloseFromReconcile), mark_sell_partially_filled, mark_order_cancelled_zero_fill, keep_needs_reconcile, mark_failed. Lock released ONLY on proven zero exposure / full exit (never on the button). mark_failed safety: FAILED is terminal, so with open/unknown exposure it is REFUSED (kept in NEEDS_RECONCILE, lock held, audited) unless the operator sets external_resolution_confirmed=true + a mandatory external_resolution_reason (then FAILED + lock released, audited with the flag); proven zero exposure allowed but prefers cancel_zero_exposure. Fill safety: side/qty/price/fee/fee-asset validated, oversell + duplicate-fill-id rejected, cumulative order fields updated. Balance cross-check advisory (warn >1%, never blocks). Dashboard: GET /api/reconcile (list), /api/reconcile/{id} (full context: cycle/exchange/orders/fills/requests/events/locks/logs/reason/balances/prior-resolutions/actions), /api/reconcile/audit; POST …/preview + …/apply gated by requireReconcileOperator (reconcile_operator/admin → 401/403); operator from the session, never the body; secrets never shown. No exchange mutation. Audit `reconcile_resolutions` (operator/time/cycle/order/action/old+new states/reason/fill/before+after/lock_released). Tests: offline (state resolution success/illegal-target/non-reconcile-from rejected + whitelist; resolver-holds-no-exchange-client) + gated opreconcile (zero-exposure-close+release, buy-fill-records+holds-lock, sell-fill-closes+releases, partial-keeps-lock, duplicate-fill/invalid-qty/oversell rejected, attach-oid, keep-no-release, failed-with-exposure-keeps-lock, preview-no-mutate, balance-warning, reason-required, mark_failed-open-exposure-refused+kept-in-reconcile, mark_failed-forced-with-external-confirmation, forced-requires-external-reason, zero-exposure-failed-warns) + gated dashboard (401/403 auth incl. wrong-role, detail-context+no-secrets, preview-no-mutate, apply-resolves+audits-operator, invalid→400, list). Correction: `mark_failed` refuses to strand open/unknown exposure (kept in NEEDS_RECONCILE) unless explicitly forced with `external_resolution_confirmed`+reason (migration 021 adds the audit column). |
+| PR22 | `pr22-credential-provisioning` | **planned (rebuilds onto accepted PR20)** | `internal/credentials.Provisioner` + dashboard endpoints + migration 022 (`credential_audit`): operator create/rotate/disable/validate of exchange credentials. Plaintext exists ONLY in memory: Create/Rotate encrypt each secret with the PR20a `secrets.Cipher` (AES-256-GCM, `nonce‖ciphertext‖tag`, key=SHA-256(master key)) and store ONLY ciphertext — never logged (log-capture test), never returned (API responds id+status only), never audited. Master key from the config file only (no runtime env); empty key → `ErrNoMasterKey` → endpoints safe-disabled (503); wrong key cannot decrypt (PR20a ErrDecrypt). Create: exchange/label/key_version/algorithm(only AES-256-GCM)/enabled/status(enum)/api_key/api_secret/optional passphrase + mandatory reason; duplicate (exchange,label) → 400. Rotate: new active at key_version+1 (derived `…#vN` label) + disable ALL previously-active in one tx → exactly one active credential (no ambiguity); PR20a provider resolves to the new secret. Disable: enabled=0/status=disabled, KEEPS the row (secrets not deleted), provider ignores it. Validate: read-only balance read via the narrow `BalanceReader` (cannot place/cancel), stamps status + audits. Authz: create/rotate/disable require `credential_operator`/`admin` (`requireCredentialOperator` → 401/403); viewer/config_operator/reconcile_operator refused. Dashboard shows status only (`GET /api/credentials`, `/api/credentials/audit`) — never key material/blob/plaintext. Audit `credential_audit` (exchange/credential/operator/action/old+new status/old+new key_version/reason; no secrets). Tests: gated credentials (create-encrypts+roundtrips+no-plaintext-in-blob/logs, wrong-master-key-cannot-decrypt, duplicate-label→400, input validation, create-audit, rotation-activates-new+disables-old+single-active+both-audited, disable-ignored-by-provider+row-kept, validate-read-only+audit, no-master-key→ErrNoMasterKey) + gated dashboard (create/disable 401/bad/403-for-viewer+config_operator+reconcile_operator, create-via-http-returns-no-secrets+stores-ciphertext, invalid→400, disable-via-http, audit-endpoint-no-secrets). No real network in any test; validation cannot place/cancel; no runtime env var. |
+| PR23 | `pr23-live-preflight` | **planned (rebuilds onto accepted PR20)** | `internal/preflight` + `internal/live` (canary ack gate) + dashboard endpoints + migration 023 (`live_controls` freshness/canary cols + `live_acknowledgements`): strict read-only live readiness checklist + an explicit operator acknowledgement the guard enforces, so live trading can't start accidentally even with creds/caps/controls. `preflight.Checker` (DB handle only — reflection guard: no place/cancel/balance/order; no exchange import; mutates nothing): `Run` produces a Report (per-check pass/fail/warn, failures/warnings, ready, config_hash). Checks: execution-mode-live, kill-switch known+disengaged, exchange+symbol live-enabled, caps configured+sane (+canary max_open_cycles=1), credential exists/enabled/active/validated + validation-fresh (credential_validation_max_age_minutes), private-health ok (WARN accepted when health_required=0), balance recent, market-data fresh (recent comparison_event ⇒ Binance+Iranian fresh), reconcile within cap, no stuck IN_FLIGHT mutating, no stale lock, no DEAD mutating on real cycles, recent dry-run CLOSED for the exchange/symbol, auth path (enabled token), audit path (live_audit). `ConfigHash` covers config-relevant inputs only (caps/live-flags/canary/credential-identity/freshness/mode/ack-req — excludes market freshness/balances/kill-switch). `POST /api/live/acknowledge` (admin) re-runs preflight, refuses unless ready (409), records `live_acknowledgements` bound to the config hash (operator/exchange/symbol/credential/caps/reason), deactivating any prior. Guard (require_canary_ack default 1): a live BUY must be within the canary exchange/symbol scope AND covered by an active ack whose preflight_hash == current ConfigHash AND not expired (canary_ack_max_age_minutes) AND pass a dynamic re-check (credential/market/balance freshness, reconcile cap, stuck IN_FLIGHT, dangerous queue) — missing/out-of-scope/stale/expired/dynamic-fail → deny; sells+cancels unaffected. `GET /api/live/preflight` + `GET /api/live/acknowledgements` (with an `expired` flag) read-only. No exchange mutation; preflight places/cancels nothing. PR20 guard remains mandatory. Tests: offline (checker-holds-no-exchange-client) + gated preflight (passes-when-ready, fails on credential-missing/validation-stale/kill-switch/caps-missing/market-stale/balance-stale/reconcile-over-cap/stuck-inflight/no-recent-dry-run, does-not-mutate, ack-records-operator+hash, ack-refused-when-not-ready, config-change-invalidates-ack) + gated live (canary-ack-required+stale-after-config-change, canary-scope-restricts-to-one-market, ack-required-but-scope-unset) + gated dashboard (preflight-read-only, acknowledge-requires-admin [401/403 viewer+config+credential+reconcile, 200 admin records operator+hash], not-ready→409). No real network in any test. Correction: a config-only hash is not the sole gate — the live-BUY guard also enforces ack EXPIRY (canary_ack_max_age_minutes) + a dynamic re-check (preflight.DynamicRecheck) before each buy; tests: expired-ack-denies, stale-credential/market/balance-after-ack-denies, new-reconcile/stuck-inflight-after-ack-denies, kill-switch-reengaged-denies, sell/cancel-unaffected. |
+| PR24 | `pr24-canary-session` | **planned (rebuilds onto accepted PR20)** | `internal/live` (run sessions) + executor + dashboard endpoints + migration 024 (`live_run_sessions` + `live_audit` correlation cols): first real canary live-run instrumentation — makes the first order observable, correlatable, and stoppable WITHOUT broadening scope (still one exchange/symbol/cycle/tiny notional, gated by the PR23 ack). `live_run_sessions` records operator/exchange/symbol/credential/preflight-hash/ack-id/caps/status/start+stop reasons/first-order-checklist. `StartSession`: verifies canary scope + a current (hash-matching, non-expired) acknowledgement + dynamic readiness + no active session, then inserts ACTIVE; contacts no exchange. The guard's live-BUY path now ALSO requires an ACTIVE session (added to canaryAckOK after ack/expiry/dynamic), so `StopSession` blocks new buys immediately while sell/cancel/status stay allowed (per-run audited complement to the kill switch). `POST /api/live/session/start|stop` require admin (start re-runs preflight → 409 if not ready; 400 on scope/ack/readiness; 409 if already active); `GET /api/live/session` read-only shows session + order count/quote used/open cycles/last order/last deny/kill switch/mode/ack status. Every live_audit row tagged with live_session_id + acknowledgement_id + preflight_hash. First real buy of a session writes a one-time first-order checklist (mode/exchange/symbol/caps-remaining/credential-status/ack/session/kill-switch/request+order+cycle ids) — no secrets, idempotent. Tests: gated live (start-requires-valid-ack, out-of-scope-rejected, failed-readiness-rejected, succeeds+recorded+single, stop-blocks-buys+allows-sell/cancel+audited, stop-without-active, no-active-session-denies-buy, live_audit-includes-session+ack+hash, first-order-checklist-written+no-secrets+idempotent) + gated dashboard (start requires admin [401/403], requires ack [400], failed-preflight [409], start→view-ACTIVE→stop→no-active + second-stop 409). No real network in any test; scope stays single-canary. |
+| PR25 | `pr25-canary-runbook` | **planned (rebuilds onto accepted PR20)** | `RUNBOOK.md` + `internal/live` (startup summary, dry-run gate) + `internal/preflight` (RecentDryRunOK) + cmd (startup log) + dashboard (warnings + audit export) + the asInt fix: real-canary execution runbook & production hardening, no scope change (still one exchange/symbol/cycle/tiny notional, gated by preflight+ack+session). RUNBOOK.md: provision→validate→configure caps/scope→dry-run→preflight→acknowledge→disengage kill switch→start session→watch first order→stop→kill switch→inspect/export audit→resolve NEEDS_RECONCILE, + an emergency-stop-by-cycle-state table. `live.BuildSafetySummary` (read-only, no secrets): execution mode/live-enabled/kill-switch/canary exchange+symbol/caps-configured/credential STATUS/active-session/new-live-buys-allowed (full guard verdict) — logged at startup by order-executor + trade-engine. `StartSession` now also requires a recent successful dry-run (preflight.RecentDryRunOK) for the exchange/symbol. `GET /api/live/warnings` (read-only, severity-tagged): live-mode-enabled, kill-switch-disengaged, session-active, first-order-pending/sent, unresolved-reconcile, balance/market/credential-validation stale. Emergency stop (session stop or kill switch) blocks new buys immediately + keeps sell/cancel/status + recalls nothing already sent (documented + tested per cycle state). `GET /api/live/session/export` (read-only, no secrets): session + preflight hash + acknowledgement + caps + requests + orders + allow decisions + denials + first-order checklist + stop reason (via PR24 live_audit correlation). Fixed asInt to parse driver []byte/float64 ids so session counts + export correlation work. Tests: gated live (startup-summary-no-secrets + off-mode, emergency-stop-matrix [stop blocks buys/keeps sell+cancel; kill switch same], start-requires-recent-dry-run) + gated dashboard (warnings appear in live-danger states incl. stale balance/market, audit export includes session/caps/checklist/decisions + no secrets). No real network in any test; scope stays single-canary. |
+| PR26 | `pr26-predeploy-audit` | **planned (rebuilds onto accepted PR20)** | `scripts/check-critical-invariants.sh` + `internal/audit/invariants_test.go` + two hardening fixes + focused tests: a read-only critical pre-deploy audit (NO deploy, NO live order, NO API key, NO scope change). Audited all safety layers — runtime-config boundary, exchange-mutation boundary, DB-commit-before-send, queue claim SQL (OR/AND precedence correct + type/enabled/concurrency filters), mutating-retry safety, state-machine enforcement, symbol-lock safety, buy/sell lifecycles, simulated-IOC classification, decimal/precision, live-guard deny matrix, credential/secret masking, dashboard authz, operator reconciliation, audit correlation, crash/restart — partly via independent read-only sub-audits of the riskiest areas. **No critical bug found; every invariant HOLDS.** Static checks (CI + `go test`): fail on runtime V3_* env, PlaceOrder/CancelOrder outside executor/adapters, direct UPDATE cycles|orders SET state outside internal/state, dashboard encrypted-blob reference, secret-named log field, read-only service main holding PrivateClient — all pass. Hardening fixes (defense-in-depth, not bugs): (1) `queue.ScheduleRetry` dead-letters a mutating request (+ order NEEDS_RECONCILE) instead of ever rescheduling — guards a future caller from blind re-send; (2) `exir` order books parse via json.Number→decimal.NewFromString (exact, no float round-trip). Tests added: audit static invariants (6), queue mutating-retry guard, exchanges mask-covers-every-adapter-secret-field (incl secret_key), dashboard asInt driver-type parsing (the PR25 []byte/float64 id bug). Remaining risks documented: a few crash-recovery scenarios are venue/fault-injection-only (conservatively handled by sweeper→DEAD+reconcile). Verification: static script exit 0; offline `go test ./...` ok; full gated `-p 1` green; build/vet/gofmt clean; go.mod unchanged. Correction: added six venue-free crash/rollback fault-injection tests (TEST-ONLY executor.faultAfterSend + opreconcile.faultBeforeCommit seams + a send-counting fake client): commit-before-send recoverable+no-dup, MarkInFlight-crash, place-completion-rollback, cancel-completion-rollback, reprice-cancel-in-flight-crash, reconcile-apply-crash — all conservative (DEAD + NEEDS_RECONCILE, never re-sent, lock held). No live order sent; no real API key used. |
+| PR27 | `pr27-deploy-packaging` | **planned (rebuilds onto accepted PR20)** | `Dockerfile` + `docker-compose.yml` + `configs/production.example.toml` + `DEPLOY.md` + `scripts/local-dryrun-check.sh` + safe-default tests: local/staging deployment packaging with NO live trading and NO real credentials (no PlaceOrder/CancelOrder, no API key). Dockerfile builds all 9 binaries (collector/trade-engine/order-executor/reconciler/balance-sync/health-monitor/dashboard/retention-worker/migrate) into one small distroless non-root image — no config/secret baked in. docker-compose: MariaDB 10.6 + Redis 7 (health-checked) + a one-shot migrate + the 8 services, each waiting on migrate via service_completed_successfully and mounting configs/config.toml read-only; dashboard on :8080. production.example.toml: placeholders ONLY — no API key, no plaintext credential, master_key empty, [execution] mode=off (safe default; off/dry_run for local/staging). DEPLOY.md: startup order (DB -> Redis -> migrate -> services -> verify dashboard/market-data/dry-run; services fail fast on pending migrations) + a full dry-run procedure (simulated clients, zero exposure). Tests: offline production-example-is-safe-and-secret-free (mode != live, master_key empty, DSN redacted, no api_key/secret in file) + gated services-refuse-pending-migrations (EnsureCurrent) + kill-switch-defaults-engaged. Existing PR19-PR26 suites cover no-real-mutating-in-dry-run, live-disabled-without-credentials, dashboard-no-secrets. Verification: all 9 binaries build, `docker compose config` valid, scripts bash-clean, static invariant script PASS, offline `go test ./...` ok, full gated `-p 1` green, build/vet/gofmt clean, go.mod unchanged. No live order; no real API key.  |

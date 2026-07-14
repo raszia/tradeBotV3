@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeLoader returns a configurable snapshot/error.
@@ -123,4 +124,94 @@ func TestCacheConcurrentReadsDuringReload(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// PR20 round-4 #1: every reload — startup and periodic — is validated before it replaces the
+// active snapshot, and an invalid reload keeps the last known-good snapshot.
+
+func TestReloadValidatedKeepsLastGoodOnInvalid(t *testing.T) {
+	good := snapWithVersion(5)
+	f := &fakeLoader{snap: good}
+	c := NewCache()
+
+	// A valid snapshot swaps in.
+	validate := func(s *Snapshot) error {
+		if s.Version == 0 {
+			return errors.New("incomplete snapshot")
+		}
+		return nil
+	}
+	if err := c.ReloadValidated(context.Background(), f, validate); err != nil {
+		t.Fatalf("valid reload: %v", err)
+	}
+	if c.Snapshot().ConfigVersion() != 5 {
+		t.Fatalf("active version = %d, want 5", c.Snapshot().ConfigVersion())
+	}
+
+	// The NEXT reload is invalid → it must be rejected and the previous snapshot retained.
+	f.mu.Lock()
+	f.snap = snapWithVersion(0) // incomplete
+	f.mu.Unlock()
+	if err := c.ReloadValidated(context.Background(), f, validate); err == nil {
+		t.Error("an invalid reload must return an error")
+	}
+	if c.Snapshot().ConfigVersion() != 5 {
+		t.Errorf("active version after invalid reload = %d, want 5 (last known-good retained)", c.Snapshot().ConfigVersion())
+	}
+}
+
+func TestRunValidatedDoesNoImmediateReload(t *testing.T) {
+	// RunValidated must NOT reload at start (the caller already did a validated initial load);
+	// a redundant, potentially-unvalidated second load right after startup is the bug.
+	f := &fakeLoader{snap: snapWithVersion(9)}
+	c := NewCache()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.RunValidated(ctx, f, time.Hour, nil, nil); close(done) }()
+	// Give the goroutine a moment; with an hour interval and no immediate reload, hits stays 0.
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	<-done
+	f.mu.Lock()
+	hits := f.hits
+	f.mu.Unlock()
+	if hits != 0 {
+		t.Errorf("RunValidated performed %d immediate reload(s), want 0", hits)
+	}
+}
+
+func TestReloadValidatedRejectsMissingWiredExchange(t *testing.T) {
+	// Mirrors the executor's live validator: a wired exchange missing from the reloaded
+	// snapshot makes the reload invalid, so pacing values are never silently lost.
+	wired := map[string]struct{}{"nobitex": {}, "wallex": {}}
+	validate := func(s *Snapshot) error {
+		for code := range wired {
+			if _, ok := s.Exchanges[code]; !ok {
+				return errors.New("wired exchange missing from snapshot: " + code)
+			}
+		}
+		return nil
+	}
+	full := emptySnapshot()
+	full.Version = 1
+	full.Exchanges["nobitex"] = ExchangeConfig{ExchangeCode: "nobitex", RateLimitPerSec: 5}
+	full.Exchanges["wallex"] = ExchangeConfig{ExchangeCode: "wallex", RateLimitPerSec: 3}
+	f := &fakeLoader{snap: full}
+	c := NewCache()
+	if err := c.ReloadValidated(context.Background(), f, validate); err != nil {
+		t.Fatalf("full snapshot should validate: %v", err)
+	}
+	// Now wallex's row is gone → invalid → keep the previous snapshot.
+	partial := emptySnapshot()
+	partial.Version = 2
+	partial.Exchanges["nobitex"] = ExchangeConfig{ExchangeCode: "nobitex", RateLimitPerSec: 5}
+	f.mu.Lock()
+	f.snap = partial
+	f.mu.Unlock()
+	if err := c.ReloadValidated(context.Background(), f, validate); err == nil {
+		t.Error("a snapshot missing a wired exchange must be rejected")
+	}
+	if c.Snapshot().ConfigVersion() != 1 {
+		t.Errorf("active version = %d, want 1 (partial reload rejected)", c.Snapshot().ConfigVersion())
+	}
 }

@@ -320,12 +320,12 @@ func (c *ramzinexPublic) get(ctx context.Context, fullURL, op string) ([]byte, e
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, &NormalizedAPIError{
+		return nil, ApplyRateLimitSignals(&NormalizedAPIError{
 			Exchange: ramzinexCode, Op: op, StatusCode: resp.StatusCode,
 			Category:  classifyHTTPStatus(resp.StatusCode),
 			Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429,
 			Message:   MaskBody(string(body)),
-		}
+		}, resp.Header)
 	}
 	return body, nil
 }

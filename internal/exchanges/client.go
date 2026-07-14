@@ -26,6 +26,28 @@ type CredentialProvider interface {
 	Credentials(ctx context.Context, exchange string) (Credentials, error)
 }
 
+// PreparedMutation is an immutable, fully-prepared order/cancel whose ONLY remaining step is
+// the actual network send. All definitely-pre-send work (credentials, auth/token, symbol
+// normalization, payload + HTTP-request construction) has already happened. The executor marks
+// the queue row IN_FLIGHT only immediately before calling Send, so a crash DURING preparation
+// (e.g. a Bitpin token refresh) leaves the request CLAIMED/never-sent, never a false ambiguity
+// (PR20 correction #2).
+type PreparedMutation interface {
+	// Send performs the single remaining network mutation (the order/cancel HTTP request).
+	Send(ctx context.Context) (execution.OrderAck, error)
+}
+
+// MutationPreparer is implemented by private adapters that split preparation from the send.
+// A preparation error is definitely-not-sent (wrap with execution.NotSent/NotSentPermanent); a
+// rate limit observed while preparing (e.g. a Bitpin auth 429 or an auth 200 with
+// X-RateLimit-Remaining:0) must FAIL preparation with a rate-limited ErrNotSent so the order
+// endpoint is never called in the same invocation (PR20 correction #3). Adapters that do not
+// implement this fall back to PlaceOrder/CancelOrder.
+type MutationPreparer interface {
+	PreparePlace(ctx context.Context, req execution.OrderRequest) (PreparedMutation, error)
+	PrepareCancel(ctx context.Context, exchangeOrderID string) (PreparedMutation, error)
+}
+
 // StaticCredentialProvider is a trivial provider for tests and bootstrap. It is
 // NOT how production credentials are supplied (those come from the encrypted DB).
 type StaticCredentialProvider struct{ Creds Credentials }
@@ -50,6 +72,10 @@ type ClientConfig struct {
 	RequestTimeout time.Duration
 	HTTPClient     *http.Client       // optional injected client (tests); else built from the above
 	Creds          CredentialProvider // required for private clients
+	// RateLimitSink receives throttle signals seen on SUCCESSFUL responses (PR20 correction
+	// #6) — exhausted-quota headers on an HTTP 200 must pause FUTURE requests without
+	// affecting the successful result. Optional; nil disables the observation.
+	RateLimitSink RateLimitSink
 }
 
 // Capabilities describes what an exchange adapter supports. Adapters return a

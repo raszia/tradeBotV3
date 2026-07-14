@@ -292,7 +292,9 @@ func (c *nobitexPrivate) credentials(ctx context.Context) (Credentials, error) {
 	}
 	creds, err := c.cfg.Creds.Credentials(ctx, nobitexCode)
 	if err != nil {
-		return Credentials{}, err
+		// PR20 correction #3: a credential load/decrypt failure happens BEFORE the network
+		// send — definitely not sent, and transient (e.g. the credential DB is briefly down).
+		return Credentials{}, execution.NotSent(err)
 	}
 	if creds.APIKey == "" {
 		return Credentials{}, &NormalizedAPIError{
@@ -413,12 +415,16 @@ func (c *nobitexPrivate) ClientOrderIDForSend(local string) string {
 	return nobitexNormalizeClientID(local)
 }
 
-func (c *nobitexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
+// PreparePlace implements exchanges.MutationPreparer: it does ALL pre-network work (symbol
+// validation, field/payload construction, credential load, multipart body + http.Request
+// construction) and returns a prepared mutation whose only remaining step is the order HTTP call.
+// Nobitex authenticates with an in-memory API-key header, so preparation makes no network call
+// (PR20 correction round 8 #1).
+func (c *nobitexPrivate) PreparePlace(ctx context.Context, req execution.OrderRequest) (PreparedMutation, error) {
 	base, quote := nobitexSplitSymbol(req.Symbol)
 	if base == "" || quote == "" {
-		return execution.OrderAck{}, fmt.Errorf("nobitex: invalid symbol %q", req.Symbol)
+		return nil, execution.NotSentPermanent(fmt.Errorf("nobitex: invalid symbol %q", req.Symbol))
 	}
-
 	fields := map[string]string{
 		"type":        strings.ToLower(req.Side),
 		"mode":        nobitexModeFromTIF(req.TimeInForce),
@@ -440,48 +446,109 @@ func (c *nobitexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequ
 	if cid := nobitexNormalizeClientID(req.ClientOrderID); cid != "" {
 		fields["clientOrderId"] = cid
 	}
-
-	var payload nobitexOrderEnvelope
-	raw, err := c.doForm(ctx, "/market/orders/add", fields, &payload)
+	httpReq, err := c.buildForm(ctx, "/market/orders/add", fields)
 	if err != nil {
-		return execution.OrderAck{}, err
+		return nil, err
 	}
-	if payload.Status != "ok" {
-		return execution.OrderAck{}, nobitexBusinessError("/market/orders/add", payload.Status, payload.Code, raw)
-	}
-
 	canonical := req.Symbol
 	if norm, nerr := domain.NormalizeSymbol(req.Symbol); nerr == nil {
 		canonical = norm
 	}
-	ack := c.orderToAck(payload.Order, canonical, req.Side)
-	ack.RequestedQty = req.Quantity
-	ack.LimitPrice = req.LimitPrice
+	return &nobitexPreparedPlace{c: c, req: httpReq, canonical: canonical, side: req.Side,
+		reqQty: req.Quantity, limitPx: req.LimitPrice}, nil
+}
+
+type nobitexPreparedPlace struct {
+	c         *nobitexPrivate
+	req       *http.Request
+	canonical string
+	side      string
+	reqQty    decimal.Decimal
+	limitPx   decimal.Decimal
+}
+
+func (p *nobitexPreparedPlace) Send(ctx context.Context) (execution.OrderAck, error) {
+	status, _, raw, err := doPreparedRequest(ctx, p.c.http, p.req)
+	if err != nil {
+		return execution.OrderAck{}, fmt.Errorf("nobitex POST /market/orders/add: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return execution.OrderAck{}, nobitexHTTPError("/market/orders/add", status, raw)
+	}
+	var payload nobitexOrderEnvelope
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return execution.OrderAck{}, fmt.Errorf("nobitex /market/orders/add decode: %w", err)
+	}
+	if payload.Status != "ok" {
+		return execution.OrderAck{}, nobitexBusinessError("/market/orders/add", payload.Status, payload.Code, raw)
+	}
+	ack := p.c.orderToAck(payload.Order, p.canonical, p.side)
+	ack.RequestedQty = p.reqQty
+	ack.LimitPrice = p.limitPx
 	ack.Raw = MaskBody(string(raw))
 	return ack, nil
 }
 
+// PlaceOrder is the single-call convenience wrapper over the two-stage boundary.
+func (c *nobitexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
+	prepared, err := c.PreparePlace(ctx, req)
+	if err != nil {
+		return execution.OrderAck{}, err
+	}
+	return prepared.Send(ctx)
+}
+
 // --- CancelOrder ---
 
-func (c *nobitexPrivate) CancelOrder(ctx context.Context, exchangeOrderID string) error {
+// PrepareCancel implements exchanges.MutationPreparer for cancels (round 8 #1).
+func (c *nobitexPrivate) PrepareCancel(ctx context.Context, exchangeOrderID string) (PreparedMutation, error) {
 	if exchangeOrderID == "" {
-		return fmt.Errorf("nobitex: order id is required")
+		return nil, execution.NotSentPermanent(fmt.Errorf("nobitex: order id is required"))
+	}
+	httpReq, err := c.buildForm(ctx, "/market/orders/update-status", map[string]string{
+		"order":  exchangeOrderID,
+		"status": "canceled",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &nobitexPreparedCancel{c: c, req: httpReq}, nil
+}
+
+type nobitexPreparedCancel struct {
+	c   *nobitexPrivate
+	req *http.Request
+}
+
+func (p *nobitexPreparedCancel) Send(ctx context.Context) (execution.OrderAck, error) {
+	status, _, raw, err := doPreparedRequest(ctx, p.c.http, p.req)
+	if err != nil {
+		return execution.OrderAck{}, fmt.Errorf("nobitex POST /market/orders/update-status: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return execution.OrderAck{}, nobitexHTTPError("/market/orders/update-status", status, raw)
 	}
 	var payload struct {
 		Status string `json:"status"`
 		Code   string `json:"code,omitempty"`
 	}
-	raw, err := c.doForm(ctx, "/market/orders/update-status", map[string]string{
-		"order":  exchangeOrderID,
-		"status": "canceled",
-	}, &payload)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return execution.OrderAck{}, fmt.Errorf("nobitex /market/orders/update-status decode: %w", err)
+	}
+	if payload.Status != "" && payload.Status != "ok" {
+		return execution.OrderAck{}, nobitexBusinessError("/market/orders/update-status", payload.Status, payload.Code, raw)
+	}
+	return execution.OrderAck{}, nil
+}
+
+// CancelOrder is the single-call convenience wrapper over the two-stage boundary.
+func (c *nobitexPrivate) CancelOrder(ctx context.Context, exchangeOrderID string) error {
+	prepared, err := c.PrepareCancel(ctx, exchangeOrderID)
 	if err != nil {
 		return err
 	}
-	if payload.Status != "" && payload.Status != "ok" {
-		return nobitexBusinessError("/market/orders/update-status", payload.Status, payload.Code, raw)
-	}
-	return nil
+	_, err = prepared.Send(ctx)
+	return err
 }
 
 // --- GetOrder ---
@@ -694,34 +761,36 @@ func (c *nobitexPrivate) doJSON(ctx context.Context, method, path string, out an
 	return c.do(req, path, out)
 }
 
-// doForm issues an authenticated multipart/form-data POST (Nobitex's order API
-// shape) and decodes the response into out.
-func (c *nobitexPrivate) doForm(ctx context.Context, path string, fields map[string]string, out any) ([]byte, error) {
+// buildForm constructs the authenticated multipart/form-data POST request for a Nobitex mutation
+// (its order API shape). ALL pre-network work — credential load/decrypt, multipart body
+// construction, and http.Request construction — happens here so the two-stage preparer builds it
+// BEFORE the executor commits MarkInFlight (PR20 correction round 8 #1). Nobitex authenticates
+// with an in-memory API-key header, so preparation makes NO network call. The request carries a
+// placeholder context; Send binds the real send context via doPreparedRequest.
+func (c *nobitexPrivate) buildForm(ctx context.Context, path string, fields map[string]string) (*http.Request, error) {
 	creds, err := c.credentials(ctx)
 	if err != nil {
-		return nil, err
+		return nil, err // NotSent (transient credential DB blip) or auth error — definitely pre-network
 	}
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	for k, v := range fields {
 		if err := writer.WriteField(k, v); err != nil {
 			_ = writer.Close()
-			return nil, err
+			return nil, execution.NotSentPermanent(err)
 		}
 	}
 	if err := writer.Close(); err != nil {
-		return nil, err
+		return nil, execution.NotSentPermanent(err)
 	}
-	ctx, cancel := RequestContext(ctx, c.cfg)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.restURL+path, &body)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.restURL+path, &body)
 	if err != nil {
-		return nil, err
+		return nil, execution.NotSentPermanent(err)
 	}
 	req.Header.Set("Authorization", "Token "+creds.APIKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("User-Agent", nobitexUserAgent)
-	return c.do(req, path, out)
+	return req, nil
 }
 
 func (c *nobitexPrivate) do(req *http.Request, path string, out any) ([]byte, error) {
@@ -742,6 +811,40 @@ func (c *nobitexPrivate) do(req *http.Request, path string, out any) ([]byte, er
 	return raw, nil
 }
 
+// nobitexRateLimitCode is Nobitex's documented throttle code, delivered in the standard
+// {"status":"failed","code":"TooManyRequests","backOff":N} envelope (iranArb-verified wire
+// shape). status:"failed" is Nobitex's documented "the operation was NOT performed"
+// contract — the same envelope this adapter already trusts for definite rejections like
+// InsufficientBalance — so a TooManyRequests envelope is a DEFINITE pre-execution
+// rejection: the throttled request may be safely re-queued after the cooldown.
+const nobitexRateLimitCode = "TooManyRequests"
+
+// nobitexMaxBackoff caps a server-supplied backOff (iranArb-proven bound).
+const nobitexMaxBackoff = 15 * time.Minute
+
+// parseNobitexBackoff extracts the venue wait from Nobitex's throttle body:
+// {"code":"TooManyRequests","backOff":698,...} where backOff is in SECONDS
+// (iranArb-verified unit). Returns 0 when absent/non-positive (caller applies its
+// configured fallback); caps pathological values at nobitexMaxBackoff.
+func parseNobitexBackoff(body []byte) time.Duration {
+	var r struct {
+		Backoff int64 `json:"backOff"`
+	}
+	_ = json.Unmarshal(body, &r)
+	if r.Backoff <= 0 {
+		return 0
+	}
+	if d := time.Duration(r.Backoff) * time.Second; d < nobitexMaxBackoff {
+		return d
+	}
+	return nobitexMaxBackoff
+}
+
+// nobitexIsRateLimit reports whether the venue body carries the documented throttle code.
+func nobitexIsRateLimit(code string) bool {
+	return strings.EqualFold(code, nobitexRateLimitCode)
+}
+
 // nobitexHTTPError builds a *NormalizedAPIError from a non-2xx response, wrapping
 // the appropriate execution sentinel where classifiable.
 func nobitexHTTPError(op string, status int, body []byte) error {
@@ -754,18 +857,39 @@ func nobitexHTTPError(op string, status int, body []byte) error {
 		Retryable:  status >= 500 || status == http.StatusTooManyRequests,
 		Message:    MaskBody(string(body)),
 	}
-	switch {
-	case status == http.StatusTooManyRequests:
-		e.Err = execution.ErrRateLimited
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		e.Err = execution.ErrAuthFailed
-	}
 	// Inspect the venue body for codes that classify the error more precisely.
 	code, msg := nobitexErrorCode(body)
 	if code != "" {
 		e.Code = code
 	}
 	switch {
+	case status == http.StatusTooManyRequests:
+		e.Err = execution.ErrRateLimited
+		e.Category = CatRateLimit
+		// PR20 #3/#6: attach the structured throttle metadata. The wait comes from the
+		// documented backOff body field (seconds). DefiniteRejection only when the body
+		// carries Nobitex's documented TooManyRequests envelope — a bare 429 (e.g. from an
+		// intermediary) proves nothing about execution.
+		e.RateLimit = &RateLimitInfo{
+			RetryAfter:        parseNobitexBackoff(body),
+			Source:            RLSourceStatus,
+			Code:              code,
+			DefiniteRejection: nobitexIsRateLimit(code),
+		}
+		if e.RateLimit.RetryAfter > 0 {
+			e.RateLimit.Source = RLSourceBody
+		}
+		return e
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		e.Err = execution.ErrAuthFailed
+	}
+	switch {
+	case nobitexIsRateLimit(code):
+		// A throttle envelope on some other non-2xx status: still a documented rejection.
+		e.Category = CatRateLimit
+		e.Err = execution.ErrRateLimited
+		e.Retryable = true
+		e.RateLimit = &RateLimitInfo{RetryAfter: parseNobitexBackoff(body), Source: RLSourceCode, Code: code, DefiniteRejection: true}
 	case nobitexIndicatesOrderUnknown(code, msg):
 		e.Category = CatNotFound
 		e.Err = execution.ErrOrderUnknown
@@ -778,16 +902,26 @@ func nobitexHTTPError(op string, status int, body []byte) error {
 
 // nobitexBusinessError builds a *NormalizedAPIError for a 2xx response whose
 // envelope reports a non-"ok" status (Nobitex returns 200 with {"status":"failed",
-// "code":"..."} for many business errors).
+// "code":"..."} for many business errors). PR20 correction: an HTTP-200 body carrying
+// the documented TooManyRequests throttle code IS a rate limit — it must never be
+// mis-classified CatBadRequest (which would fail the cycle) nor treated as success.
 func nobitexBusinessError(op, status, code string, body []byte) error {
 	e := &NormalizedAPIError{
-		Exchange: nobitexCode,
-		Op:       op,
-		Code:     code,
-		Category: CatBadRequest,
-		Message:  MaskBody(string(body)),
+		Exchange:   nobitexCode,
+		Op:         op,
+		StatusCode: http.StatusOK,
+		Code:       code,
+		Category:   CatBadRequest,
+		Message:    MaskBody(string(body)),
 	}
 	switch {
+	case nobitexIsRateLimit(code):
+		e.Category = CatRateLimit
+		e.Err = execution.ErrRateLimited
+		e.Retryable = true
+		// status:"failed" is Nobitex's documented not-performed contract → definite
+		// pre-execution rejection, safe to re-queue after the cooldown.
+		e.RateLimit = &RateLimitInfo{RetryAfter: parseNobitexBackoff(body), Source: RLSourceCode, Code: code, DefiniteRejection: true}
 	case nobitexIndicatesOrderUnknown(code, ""):
 		e.Category = CatNotFound
 		e.Err = execution.ErrOrderUnknown

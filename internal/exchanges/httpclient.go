@@ -42,7 +42,7 @@ func BuildHTTPClient(cfg ClientConfig, logger *IOLogger) (*http.Client, error) {
 		if base == nil {
 			base = http.DefaultTransport
 		}
-		client.Transport = NewLoggingTransport(base, cfg.Code, logger)
+		client.Transport = newRateLimitObserver(NewLoggingTransport(base, cfg.Code, logger), cfg.Code, cfg.RateLimitSink)
 		return &client, nil
 	}
 
@@ -85,8 +85,39 @@ func BuildHTTPClient(cfg ClientConfig, logger *IOLogger) (*http.Client, error) {
 	}
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: NewLoggingTransport(transport, cfg.Code, logger),
+		Transport: newRateLimitObserver(NewLoggingTransport(transport, cfg.Code, logger), cfg.Code, cfg.RateLimitSink),
 	}, nil
+}
+
+// rateLimitObserver reports throttle headers carried by SUCCESSFUL responses to the sink
+// (PR20 correction #6). It is READ-ONLY with respect to the response: it never alters the
+// status, body, or error, so a successful mutation stays successful even when the venue says
+// the quota is now exhausted — only FUTURE requests are paused, by the sink parking the
+// exchange. Wrapping the transport means every adapter and every operation is covered by one
+// implementation. Venue-SPECIFIC body contracts stay in the adapters (they decide success vs
+// ambiguity and are the only place DefiniteRejection can be established).
+type rateLimitObserver struct {
+	base http.RoundTripper
+	code string
+	sink RateLimitSink
+}
+
+func newRateLimitObserver(base http.RoundTripper, code string, sink RateLimitSink) http.RoundTripper {
+	if sink == nil {
+		return base
+	}
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &rateLimitObserver{base: base, code: code, sink: sink}
+}
+
+func (t *rateLimitObserver) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err == nil {
+		observeSuccessHeaders(t.sink, t.code, resp)
+	}
+	return resp, err
 }
 
 // RequestContext returns a child context bounded by cfg.RequestTimeout (default

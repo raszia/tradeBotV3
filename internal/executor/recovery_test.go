@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -420,11 +421,16 @@ func TestRecoveredMismatchNotAttached(t *testing.T) {
 // after the exchange accepted the send but before the response was handled.
 func (it *intg) crashDuringPlace(t *testing.T, sc simexec.Scenario, cyc, ord, placeReq int64) {
 	t.Helper()
-	var loc string
+	var loc, symbol string
 	it.db.QueryRow("SELECT local_client_order_id FROM orders WHERE id=?", ord).Scan(&loc)
+	// The simulated crashed order MUST carry the cycle's real canonical symbol: recovery
+	// verifies the venue-reported symbol against the request's before attaching an order to a
+	// cycle (recoveredMatches). A placeholder here would make the probe correctly REFUSE the
+	// order and mask what this test is asserting.
+	it.db.QueryRow("SELECT canonical_symbol FROM cycles WHERE id=?", cyc).Scan(&symbol)
 	it.db.Exec("UPDATE orders SET client_order_id_sent=? WHERE id=?", loc, ord)
 	sim := simexec.New(it.db, it.code, sc)
-	if _, err := sim.PlaceOrder(it.ctx, execution.OrderRequest{ClientOrderID: loc, Symbol: "X/IRT", Side: "buy",
+	if _, err := sim.PlaceOrder(it.ctx, execution.OrderRequest{ClientOrderID: loc, Symbol: symbol, Side: "buy",
 		Quantity: decimal.RequireFromString("0.5"), LimitPrice: decimal.RequireFromString("100"), OrderType: "limit"}); err != nil && !errors.Is(err, execution.ErrAckTimeout) {
 		t.Fatalf("sim place: %v", err)
 	}
@@ -555,7 +561,9 @@ func (it *intg) transientCancelSetup(t *testing.T, rec RecoveryConfig, perEx map
 	cyc, ord, _ := it.seedBuyCycle(t, "0.5")
 	it.fake.placeAck = execution.OrderAck{ExchangeOrderID: "EXT-1", Status: execution.StateOpen}
 	it.fake.cancelErr = execution.ErrAckTimeout // ambiguous cancel -> recovery probe scheduled
-	it.fake.getErr = execution.ErrRateLimited   // every probe lookup fails TRANSIENTLY
+	// The transient error is deliberately NON-rate-limit (a rate limit would additionally
+	// PARK the exchange for the fallback cooldown — PR20 #4 — and stall the drive loop).
+	it.fake.getErr = context.DeadlineExceeded // every probe lookup fails TRANSIENTLY
 	return cyc, ord
 }
 

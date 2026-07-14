@@ -92,7 +92,7 @@ func TestStopSessionBlocksBuysAllowsSellCancel(t *testing.T) {
 	if d := f.g.CheckPlace(f.ctx, f.sell()); !d.Allow {
 		t.Errorf("sell must remain allowed after stop: %s", d.Reason)
 	}
-	if d := f.g.CheckCancel(f.ctx, PlaceCheck{ExchangeID: f.ex}); !d.Allow {
+	if d := f.g.CheckCancel(f.ctx, f.cancelOf()); !d.Allow {
 		t.Errorf("cancel must remain allowed after stop: %s", d.Reason)
 	}
 	// The stop is audited on the session row.

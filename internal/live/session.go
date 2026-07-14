@@ -172,15 +172,19 @@ func (g *Guard) RecordFirstOrderChecklist(ctx context.Context, p PlaceCheck) {
 	g.db.QueryRowContext(ctx,
 		"SELECT status FROM exchange_credentials WHERE exchange_id=? AND enabled=1 ORDER BY key_version DESC, id DESC LIMIT 1", p.ExchangeID).Scan(&credStatus)
 
+	// Daily order/quote caps were removed (owner decision) — only the open-cycle headroom
+	// remains in the snapshot. A count error records -1 (unknown) rather than lying with 0.
+	openHeadroom := -1
+	if open, err := g.openCycles(ctx); err == nil {
+		openHeadroom = ctrl.MaxOpenCycles - open
+	}
 	checklist := map[string]any{
 		"mode":          "live",
 		"exchange_id":   p.ExchangeID,
 		"exchange_code": p.ExchangeCode,
 		"symbol":        p.Symbol,
 		"caps_remaining": map[string]any{
-			"daily_orders": ctrl.MaxDailyOrders - g.dailyOrders(ctx),
-			"daily_quote":  ctrl.MaxDailyQuote.Sub(g.dailyQuote(ctx)).String(),
-			"open_cycles":  ctrl.MaxOpenCycles - g.openCycles(ctx),
+			"open_cycles": openHeadroom,
 		},
 		"credential_status":      credStatus,
 		"acknowledgement_id":     sess.AckID.Int64,
@@ -199,17 +203,16 @@ func (g *Guard) RecordFirstOrderChecklist(ctx context.Context, p PlaceCheck) {
 	}
 }
 
-// capsSnapshot returns a JSON snapshot of the current caps (no secrets).
+// capsSnapshot returns a JSON snapshot of the current caps (no secrets). Daily caps were
+// removed from live decisions (owner decision) and are not snapshotted.
 func capsSnapshot(ctx context.Context, db *sql.DB) []byte {
-	var maxOpen, maxDaily sql.NullInt64
-	var maxQuote, maxNotional, maxBase sql.NullString
+	var maxOpen sql.NullInt64
+	var maxNotional, maxBase sql.NullString
 	_ = db.QueryRowContext(ctx,
-		"SELECT max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty FROM live_controls WHERE id=1").
-		Scan(&maxOpen, &maxDaily, &maxQuote, &maxNotional, &maxBase)
+		"SELECT max_open_cycles, max_order_notional, max_base_qty FROM live_controls WHERE id=1").
+		Scan(&maxOpen, &maxNotional, &maxBase)
 	b, _ := json.Marshal(map[string]any{
 		"max_open_cycles":    maxOpen.Int64,
-		"max_daily_orders":   maxDaily.Int64,
-		"max_daily_quote":    maxQuote.String,
 		"max_order_notional": maxNotional.String,
 		"max_base_qty":       maxBase.String,
 	})

@@ -274,7 +274,31 @@ var bitpinAuthThrottleRe = regexp.MustCompile(`available in (\d+) second`)
 // needed. Faithful port of iranArb's bitpin token flow: cache for bitpinTokenTTL,
 // prefer the cached token while a 429 backoff is active, refresh via
 // /usr/refresh_token/ when a refresh token is held, else /usr/authenticate/.
-func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
+// bitpinAuthRateLimited is the ErrNotSent-wrapped rate-limit an auth interaction reports for a
+// MUTATION (strict), so the order endpoint is never called in the same invocation and the
+// executor arms the cooldown (PR20 correction #3).
+func (b *bitpinPrivate) bitpinAuthRateLimited(msg string, retryAfter time.Duration, source string) error {
+	if source == "" {
+		source = RLSourceStatus
+	}
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
+	return execution.NotSent(&NormalizedAPIError{
+		Exchange: bitpinCode, Op: "auth", StatusCode: http.StatusTooManyRequests,
+		Category: CatRateLimit, Retryable: true, Message: msg, Err: execution.ErrRateLimited,
+		// Carry the REAL venue throttle deadline (round 9 #4) so the executor schedules the queue
+		// retry at the actual cooldown, not a short configured fallback that would burn the retry
+		// budget before the throttle window expires. An auth throttle proves the order was NOT sent.
+		RateLimit: &RateLimitInfo{RetryAfter: retryAfter, Source: source, Code: "auth_throttled", DefiniteRejection: true},
+	})
+}
+
+// bearerToken returns a valid JWT. `strict` (used for MUTATIONS) means: any auth rate limit —
+// an active throttle window, a fresh 429, or an auth 200 with X-RateLimit-Remaining:0 — is a
+// definitely-not-sent rate limit, NOT a licence to send the order with a cached token. Lenient
+// (reads) prefers a cached token during a throttle window.
+func (b *bitpinPrivate) bearerToken(ctx context.Context, strict bool) (string, error) {
 	b.tokenMu.Lock()
 	// Fast path: still-fresh cached token.
 	if b.accessToken != "" && time.Since(b.tokenAt) < bitpinTokenTTL {
@@ -286,14 +310,20 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 	// auth endpoint: prefer the (slightly-stale, ~1m grace) cached token over an
 	// auth attempt we know would 429 again.
 	inBackoff := !b.authThrottledUntil.IsZero() && time.Now().Before(b.authThrottledUntil)
-	if inBackoff && b.accessToken != "" {
-		tok := b.accessToken
-		b.tokenMu.Unlock()
-		return tok, nil
-	}
 	if inBackoff {
 		wait := time.Until(b.authThrottledUntil)
+		hasCache := b.accessToken != ""
+		tok := b.accessToken
 		b.tokenMu.Unlock()
+		if strict {
+			// A MUTATION must NOT be sent while auth is throttled, even with a cached token. Carry
+			// the REMAINING throttle window (round 9 #4) so the executor waits the real deadline and
+			// does not re-attempt (and burn a retry) before it expires.
+			return "", b.bitpinAuthRateLimited(fmt.Sprintf("auth throttled, retry after %s", wait.Round(time.Second)), wait, RLSourceStatus)
+		}
+		if hasCache {
+			return tok, nil // reads may proceed with the cached token
+		}
 		return "", b.authError(fmt.Sprintf("auth throttled, retry after %s", wait), http.StatusTooManyRequests)
 	}
 	refresh := b.refreshToken
@@ -301,7 +331,8 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 
 	creds, err := b.cfg.Creds.Credentials(ctx, bitpinCode)
 	if err != nil {
-		return "", err
+		// PR20 correction #3: pre-network credential failure — definitely not sent, transient.
+		return "", execution.NotSent(err)
 	}
 	if creds.APIKey == "" || creds.APISecret == "" {
 		return "", b.authError("missing api credentials", http.StatusUnauthorized)
@@ -312,6 +343,15 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 	if refresh != "" {
 		path = "/api/v1/usr/refresh_token/"
 		body, _ = json.Marshal(map[string]string{"refresh": refresh})
+	}
+
+	// Round 8 #3: reserve a pacing slot for the auth/refresh HTTP call — but ONLY here, at the
+	// point we are actually about to hit the network. The still-fresh-cached-token and
+	// throttle-backoff fast paths above returned WITHOUT a network call and therefore consumed no
+	// slot, so pacing reservations equal actual HTTP calls. A cancellation while waiting for the
+	// slot is definitely-not-sent (the auth request was never built or sent).
+	if perr := paceNetwork(ctx); perr != nil {
+		return "", execution.NotSent(perr)
 	}
 
 	reqCtx, cancel := RequestContext(ctx, b.cfg)
@@ -331,16 +371,26 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 	if resp.StatusCode == http.StatusTooManyRequests {
 		// Arm the throttle window so subsequent callers reuse the cached token
 		// rather than re-hitting auth. Prefer Retry-After, then the body hint.
-		wait := parseBitpinAuthThrottle(resp.Header.Get("Retry-After"), raw)
+		header := resp.Header.Get("Retry-After")
+		wait := parseBitpinAuthThrottle(header, raw)
+		src := RLSourceHeader
 		if wait <= 0 {
 			wait = bitpinDefaultThrottle
+			src = "fallback"
+		} else if ParseRetryAfter(header, time.Now()) <= 0 {
+			src = RLSourceBody // the header did not yield it, so the body did
 		}
 		b.tokenMu.Lock()
 		b.authThrottledUntil = time.Now().Add(wait)
 		tok := b.accessToken
 		b.tokenMu.Unlock()
+		if strict {
+			// Auth is rate-limited → do NOT send the order this invocation (PR20 correction #3).
+			// Carry the REAL parsed wait (round 9 #4) so the retry waits the venue deadline.
+			return "", b.bitpinAuthRateLimited("auth endpoint rate-limited", wait, src)
+		}
 		if tok != "" {
-			return tok, nil
+			return tok, nil // reads may reuse the cached token
 		}
 		return "", b.apiError(path, resp.StatusCode, raw)
 	}
@@ -367,6 +417,27 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 	b.authThrottledUntil = time.Time{}
 	b.tokenMu.Unlock()
 
+	// Auth succeeded, but if it reports the quota is now exhausted, future Bitpin calls must
+	// pause. For a MUTATION the order is the NEXT network call, so it must not be sent this
+	// invocation — fail strict as a definitely-not-sent rate limit (PR20 correction #3). The
+	// token is cached, so the retry after the cooldown can reuse it.
+	if strict {
+		if reset, src, ok := RetryAfterFromHeaders(resp.Header, time.Now()); ok {
+			// Derive the real reset deadline (round 9 #4); fall back to the default only when the
+			// venue gave a remaining=0 signal with no parseable reset.
+			wait := reset
+			if wait <= 0 {
+				wait = bitpinDefaultThrottle
+				src = "fallback"
+			}
+			b.tokenMu.Lock()
+			if b.authThrottledUntil.Before(time.Now().Add(wait)) {
+				b.authThrottledUntil = time.Now().Add(wait)
+			}
+			b.tokenMu.Unlock()
+			return "", b.bitpinAuthRateLimited("auth succeeded but quota exhausted (X-RateLimit-Remaining: 0)", wait, src)
+		}
+	}
 	return payload.Access, nil
 }
 
@@ -374,25 +445,43 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context) (string, error) {
 // the JSON body (if any), and returns the raw response, decoding into out when
 // provided. Non-2xx becomes a *NormalizedAPIError.
 func (b *bitpinPrivate) doJSON(ctx context.Context, op, method, path string, in, out any) ([]byte, error) {
-	tok, err := b.bearerToken(ctx)
+	// bearerToken does ALL pre-order work — it may call the auth/refresh endpoint but NEVER the
+	// order endpoint. Any failure here is definitely-not-sent (wrapped ErrNotSent). Lenient token
+	// for reads; mutations use PreparePlace/PrepareCancel with the STRICT token.
+	tok, err := b.bearerToken(ctx, false)
 	if err != nil {
+		if !execution.IsNotSent(err) {
+			err = execution.NotSent(err)
+		}
 		return nil, err
 	}
-	var body io.Reader
+	var body []byte
 	if in != nil {
-		buf, err := json.Marshal(in)
-		if err != nil {
-			return nil, err
+		buf, jerr := json.Marshal(in)
+		if jerr != nil {
+			return nil, execution.NotSentPermanent(jerr)
 		}
-		body = bytes.NewReader(buf)
+		body = buf
+	}
+	return b.sendAuthed(ctx, op, method, path, tok, body, out)
+}
+
+// sendAuthed performs an authenticated Bitpin HTTP call with an ALREADY-acquired token, for the
+// READ path only (doJSON). Mutations do NOT go through this: they pre-build their immutable
+// request during preparation and send it via bitpinPrepared.Send (PR20 correction round 8 #2), so
+// no request construction happens at their send boundary.
+func (b *bitpinPrivate) sendAuthed(ctx context.Context, op, method, path, token string, body []byte, out any) ([]byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
 	}
 	reqCtx, cancel := RequestContext(ctx, b.cfg)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, method, b.restURL+path, body)
+	req, err := http.NewRequestWithContext(reqCtx, method, b.restURL+path, rdr)
 	if err != nil {
-		return nil, err
+		return nil, execution.NotSentPermanent(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := b.http.Do(req)
 	if err != nil {
@@ -401,7 +490,7 @@ func (b *bitpinPrivate) doJSON(ctx context.Context, op, method, path string, in,
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return raw, b.apiError(op, resp.StatusCode, raw)
+		return raw, bitpinAPIErrorH(op, resp.StatusCode, resp.Header, raw)
 	}
 	if out != nil && len(raw) > 0 {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -409,6 +498,121 @@ func (b *bitpinPrivate) doJSON(ctx context.Context, op, method, path string, in,
 		}
 	}
 	return raw, nil
+}
+
+// buildAuthedRequest constructs the FINAL immutable authenticated request for a Bitpin mutation
+// with an already-acquired token. This is the last fallible pre-network step, and it runs during
+// preparation — BEFORE the executor commits MarkInFlight (PR20 correction round 8 #2). The request
+// carries a placeholder context; Send binds the real send context via doPreparedRequest.
+func (b *bitpinPrivate) buildAuthedRequest(method, path, token string, body []byte) (*http.Request, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, b.restURL+path, rdr)
+	if err != nil {
+		return nil, execution.NotSentPermanent(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
+}
+
+// bitpinPrepared is a fully-prepared order/cancel whose FINAL http.Request is already built (token
+// acquired, body attached, headers set). Send performs ONLY the send-boundary work: bind the send
+// context and perform the single order/cancel HTTP call. No token, credential, symbol, payload, or
+// request construction happens here (PR20 correction round 8 #2) — the type deliberately holds no
+// material from which a request could be rebuilt.
+type bitpinPrepared struct {
+	b      *bitpinPrivate
+	op     string
+	req    *http.Request
+	decode func(raw []byte) (execution.OrderAck, error)
+}
+
+func (p *bitpinPrepared) Send(ctx context.Context) (execution.OrderAck, error) {
+	status, hdr, raw, err := doPreparedRequest(ctx, p.b.http, p.req)
+	if err != nil {
+		return execution.OrderAck{}, fmt.Errorf("bitpin %s %s: %w", p.req.Method, p.req.URL.Path, err)
+	}
+	if status < 200 || status >= 300 {
+		return execution.OrderAck{}, bitpinAPIErrorH(p.op, status, hdr, raw)
+	}
+	if p.decode == nil {
+		return execution.OrderAck{}, nil
+	}
+	return p.decode(raw)
+}
+
+// PreparePlace does all pre-send work for a place — symbol validation, payload construction, and
+// (the network) token acquisition — returning a prepared order whose Send is the only remaining
+// network call. A rate limit during auth fails here as a definitely-not-sent rate limit, so the
+// order endpoint is never reached (PR20 correction #2/#3).
+func (b *bitpinPrivate) PreparePlace(ctx context.Context, req execution.OrderRequest) (PreparedMutation, error) {
+	venueSym := bitpinNativeSymbol(req.Symbol)
+	if v, ok := VenueSymbol(b.cfg, req.Symbol); ok {
+		venueSym = bitpinNativeSymbol(v)
+	}
+	if strings.TrimSpace(venueSym) == "" {
+		return nil, execution.NotSentPermanent(fmt.Errorf("bitpin: invalid symbol %q", req.Symbol))
+	}
+	orderType := strings.ToLower(strings.TrimSpace(req.OrderType))
+	if orderType == "" {
+		orderType = "limit"
+	}
+	payload := bitpinPlaceOrderRequest{
+		Symbol: venueSym, Type: orderType, Side: strings.ToLower(req.Side),
+		BaseAmount: req.Quantity.String(), Identifier: req.ClientOrderID,
+	}
+	if req.LimitPrice.IsPositive() {
+		payload.Price = req.LimitPrice.String()
+	}
+	if tif := strings.TrimSpace(req.TimeInForce); tif != "" {
+		payload.TimeInForce = tif
+	}
+	body, jerr := json.Marshal(payload)
+	if jerr != nil {
+		return nil, execution.NotSentPermanent(jerr)
+	}
+	tok, err := b.bearerToken(ctx, true) // STRICT: auth rate limit → definitely-not-sent, no order call
+	if err != nil {
+		if !execution.IsNotSent(err) {
+			err = execution.NotSent(err)
+		}
+		return nil, err
+	}
+	// Build the FINAL order request NOW (round 8 #2) — fallible construction before MarkInFlight.
+	httpReq, rerr := b.buildAuthedRequest(http.MethodPost, "/api/v1/odr/orders/", tok, body)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return &bitpinPrepared{b: b, op: "place", req: httpReq,
+		decode: func(raw []byte) (execution.OrderAck, error) { return b.decodePlaceAck(raw, req) }}, nil
+}
+
+// PrepareCancel does all pre-send work for a cancel (token acquisition) and returns a prepared
+// cancel whose Send is the only remaining network call (PR20 correction #2/#3).
+func (b *bitpinPrivate) PrepareCancel(ctx context.Context, exchangeOrderID string) (PreparedMutation, error) {
+	if exchangeOrderID == "" {
+		return nil, execution.NotSentPermanent(fmt.Errorf("bitpin CancelOrder: empty order id"))
+	}
+	path := "/api/v1/odr/orders/" + url.PathEscape(exchangeOrderID) + "/"
+	if !bitpinIsDecimalString(exchangeOrderID) {
+		path = "/api/v1/odr/orders/identifier/" + url.PathEscape(exchangeOrderID) + "/"
+	}
+	tok, err := b.bearerToken(ctx, true)
+	if err != nil {
+		if !execution.IsNotSent(err) {
+			err = execution.NotSent(err)
+		}
+		return nil, err
+	}
+	// Build the FINAL cancel request NOW (round 8 #2) — fallible construction before MarkInFlight.
+	httpReq, rerr := b.buildAuthedRequest(http.MethodDelete, path, tok, nil)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return &bitpinPrepared{b: b, op: "cancel", req: httpReq}, nil
 }
 
 // --- GetBalances ---
@@ -487,36 +691,22 @@ type bitpinPlaceOrderRequest struct {
 	TimeInForce string `json:"time_in_force,omitempty"`
 }
 
+// PlaceOrder = PreparePlace(...).Send(...). The executor uses the two-stage MutationPreparer
+// directly so the token/auth work happens before MarkInFlight; PlaceOrder keeps the one-call
+// contract for any non-executor caller (PR20 correction #2).
 func (b *bitpinPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
-	venueSym := bitpinNativeSymbol(req.Symbol)
-	if v, ok := VenueSymbol(b.cfg, req.Symbol); ok {
-		venueSym = bitpinNativeSymbol(v)
-	}
-	// Order type passes straight through (owner-defined). Default to limit only
-	// when the caller left it empty; never force IOC/market/post-only.
-	orderType := strings.ToLower(strings.TrimSpace(req.OrderType))
-	if orderType == "" {
-		orderType = "limit"
-	}
-	payload := bitpinPlaceOrderRequest{
-		Symbol:     venueSym,
-		Type:       orderType,
-		Side:       strings.ToLower(req.Side),
-		BaseAmount: req.Quantity.String(),
-		Identifier: req.ClientOrderID, // Bitpin "identifier" = our client order id
-	}
-	if req.LimitPrice.IsPositive() {
-		payload.Price = req.LimitPrice.String()
-	}
-	// Time-in-force is owner-set; pass it through only when supplied.
-	if tif := strings.TrimSpace(req.TimeInForce); tif != "" {
-		payload.TimeInForce = tif
-	}
-
-	var order bitpinOrder
-	raw, err := b.doJSON(ctx, "place", http.MethodPost, "/api/v1/odr/orders/", payload, &order)
+	prepared, err := b.PreparePlace(ctx, req)
 	if err != nil {
 		return execution.OrderAck{}, err
+	}
+	return prepared.Send(ctx)
+}
+
+// decodePlaceAck parses a Bitpin place response into an OrderAck.
+func (b *bitpinPrivate) decodePlaceAck(raw []byte, req execution.OrderRequest) (execution.OrderAck, error) {
+	var order bitpinOrder
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &order)
 	}
 	// Some responses wrap the order under {"order": {...}}.
 	if len(order.ID) == 0 && order.Identifier == "" {
@@ -565,14 +755,11 @@ func (b *bitpinPrivate) PlaceOrder(ctx context.Context, req execution.OrderReque
 // CancelOrder accepts EITHER a numeric exchange order id OR an identifier string
 // (the ClientOrderID passed at placement); the two use different URL forms.
 func (b *bitpinPrivate) CancelOrder(ctx context.Context, exchangeOrderID string) error {
-	if exchangeOrderID == "" {
-		return fmt.Errorf("bitpin CancelOrder: empty order id")
+	prepared, err := b.PrepareCancel(ctx, exchangeOrderID)
+	if err != nil {
+		return err
 	}
-	path := "/api/v1/odr/orders/" + url.PathEscape(exchangeOrderID) + "/"
-	if !bitpinIsDecimalString(exchangeOrderID) {
-		path = "/api/v1/odr/orders/identifier/" + url.PathEscape(exchangeOrderID) + "/"
-	}
-	_, err := b.doJSON(ctx, "cancel", http.MethodDelete, path, nil, nil)
+	_, err = prepared.Send(ctx)
 	return err
 }
 
@@ -849,7 +1036,15 @@ func (b *bitpinPrivate) authError(msg string, status int) error {
 }
 
 func bitpinAPIError(op string, status int, body []byte) error {
-	return &NormalizedAPIError{
+	return bitpinAPIErrorH(op, status, nil, body)
+}
+
+// bitpinAPIErrorH is bitpinAPIError with the response headers, so throttle metadata
+// (Retry-After, DRF "available in N seconds" body) is preserved (PR20 #3/#6). Bitpin has
+// no iranArb-verified pre-execution rejection contract for order-path 429s, so
+// DefiniteRejection stays FALSE — a rate-limited mutation is AMBIGUOUS.
+func bitpinAPIErrorH(op string, status int, hdr http.Header, body []byte) error {
+	e := &NormalizedAPIError{
 		Exchange:   bitpinCode,
 		Op:         op,
 		StatusCode: status,
@@ -858,6 +1053,22 @@ func bitpinAPIError(op string, status int, body []byte) error {
 		Message:    MaskBody(string(body)),
 		Err:        bitpinSentinelFor(status),
 	}
+	if status == http.StatusTooManyRequests {
+		retryAfter := ""
+		if hdr != nil {
+			retryAfter = hdr.Get("Retry-After")
+		}
+		wait := parseBitpinAuthThrottle(retryAfter, body) // proven parser: header seconds, then body regex
+		src := RLSourceStatus
+		if wait > 0 {
+			src = RLSourceHeader
+			if retryAfter == "" {
+				src = RLSourceBody
+			}
+		}
+		e.RateLimit = &RateLimitInfo{RetryAfter: wait, Source: src}
+	}
+	return e
 }
 
 // bitpinSentinelFor maps an HTTP status to an execution sentinel for errors.Is.

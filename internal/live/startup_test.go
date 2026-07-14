@@ -62,7 +62,7 @@ func TestEmergencyStopMatrix(t *testing.T) {
 	if d := f.g.CheckPlace(f.ctx, f.sell()); !d.Allow {
 		t.Errorf("emergency stop must keep sell management available (filled-but-unsold exit): %s", d.Reason)
 	}
-	if d := f.g.CheckCancel(f.ctx, PlaceCheck{ExchangeID: f.ex}); !d.Allow {
+	if d := f.g.CheckCancel(f.ctx, f.cancelOf()); !d.Allow {
 		t.Errorf("emergency stop must keep cancel/status available: %s", d.Reason)
 	}
 

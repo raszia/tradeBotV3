@@ -330,7 +330,7 @@ func (w *wallexPublic) get(ctx context.Context, op, path string) ([]byte, error)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, wallexHTTPError(op, resp.StatusCode, body)
+		return nil, wallexHTTPError(op, resp.StatusCode, resp.Header, body)
 	}
 	return body, nil
 }
@@ -368,7 +368,8 @@ func (w *wallexPrivate) apiKey(ctx context.Context) (string, error) {
 	}
 	creds, err := w.cfg.Creds.Credentials(ctx, wallexCode)
 	if err != nil {
-		return "", fmt.Errorf("wallex credentials: %w", err)
+		// PR20 correction #3: pre-network credential failure — definitely not sent, transient.
+		return "", execution.NotSent(fmt.Errorf("wallex credentials: %w", err))
 	}
 	if creds.APIKey == "" {
 		return "", &NormalizedAPIError{
@@ -412,9 +413,38 @@ func (w *wallexPrivate) doPrivate(ctx context.Context, op, method, path string, 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return raw, wallexHTTPError(op, resp.StatusCode, raw)
+		return raw, wallexHTTPError(op, resp.StatusCode, resp.Header, raw)
 	}
 	return raw, nil
+}
+
+// buildPrivate constructs the authenticated request for a Wallex mutation. ALL pre-network work —
+// credential load, JSON body marshalling, and http.Request construction — happens here so the
+// two-stage preparer builds it BEFORE the executor commits MarkInFlight (PR20 correction round 8
+// #1). Wallex authenticates with an in-memory X-API-Key header, so preparation makes NO network
+// call. The request carries a placeholder context; Send binds the real send context.
+func (w *wallexPrivate) buildPrivate(ctx context.Context, method, path string, body any) (*http.Request, error) {
+	key, err := w.apiKey(ctx)
+	if err != nil {
+		return nil, err // NotSent (transient) or auth error — definitely pre-network
+	}
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, execution.NotSentPermanent(err)
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, w.restURL+path, reader)
+	if err != nil {
+		return nil, execution.NotSentPermanent(err)
+	}
+	req.Header.Set("X-API-Key", key) // Wallex auth header (masked in logs)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
 }
 
 // --- GetBalances ---
@@ -512,9 +542,17 @@ type wallexOrder struct {
 	UpdatedAt     string          `json:"updated_at"`
 }
 
-func (w *wallexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
+// PreparePlace implements exchanges.MutationPreparer: it does ALL pre-network work (symbol
+// resolution, body construction, credential load, http.Request construction) and returns a
+// prepared mutation whose only remaining step is the order HTTP call. Wallex authenticates with an
+// in-memory X-API-Key header, so preparation makes no network call (PR20 correction round 8 #1).
+func (w *wallexPrivate) PreparePlace(ctx context.Context, req execution.OrderRequest) (PreparedMutation, error) {
 	native := wallexNativeSymbol(w.venueSymbol(req.Symbol))
-
+	if strings.TrimSpace(native) == "" {
+		// An unresolved symbol is a permanent LOCAL failure — reject before building/sending any
+		// HTTP request (definitely not sent).
+		return nil, execution.NotSentPermanent(fmt.Errorf("wallex: invalid symbol %q", req.Symbol))
+	}
 	// Order type / time-in-force come straight from the request — this layer
 	// imposes NO strategy (no forced IOC/market/post-only). Default to LIMIT
 	// only when the caller left OrderType empty, mirroring the source's LIMIT
@@ -534,22 +572,46 @@ func (w *wallexPrivate) PlaceOrder(ctx context.Context, req execution.OrderReque
 	if req.LimitPrice.IsPositive() {
 		body.Price = req.LimitPrice.String()
 	}
-
-	raw, err := w.doPrivate(ctx, "PlaceOrder", http.MethodPost, "/v1/account/orders", body)
+	httpReq, err := w.buildPrivate(ctx, http.MethodPost, "/v1/account/orders", body)
 	if err != nil {
-		return execution.OrderAck{}, err
+		return nil, err
+	}
+	return &wallexPreparedPlace{w: w, req: httpReq, symbol: req.Symbol, side: req.Side, clientID: req.ClientOrderID}, nil
+}
+
+type wallexPreparedPlace struct {
+	w        *wallexPrivate
+	req      *http.Request
+	symbol   string
+	side     string
+	clientID string
+}
+
+func (p *wallexPreparedPlace) Send(ctx context.Context) (execution.OrderAck, error) {
+	status, hdr, raw, err := doPreparedRequest(ctx, p.w.http, p.req)
+	if err != nil {
+		return execution.OrderAck{}, fmt.Errorf("wallex POST /v1/account/orders: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return execution.OrderAck{}, wallexHTTPError("PlaceOrder", status, hdr, raw)
 	}
 	var payload wallexOrderResponse
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return execution.OrderAck{}, fmt.Errorf("wallex place order decode: %w", err)
 	}
 	if !payload.Success {
-		return execution.OrderAck{}, &NormalizedAPIError{
-			Exchange: wallexCode, Op: "PlaceOrder", StatusCode: http.StatusOK,
-			Category: CatBadRequest, Message: MaskBody(payload.errorMessage()),
-		}
+		return execution.OrderAck{}, wallexBusinessError("PlaceOrder", payload.errorMessage())
 	}
-	return wallexOrderToAck(payload.Result, req.Symbol, req.Side, req.ClientOrderID), nil
+	return wallexOrderToAck(payload.Result, p.symbol, p.side, p.clientID), nil
+}
+
+// PlaceOrder is the single-call convenience wrapper over the two-stage boundary.
+func (w *wallexPrivate) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
+	prepared, err := w.PreparePlace(ctx, req)
+	if err != nil {
+		return execution.OrderAck{}, err
+	}
+	return prepared.Send(ctx)
 }
 
 // venueSymbol resolves the venue-native symbol for a canonical symbol via
@@ -585,31 +647,55 @@ func (r wallexSimpleResponse) errorMessage() string {
 	return "unknown wallex error"
 }
 
-func (w *wallexPrivate) CancelOrder(ctx context.Context, exchangeOrderID string) error {
-	// exchangeOrderID is the CLIENT order id for Wallex (see file header).
+// PrepareCancel implements exchanges.MutationPreparer for cancels (round 8 #1). exchangeOrderID is
+// the CLIENT order id for Wallex (see file header).
+func (w *wallexPrivate) PrepareCancel(ctx context.Context, exchangeOrderID string) (PreparedMutation, error) {
 	clientOrderID := exchangeOrderID
 	if clientOrderID == "" {
-		return &NormalizedAPIError{
+		return nil, execution.NotSentPermanent(&NormalizedAPIError{
 			Exchange: wallexCode, Op: "CancelOrder", Category: CatBadRequest,
 			Message: "wallex cancel requires a client order id", Err: execution.ErrOrderUnknown,
-		}
+		})
 	}
 	path := "/v1/account/orders?clientOrderId=" + url.QueryEscape(clientOrderID)
-	raw, err := w.doPrivate(ctx, "CancelOrder", http.MethodDelete, path, nil)
+	httpReq, err := w.buildPrivate(ctx, http.MethodDelete, path, nil)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return &wallexPreparedCancel{w: w, req: httpReq}, nil
+}
+
+type wallexPreparedCancel struct {
+	w   *wallexPrivate
+	req *http.Request
+}
+
+func (p *wallexPreparedCancel) Send(ctx context.Context) (execution.OrderAck, error) {
+	status, hdr, raw, err := doPreparedRequest(ctx, p.w.http, p.req)
+	if err != nil {
+		return execution.OrderAck{}, fmt.Errorf("wallex DELETE /v1/account/orders: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return execution.OrderAck{}, wallexHTTPError("CancelOrder", status, hdr, raw)
 	}
 	var payload wallexSimpleResponse
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return fmt.Errorf("wallex cancel decode: %w", err)
+		return execution.OrderAck{}, fmt.Errorf("wallex cancel decode: %w", err)
 	}
 	if !payload.Success {
-		return &NormalizedAPIError{
-			Exchange: wallexCode, Op: "CancelOrder", StatusCode: http.StatusOK,
-			Category: CatBadRequest, Message: MaskBody(payload.errorMessage()),
-		}
+		return execution.OrderAck{}, wallexBusinessError("CancelOrder", payload.errorMessage())
 	}
-	return nil
+	return execution.OrderAck{}, nil
+}
+
+// CancelOrder is the single-call convenience wrapper over the two-stage boundary.
+func (w *wallexPrivate) CancelOrder(ctx context.Context, exchangeOrderID string) error {
+	prepared, err := w.PrepareCancel(ctx, exchangeOrderID)
+	if err != nil {
+		return err
+	}
+	_, err = prepared.Send(ctx)
+	return err
 }
 
 // --- GetOrder ---
@@ -640,6 +726,11 @@ func (w *wallexPrivate) GetOrder(ctx context.Context, exchangeOrderID string) (e
 		return execution.OrderStatus{}, fmt.Errorf("wallex get order decode: %w", err)
 	}
 	if !payload.Success {
+		// PR20: a throttled 200 body must NOT be mis-read as "order unknown" (that would
+		// feed recovery a false negative); classify it as the rate limit it is.
+		if msg := payload.errorMessage(); LooksLikeRateLimitMessage(msg) {
+			return execution.OrderStatus{}, wallexBusinessError("GetOrder", msg)
+		}
 		return execution.OrderStatus{}, &NormalizedAPIError{
 			Exchange: wallexCode, Op: "GetOrder", StatusCode: http.StatusOK,
 			Category: CatBadRequest, Message: MaskBody(payload.errorMessage()), Err: execution.ErrOrderUnknown,
@@ -870,8 +961,9 @@ func mustJSON(v any) []byte {
 // ─── error mapping ─────────────────────────────────────────────────────────────
 
 // wallexHTTPError builds a *NormalizedAPIError for a non-2xx response, wrapping
-// the appropriate execution sentinel where the status is classifiable.
-func wallexHTTPError(op string, status int, body []byte) error {
+// the appropriate execution sentinel where the status is classifiable. hdr carries the
+// response headers so throttle metadata (Retry-After / X-RateLimit-*) is preserved.
+func wallexHTTPError(op string, status int, hdr http.Header, body []byte) error {
 	cat := classifyHTTPStatus(status)
 	msg := wallexExtractMessage(body)
 	e := &NormalizedAPIError{
@@ -885,6 +977,16 @@ func wallexHTTPError(op string, status int, body []byte) error {
 	switch cat {
 	case CatRateLimit:
 		e.Err = execution.ErrRateLimited
+		// PR20 #3/#6: structured throttle metadata. Wallex has no iranArb-verified
+		// pre-execution rejection contract for a 429, so DefiniteRejection stays FALSE —
+		// a rate-limited mutation is AMBIGUOUS and goes through read-only recovery.
+		rl := &RateLimitInfo{Source: RLSourceStatus}
+		if hdr != nil {
+			if d, src, ok := RetryAfterFromHeaders(hdr, time.Now()); ok {
+				rl.RetryAfter, rl.Source = d, src
+			}
+		}
+		e.RateLimit = rl
 	case CatAuth:
 		e.Err = execution.ErrAuthFailed
 	case CatNotFound:
@@ -897,6 +999,26 @@ func wallexHTTPError(op string, status int, body []byte) error {
 	if e.Err == nil && wallexLooksInsufficient(msg) {
 		e.Category = CatInsufficientBalance
 		e.Err = execution.ErrInsufficientBalance
+	}
+	return e
+}
+
+// wallexBusinessError builds the error for an HTTP-200 response whose envelope reports
+// success=false. PR20 correction: an HTTP-200 body may carry a throttle message — it must
+// be classified CatRateLimit (never treated as a successful mutation, never a plain
+// CatBadRequest). Wallex exposes no structured throttle code, so only the CONSERVATIVE
+// phrase fallback applies, and DefiniteRejection stays FALSE (no documented proof the
+// request was rejected before execution) — a mutating request goes to read-only recovery.
+func wallexBusinessError(op, msg string) error {
+	e := &NormalizedAPIError{
+		Exchange: wallexCode, Op: op, StatusCode: http.StatusOK,
+		Category: CatBadRequest, Message: MaskBody(msg),
+	}
+	if LooksLikeRateLimitMessage(msg) {
+		e.Category = CatRateLimit
+		e.Err = execution.ErrRateLimited
+		e.Retryable = true
+		e.RateLimit = &RateLimitInfo{Source: RLSourceBody}
 	}
 	return e
 }

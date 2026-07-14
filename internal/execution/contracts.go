@@ -133,4 +133,61 @@ var (
 	ErrAuthFailed          = errors.New("execution: exchange authentication failed")
 	ErrAckTimeout          = errors.New("execution: order ack timed out")
 	ErrFillTimeout         = errors.New("execution: order fill timed out")
+
+	// ErrNotSent marks an error that occurred BEFORE the network request left the process — a
+	// local pre-execution failure (credential load/decrypt, symbol validation, payload/HTTP-
+	// request construction, auth-token creation, or an already-cancelled send context). The
+	// mutation DEFINITELY did not reach the exchange, so the executor must NOT treat it as an
+	// ambiguous outcome (no read-only recovery probe, no NEEDS_RECONCILE-from-ambiguity). Wrap
+	// it via NotSent/NotSentPermanent; classify via IsNotSent/IsNotSentPermanent.
+	ErrNotSent = errors.New("execution: request definitely not sent (pre-execution failure)")
 )
+
+// notSentError wraps a pre-execution failure. Permanent marks a deterministic local failure
+// (invalid symbol/request/normalized client id) that a retry cannot fix; a non-permanent one
+// is transient (e.g. the credential database is briefly unavailable) and a bounded retry via
+// the persisted queue rules may help.
+type notSentError struct {
+	err       error
+	Permanent bool
+}
+
+func (e *notSentError) Error() string {
+	kind := "temporary"
+	if e.Permanent {
+		kind = "permanent"
+	}
+	return "pre-execution (" + kind + ", not sent): " + e.err.Error()
+}
+func (e *notSentError) Unwrap() error { return e.err }
+
+// Is lets errors.Is(err, ErrNotSent) match any notSentError.
+func (e *notSentError) Is(target error) bool { return target == ErrNotSent }
+
+// NotSent wraps err as a TEMPORARY definitely-not-sent pre-execution failure.
+func NotSent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &notSentError{err: err}
+}
+
+// NotSentPermanent wraps err as a PERMANENT definitely-not-sent pre-execution failure.
+func NotSentPermanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &notSentError{err: err, Permanent: true}
+}
+
+// IsNotSent reports whether err is a definitely-not-sent pre-execution failure.
+func IsNotSent(err error) bool { return errors.Is(err, ErrNotSent) }
+
+// IsNotSentPermanent reports whether err is a PERMANENT definitely-not-sent failure.
+func IsNotSentPermanent(err error) bool {
+	var ns *notSentError
+	if errors.As(err, &ns) {
+		return ns.Permanent
+	}
+	return false
+}

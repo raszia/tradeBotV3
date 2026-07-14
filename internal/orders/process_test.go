@@ -451,3 +451,163 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// --- PR20 round-5 #1: OnBuyDenied releases the lock ONLY when zero exposure is proven -------
+
+// TestOnBuyDeniedReleasesLockOnlyWithNoExposure: the clean failure path (lock released) is used
+// ONLY when the order is provably unsent (QUEUED, filled 0, no exchange id, cycle pre-send).
+// Any other state holds the lock and moves order+cycle to NEEDS_RECONCILE.
+func TestOnBuyDeniedReleasesLockOnlyWithNoExposure(t *testing.T) {
+	cases := []struct {
+		name        string
+		cycleSt     state.CycleState
+		orderSt     state.OrderState
+		exchangeOID string
+		filled      string // set via a follow-up UPDATE when non-empty
+		wantClean   bool   // true → FAILED + lock RELEASED; false → NEEDS_RECONCILE + lock HELD
+	}{
+		{"proven no exposure", state.CycleBuyRequestQueued, state.OrderQueued, "", "", true},
+		{"order ACKED", state.CycleBuySubmitted, state.OrderAcked, "", "", false},
+		{"order SUBMITTED", state.CycleBuySubmitted, state.OrderSubmitted, "", "", false},
+		{"order PARTIALLY_FILLED", state.CycleBuyPartiallyFilled, state.OrderPartiallyFilled, "", "0.5", false},
+		{"exchange_order_id populated", state.CycleBuyRequestQueued, state.OrderQueued, "EXT-9", "", false},
+		{"filled_quantity > 0", state.CycleBuyRequestQueued, state.OrderQueued, "", "0.3", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := setupO(t)
+			cyc, ord := f.seed(c.cycleSt, c.orderSt, c.exchangeOID, "1")
+			lock := f.seedLock(cyc)
+			// The seed set the lock's cycle to `cyc`; point the order's cycle lock via cycle id.
+			f.db.Exec("UPDATE cycles SET lock_id=? WHERE id=?", lock, cyc)
+			if c.filled != "" {
+				f.db.Exec("UPDATE orders SET filled_quantity=? WHERE id=?", c.filled, ord)
+			}
+			req := f.seedReq(cyc, ord, queue.TypePlaceOrder, "CLAIMED")
+
+			f.tx(func(tx *sql.Tx) error {
+				return OnBuyDenied(f.ctx, tx, f.q, PlaceRejectedParams{RequestID: req, OrderID: ord, CycleID: cyc, Cause: "guard denied"})
+			})
+
+			if c.wantClean {
+				if f.orderState(ord) != "FAILED" || f.cycleState(cyc) != "FAILED" {
+					t.Errorf("clean path: order=%s cycle=%s, want FAILED/FAILED", f.orderState(ord), f.cycleState(cyc))
+				}
+				if f.lockState(lock) != "RELEASED" {
+					t.Errorf("clean path: lock=%s, want RELEASED (zero exposure proven)", f.lockState(lock))
+				}
+			} else {
+				if f.orderState(ord) != "NEEDS_RECONCILE" || f.cycleState(cyc) != "NEEDS_RECONCILE" {
+					t.Errorf("conservative path: order=%s cycle=%s, want NEEDS_RECONCILE", f.orderState(ord), f.cycleState(cyc))
+				}
+				if f.lockState(lock) != "ACTIVE" {
+					t.Errorf("conservative path: lock=%s, want ACTIVE (exposure not disproven — lock HELD)", f.lockState(lock))
+				}
+			}
+			if f.reqStatus(req) != "FAILED" {
+				t.Errorf("request = %s, want FAILED", f.reqStatus(req))
+			}
+		})
+	}
+}
+
+// --- PR20 round-6 #2/#4: DisposeDeniedMutation derives the cycle from the ORDER and never
+//     touches an unrelated (claimed) cycle; exhaustion dispositions by operation kind. --------
+
+// TestDisposeDeniedMutationInconsistentOwnership: a request whose claimed cycle_id points at an
+// UNRELATED cycle B must never fail/unlock cycle B — only the order's ACTUAL cycle A follows
+// the conservative reconciliation path, and the request is DEAD.
+func TestDisposeDeniedMutationInconsistentOwnership(t *testing.T) {
+	f := setupO(t)
+	// Cycle A: the order's real cycle, with its own lock.
+	cycA, ordA := f.seed(state.CycleBuyRequestQueued, state.OrderQueued, "", "1")
+	lockA := f.seedLock(cycA)
+	// Cycle B: an UNRELATED cycle with its own lock — must remain untouched.
+	cycB, _ := f.seed(state.CycleBuyRequestQueued, state.OrderQueued, "", "1")
+	lockB := f.seedLock(cycB)
+	req := f.seedReq(cycB, ordA, queue.TypePlaceOrder, "IN_FLIGHT") // claimed cycle=B, order→A
+
+	f.tx(func(tx *sql.Tx) error {
+		return DisposeDeniedMutation(f.ctx, tx, f.q, DenialParams{
+			RequestID: req, OrderID: ordA, ClaimedCycleID: cycB, ClaimedExchangeID: f.exID,
+			Kind: KindEntryBuy, Cause: "inconsistent",
+		})
+	})
+
+	// Cycle B and its lock are UNTOUCHED.
+	if st := f.cycleState(cycB); st != string(state.CycleBuyRequestQueued) {
+		t.Errorf("unrelated cycle B = %s, want unchanged BUY_REQUEST_QUEUED", st)
+	}
+	if f.lockState(lockB) != "ACTIVE" {
+		t.Errorf("unrelated cycle B lock = %s, want ACTIVE (never released)", f.lockState(lockB))
+	}
+	// The ACTUAL order/cycle A go conservative (NEEDS_RECONCILE), lock A HELD; request DEAD.
+	if f.orderState(ordA) != "NEEDS_RECONCILE" || f.cycleState(cycA) != "NEEDS_RECONCILE" {
+		t.Errorf("order/cycle A = %s/%s, want NEEDS_RECONCILE (inconsistent → conservative)", f.orderState(ordA), f.cycleState(cycA))
+	}
+	if f.lockState(lockA) != "ACTIVE" {
+		t.Errorf("cycle A lock = %s, want ACTIVE (held)", f.lockState(lockA))
+	}
+	if f.reqStatus(req) != "DEAD" {
+		t.Errorf("request = %s, want DEAD (inconsistent relationship)", f.reqStatus(req))
+	}
+}
+
+// TestDisposeDeniedMutationDerivesCycleFromOrder: even a CONSISTENT entry buy resolves on the
+// order's real cycle (not the claimed field), releasing that cycle's lock on proven no exposure.
+func TestDisposeDeniedMutationDerivesCycleFromOrder(t *testing.T) {
+	f := setupO(t)
+	cyc, ord := f.seed(state.CycleBuyRequestQueued, state.OrderQueued, "", "1")
+	lock := f.seedLock(cyc)
+	req := f.seedReq(cyc, ord, queue.TypePlaceOrder, "IN_FLIGHT")
+	f.tx(func(tx *sql.Tx) error {
+		return DisposeDeniedMutation(f.ctx, tx, f.q, DenialParams{
+			RequestID: req, OrderID: ord, ClaimedCycleID: cyc, ClaimedExchangeID: f.exID,
+			Kind: KindEntryBuy, Cause: "denied",
+		})
+	})
+	if f.orderState(ord) != "FAILED" || f.cycleState(cyc) != "FAILED" || f.lockState(lock) != "RELEASED" {
+		t.Errorf("proven-no-exposure buy: order=%s cycle=%s lock=%s, want FAILED/FAILED/RELEASED",
+			f.orderState(ord), f.cycleState(cyc), f.lockState(lock))
+	}
+}
+
+// TestExhaustionDispositionByKind: the operation-specific exhaustion disposition — entry buy
+// (zero exposure) releases the lock; exit sell and cancel hold it.
+func TestExhaustionDispositionByKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		kind      MutationKind
+		orderSt   state.OrderState
+		cycleSt   state.CycleState
+		wantOrder string
+		wantCycle string
+		wantLock  string
+	}{
+		{"entry buy zero exposure", KindEntryBuy, state.OrderQueued, state.CycleBuyRequestQueued, "FAILED", "FAILED", "RELEASED"},
+		{"exit sell holds lock", KindExitSell, state.OrderQueued, state.CycleBuyFilled, "NEEDS_RECONCILE", "NEEDS_RECONCILE", "ACTIVE"},
+		{"cancel holds lock", KindCancel, state.OrderAcked, state.CycleBuySubmitted, "NEEDS_RECONCILE", "NEEDS_RECONCILE", "ACTIVE"},
+		{"unknown role holds lock", KindUnknown, state.OrderQueued, state.CycleBuyRequestQueued, "NEEDS_RECONCILE", "NEEDS_RECONCILE", "ACTIVE"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := setupO(t)
+			cyc, ord := f.seed(c.cycleSt, c.orderSt, "", "1")
+			lock := f.seedLock(cyc)
+			req := f.seedReq(cyc, ord, queue.TypePlaceOrder, "IN_FLIGHT")
+			f.tx(func(tx *sql.Tx) error {
+				return DisposeDeniedMutation(f.ctx, tx, f.q, DenialParams{
+					RequestID: req, OrderID: ord, ClaimedCycleID: cyc, ClaimedExchangeID: f.exID,
+					Kind: c.kind, RequestDead: true, Cause: "retries exhausted",
+				})
+			})
+			if f.orderState(ord) != c.wantOrder || f.cycleState(cyc) != c.wantCycle || f.lockState(lock) != c.wantLock {
+				t.Errorf("%s: order=%s cycle=%s lock=%s, want %s/%s/%s", c.name,
+					f.orderState(ord), f.cycleState(cyc), f.lockState(lock), c.wantOrder, c.wantCycle, c.wantLock)
+			}
+			if f.reqStatus(req) != "DEAD" {
+				t.Errorf("request = %s, want DEAD", f.reqStatus(req))
+			}
+		})
+	}
+}

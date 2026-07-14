@@ -39,11 +39,18 @@ type fakeClient struct {
 	placeCount  int32
 	cancelCount int32
 	getCount    int32
+	balCount    int32
+	onBalances  func()
 	// PR19 round 3 test hooks.
 	capsOverride *exchanges.Capabilities // capability set (nil → default)
 	normalizeCID func(string) string     // ClientOrderIDForSend transform (nil → passthrough)
 	onPlace      func()                  // called INSIDE PlaceOrder (assert persisted-before-send)
 	lastSentCID  string                  // the ClientOrderID PlaceOrder actually received
+	// round-4 #3: capture the PlaceOrder context deadline to prove the exchange timeout starts
+	// AFTER pacing (a fresh, non-expired deadline at the network boundary).
+	lastPlaceDeadline    time.Time
+	lastPlaceHasDeadline bool
+	lastPlaceCtxErr      error
 }
 
 func (f *fakeClient) Name() string { return f.code }
@@ -63,14 +70,22 @@ func (f *fakeClient) ClientOrderIDForSend(local string) string {
 	return local
 }
 func (f *fakeClient) GetBalances(context.Context) ([]domain.Balance, error) {
+	atomic.AddInt32(&f.balCount, 1)
+	if f.onBalances != nil {
+		f.onBalances()
+	}
 	if f.balErr != nil {
 		return nil, f.balErr
 	}
 	return []domain.Balance{{Asset: "USDT", Available: decimal.RequireFromString("100")}}, nil
 }
-func (f *fakeClient) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
+func (f *fakeClient) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderAck, error) {
 	atomic.AddInt32(&f.placeCount, 1)
 	f.lastSentCID = req.ClientOrderID
+	if dl, ok := ctx.Deadline(); ok {
+		f.lastPlaceDeadline, f.lastPlaceHasDeadline = dl, true
+	}
+	f.lastPlaceCtxErr = ctx.Err()
 	if f.onPlace != nil {
 		f.onPlace()
 	}
@@ -216,20 +231,35 @@ func TestReadOnlySuccessAndErrors(t *testing.T) {
 		t.Errorf("read-only success status = %s", s)
 	}
 
-	// retryable error -> RETRY_SCHEDULED
+	// non-retryable error -> FAILED (checked BEFORE any rate-limit case: a rate limit now
+	// parks the whole exchange — see below).
+	it.fake.balErr = fmt.Errorf("permanent boom")
+	c3 := it.seedRequest(t, queue.TypeGetBalance, "{}", nil)
+	it.exec.process(it.ctx, c3)
+	if s := reqStatus(t, it.db, c3.ID); s != "FAILED" {
+		t.Errorf("non-retryable status = %s, want FAILED", s)
+	}
+
+	// retryable error -> RETRY_SCHEDULED. A RATE-LIMITED read additionally PARKS the
+	// exchange (PR20 #4), so a follow-up claimed request is deferred back to QUEUED
+	// without any network call.
 	it.fake.balErr = execution.ErrRateLimited
 	c2 := it.seedRequest(t, queue.TypeGetBalance, "{}", nil)
 	it.exec.process(it.ctx, c2)
 	if s := reqStatus(t, it.db, c2.ID); s != "RETRY_SCHEDULED" {
 		t.Errorf("retryable status = %s, want RETRY_SCHEDULED", s)
 	}
-
-	// non-retryable error -> FAILED
-	it.fake.balErr = fmt.Errorf("permanent boom")
-	c3 := it.seedRequest(t, queue.TypeGetBalance, "{}", nil)
-	it.exec.process(it.ctx, c3)
-	if s := reqStatus(t, it.db, c3.ID); s != "FAILED" {
-		t.Errorf("non-retryable status = %s, want FAILED", s)
+	if !it.exec.parked(it.code) {
+		t.Error("a rate-limited read must park the exchange")
+	}
+	before := atomic.LoadInt32(&it.fake.balCount)
+	c4 := it.seedRequest(t, queue.TypeGetBalance, "{}", nil)
+	it.exec.process(it.ctx, c4)
+	if s := reqStatus(t, it.db, c4.ID); s != "QUEUED" {
+		t.Errorf("request during cooldown = %s, want QUEUED (deferred, not sent)", s)
+	}
+	if after := atomic.LoadInt32(&it.fake.balCount); after != before {
+		t.Errorf("GetBalances called during cooldown (%d -> %d), want no network call", before, after)
 	}
 }
 
@@ -413,7 +443,9 @@ func TestCancelWithoutCycleFailsClosed(t *testing.T) {
 	if n := atomic.LoadInt32(&it.fake.cancelCount); n != 0 {
 		t.Errorf("CancelOrder called %d times for a cycle-less request, want 0 (fail closed)", n)
 	}
-	if s := reqStatus(t, it.db, c.ID); s != "FAILED" {
-		t.Errorf("cycle-less cancel status = %s, want FAILED (not sent)", s)
+	// A malformed mutating request (no cycle/order) is now finalized DEAD (not merely FAILED) —
+	// with a known cycle it would also reconcile that cycle + hold its lock (PR20 correction #1).
+	if s := reqStatus(t, it.db, c.ID); s != "DEAD" {
+		t.Errorf("cycle-less cancel status = %s, want DEAD (malformed, not sent)", s)
 	}
 }

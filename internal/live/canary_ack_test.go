@@ -56,7 +56,8 @@ func (f *lfix) hash() string {
 }
 
 func (f *lfix) sell() PlaceCheck {
-	return PlaceCheck{ExchangeID: f.ex, ExchangeMarketID: f.em, Side: "sell", Notional: dec("50"), BaseQty: dec("0.5")}
+	// PR20 correction: a sell must be a PROVEN exit (DB-backed inventory) to pass the guard.
+	return f.seedProvenExit("0.5", "0.5")
 }
 
 // insertSession inserts an ACTIVE live run session for the fixture's canary scope.
@@ -230,7 +231,7 @@ func TestRiskReducingPathsUnaffectedByAckGate(t *testing.T) {
 	if d := f.g.CheckPlace(f.ctx, f.sell()); !d.Allow {
 		t.Errorf("sell must be allowed without a canary ack: %s", d.Reason)
 	}
-	if d := f.g.CheckCancel(f.ctx, PlaceCheck{ExchangeID: f.ex}); !d.Allow {
+	if d := f.g.CheckCancel(f.ctx, f.cancelOf()); !d.Allow {
 		t.Errorf("cancel must be allowed without a canary ack: %s", d.Reason)
 	}
 }

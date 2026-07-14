@@ -255,11 +255,11 @@ func (b *binancePublic) get(ctx context.Context, path string) ([]byte, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, &NormalizedAPIError{
+		return nil, ApplyRateLimitSignals(&NormalizedAPIError{
 			Exchange: binanceCode, Op: path, StatusCode: resp.StatusCode,
 			Category: classifyHTTPStatus(resp.StatusCode), Retryable: resp.StatusCode >= 500 || resp.StatusCode == 429,
 			Message: MaskBody(string(body)),
-		}
+		}, resp.Header)
 	}
 	return body, nil
 }

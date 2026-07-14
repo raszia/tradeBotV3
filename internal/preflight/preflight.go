@@ -95,8 +95,6 @@ type controls struct {
 	exists               bool
 	killSwitch           bool
 	maxOpenCycles        sql.NullInt64
-	maxDailyOrders       sql.NullInt64
-	maxDailyQuote        sql.NullString
 	maxOrderNotional     sql.NullString
 	maxBaseQty           sql.NullString
 	maxConsecFailures    sql.NullInt64
@@ -116,12 +114,12 @@ func loadControls(ctx context.Context, q querier) (controls, error) {
 	var c controls
 	var kill, reqAck, healthReq int
 	err := q.QueryRowContext(ctx, `
-SELECT kill_switch, max_open_cycles, max_daily_orders, max_daily_quote, max_order_notional, max_base_qty,
+SELECT kill_switch, max_open_cycles, max_order_notional, max_base_qty,
   max_consecutive_failures, max_unresolved_reconcile, require_canary_ack, canary_exchange_id, canary_market_id,
   credential_validation_max_age_minutes, market_data_max_age_seconds, balance_max_age_minutes,
   dry_run_success_max_age_minutes, canary_ack_max_age_minutes, health_required
 FROM live_controls WHERE id=1`).Scan(
-		&kill, &c.maxOpenCycles, &c.maxDailyOrders, &c.maxDailyQuote, &c.maxOrderNotional, &c.maxBaseQty,
+		&kill, &c.maxOpenCycles, &c.maxOrderNotional, &c.maxBaseQty,
 		&c.maxConsecFailures, &c.maxUnresolvedRecon, &reqAck, &c.canaryExchangeID, &c.canaryMarketID,
 		&c.credValidationMaxMin, &c.marketDataMaxSec, &c.balanceMaxMin, &c.dryRunSuccessMaxMin, &c.canaryAckMaxMin, &healthReq)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -262,16 +260,18 @@ func (c *Checker) checkLive(ctx context.Context, exchangeID, marketID int64, add
 }
 
 func (c *Checker) checkCaps(ctrl controls, add func(string, Status, string)) {
+	// Daily order-count / quote caps were removed from live decisions (owner decision) and
+	// are no longer required for a configured live setup.
 	configured := ctrl.exists &&
-		ctrl.maxOpenCycles.Valid && ctrl.maxDailyOrders.Valid && ctrl.maxDailyQuote.Valid &&
+		ctrl.maxOpenCycles.Valid &&
 		ctrl.maxOrderNotional.Valid && ctrl.maxBaseQty.Valid && ctrl.maxConsecFailures.Valid && ctrl.maxUnresolvedRecon.Valid
 	if !configured {
 		add("caps_configured", StatusFail, "one or more live caps are not set")
 		return
 	}
 	add("caps_configured", StatusPass, "all caps set")
-	sane := ctrl.maxOpenCycles.Int64 > 0 && ctrl.maxDailyOrders.Int64 > 0 &&
-		positive(ctrl.maxDailyQuote.String) && positive(ctrl.maxOrderNotional.String) && positive(ctrl.maxBaseQty.String) &&
+	sane := ctrl.maxOpenCycles.Int64 > 0 &&
+		positive(ctrl.maxOrderNotional.String) && positive(ctrl.maxBaseQty.String) &&
 		ctrl.maxConsecFailures.Int64 > 0 && ctrl.maxUnresolvedRecon.Int64 >= 0
 	if !sane {
 		add("caps_sane", StatusFail, "a cap is zero or negative")
@@ -550,10 +550,10 @@ func ConfigHash(ctx context.Context, db *sql.DB, exchangeID, marketID int64, mod
 		Scan(&credID, &credKV, &credStatus)
 
 	parts := []string{
-		"v1", mode, code, symbol,
+		"v2", mode, code, symbol,
 		fmt.Sprintf("exlive=%d", exLive), fmt.Sprintf("mklive=%d", mkLive),
 		"caps=" + strings.Join([]string{
-			nullIntStr(ctrl.maxOpenCycles), nullIntStr(ctrl.maxDailyOrders), nullStr(ctrl.maxDailyQuote),
+			nullIntStr(ctrl.maxOpenCycles),
 			nullStr(ctrl.maxOrderNotional), nullStr(ctrl.maxBaseQty), nullIntStr(ctrl.maxConsecFailures), nullIntStr(ctrl.maxUnresolvedRecon),
 		}, ","),
 		fmt.Sprintf("ack=%t", ctrl.requireCanaryAck),

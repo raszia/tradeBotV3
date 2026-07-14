@@ -285,6 +285,161 @@ func OnPlaceRejected(ctx context.Context, tx *sql.Tx, q *queue.Queue, p PlaceRej
 	return nil
 }
 
+// preSendCycleStates are the cycle states in which a buy has NOT yet been submitted to the
+// venue, so no exchange exposure can exist for it.
+var preSendCycleStates = map[state.CycleState]bool{
+	state.CycleNew:              true,
+	state.CycleSignalDetected:   true,
+	state.CycleBuyRequestQueued: true,
+}
+
+// MutationKind selects the terminal disposition for a denied/not-sent mutating request.
+type MutationKind int
+
+const (
+	KindEntryBuy MutationKind = iota // a clean fail + lock release is allowed (only with zero exposure)
+	KindExitSell                     // inventory may exist → always NEEDS_RECONCILE + lock HELD
+	KindCancel                       // a venue order may still be open → NEEDS_RECONCILE + lock HELD
+	KindUnknown                      // role indeterminate (e.g. order-role read failed) → conservative
+)
+
+// DenialParams drives DisposeDeniedMutation.
+type DenialParams struct {
+	RequestID         int64
+	OrderID           int64 // the request's claimed (authoritative) order id
+	ClaimedCycleID    int64 // the request's claimed cycle id — VERIFIED, never used to mutate
+	ClaimedExchangeID int64 // the request's claimed exchange id — VERIFIED
+	Kind              MutationKind
+	// RequestDead: when true the request is marked DEAD (exhaustion / inconsistency / cancel);
+	// otherwise FAILED (a clean pre-send rejection).
+	RequestDead bool
+	// BroadTerminal: when true, the DEAD transition accepts a request in ANY non-terminal status
+	// (QUEUED/RETRY_SCHEDULED/CLAIMED/IN_FLIGHT) via MarkDeadMalformed, instead of only
+	// CLAIMED/IN_FLIGHT. Used by the malformed/inconsistent sweep, which finalizes rows that were
+	// never validly dispatched (round 9 #1/#3). Denial/exhaustion callers leave it false (their
+	// rows are always CLAIMED/IN_FLIGHT, and MarkDead's stricter guard is a useful safety check).
+	BroadTerminal bool
+	Cause         string
+}
+
+// DisposeDeniedMutation is the single AUTHORITATIVE terminal disposition for a mutating request
+// that must not / did not execute (PR20 correction #1/#2/#4). It:
+//   - loads the ORDER `FOR UPDATE` and derives the AUTHORITATIVE cycle from `order.cycle_id`
+//     (NEVER the queue's claimed cycle_id — a request whose claimed cycle_id points at an
+//     unrelated cycle can never mutate or unlock that cycle);
+//   - proves the request↔order↔cycle↔exchange relationship is consistent;
+//   - releases the symbol lock ONLY for an ENTRY BUY whose zero-exposure is proven (order
+//     QUEUED, filled 0, exchange_order_id NULL, cycle pre-send) AND whose relationship is
+//     consistent; otherwise HOLDS the lock and marks the ACTUAL order+cycle NEEDS_RECONCILE.
+//
+// Every state change happens in the caller's transaction, on rows read FOR UPDATE.
+func DisposeDeniedMutation(ctx context.Context, tx *sql.Tx, q *queue.Queue, p DenialParams) error {
+	var oState, filledS string
+	var exOID sql.NullString
+	var oExchangeID, oCycleID int64
+	err := tx.QueryRowContext(ctx,
+		"SELECT state, filled_quantity, exchange_order_id, exchange_id, cycle_id FROM orders WHERE id=? FOR UPDATE",
+		p.OrderID).Scan(&oState, &filledS, &exOID, &oExchangeID, &oCycleID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No order row to reconcile — resolve the request only (nothing else to strand).
+		return markRequestTerminal(ctx, tx, q, p.RequestID, p.RequestDead, p.BroadTerminal, p.Cause)
+	}
+	if err != nil {
+		return err
+	}
+	// The request's claimed cycle/exchange MUST match the order's real ones. A mismatch is an
+	// inconsistent (stale/tampered) request: force the conservative path and never touch the
+	// unrelated claimed cycle.
+	consistent := (p.ClaimedCycleID == 0 || p.ClaimedCycleID == oCycleID) &&
+		(p.ClaimedExchangeID == 0 || p.ClaimedExchangeID == oExchangeID)
+
+	var cState string
+	if err := tx.QueryRowContext(ctx, "SELECT state FROM cycles WHERE id=? FOR UPDATE", oCycleID).Scan(&cState); err != nil {
+		return err
+	}
+	filled, ferr := decimal.NewFromString(filledS)
+	zeroExposure := ferr == nil &&
+		oState == string(state.OrderQueued) &&
+		filled.IsZero() &&
+		!exOID.Valid &&
+		preSendCycleStates[state.CycleState(cState)]
+
+	if p.Kind == KindEntryBuy && consistent && zeroExposure {
+		// Proven no exposure on a consistent entry buy → clean fail + release, on the ACTUAL cycle.
+		if err := markRequestTerminal(ctx, tx, q, p.RequestID, p.RequestDead, p.BroadTerminal, p.Cause); err != nil {
+			return err
+		}
+		if err := resolveOrderTo(ctx, tx, p.OrderID, state.OrderFailed, "place_rejected", p.Cause); err != nil {
+			return err
+		}
+		if err := resolveCycleTo(ctx, tx, oCycleID, state.CycleFailed, "place_rejected", p.Cause); err != nil {
+			return err
+		}
+		return releaseLockByCycle(ctx, tx, oCycleID)
+	}
+	// Conservative: request terminal (DEAD for inconsistency/uncertainty), ACTUAL order+cycle
+	// NEEDS_RECONCILE, lock HELD. A relationship inconsistency always dead-letters the request.
+	cause := p.Cause
+	dead := p.RequestDead || !consistent
+	if !consistent {
+		cause = "inconsistent request/order/cycle/exchange relationship — " + cause
+	}
+	if err := markRequestTerminal(ctx, tx, q, p.RequestID, dead, p.BroadTerminal, cause); err != nil {
+		return err
+	}
+	return MarkNeedsReconcile(ctx, tx, p.OrderID, &oCycleID, cause)
+}
+
+// DisposeMalformedMutation resolves a MUTATING request that has no usable order (order_id NULL,
+// or an order that cannot be identified) — a malformed/historical row (PR20 correction #1/#4).
+// The request is marked DEAD; if a cycle_id is known, that cycle is pushed to NEEDS_RECONCILE
+// with its symbol lock HELD (we cannot prove zero exposure without an order, so we NEVER release
+// the lock). All within the caller's transaction.
+func DisposeMalformedMutation(ctx context.Context, tx *sql.Tx, q *queue.Queue, requestID int64, cycleID *int64, cause string) error {
+	if cycleID != nil {
+		if err := resolveCycleTo(ctx, tx, *cycleID, state.CycleNeedsReconcile, "needs_reconcile", cause); err != nil {
+			return err
+		}
+		// Lock stays HELD (no release) — no order means no proof of zero exposure.
+	}
+	// A malformed row may be QUEUED/RETRY_SCHEDULED (never validly dispatched), so use the
+	// broad-status terminal rather than MarkDead (which only accepts CLAIMED/IN_FLIGHT).
+	return q.MarkDeadMalformed(ctx, tx, requestID, cause)
+}
+
+// markRequestTerminal marks the request FAILED or DEAD within the tx. When broad is true, the
+// DEAD transition accepts any non-terminal status (MarkDeadMalformed) — used by the malformed/
+// inconsistent sweep, whose rows may still be QUEUED. Otherwise DEAD requires CLAIMED/IN_FLIGHT.
+func markRequestTerminal(ctx context.Context, tx *sql.Tx, q *queue.Queue, requestID int64, dead, broad bool, cause string) error {
+	if dead {
+		if broad {
+			return q.MarkDeadMalformed(ctx, tx, requestID, cause)
+		}
+		return q.MarkDead(ctx, tx, requestID, cause)
+	}
+	return q.MarkFailed(ctx, tx, requestID, cause)
+}
+
+// releaseLockByCycle releases the ACTIVE symbol lock for a cycle (no-op when none is active).
+func releaseLockByCycle(ctx context.Context, tx *sql.Tx, cycleID int64) error {
+	if lock, ok, err := symbollock.ActiveByCycle(ctx, tx, cycleID); err != nil {
+		return err
+	} else if ok {
+		return symbollock.Release(ctx, tx, lock.ID)
+	}
+	return nil
+}
+
+// OnBuyDenied is the entry-buy façade over DisposeDeniedMutation (PR20 correction #1/#2). The
+// authoritative cycle is derived from the order — the caller's PlaceRejectedParams.CycleID is
+// passed only as the CLAIMED cycle to be VERIFIED against it, never used to mutate/unlock.
+func OnBuyDenied(ctx context.Context, tx *sql.Tx, q *queue.Queue, p PlaceRejectedParams) error {
+	return DisposeDeniedMutation(ctx, tx, q, DenialParams{
+		RequestID: p.RequestID, OrderID: p.OrderID, ClaimedCycleID: p.CycleID,
+		Kind: KindEntryBuy, Cause: p.Cause,
+	})
+}
+
 // MarkNeedsReconcile pushes the order (and its cycle, if given) to NEEDS_RECONCILE
 // within the caller's tx — the safe response to an ambiguous cancel/send outcome.
 // Terminal/already-reconcile rows are left untouched.

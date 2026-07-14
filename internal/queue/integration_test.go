@@ -67,6 +67,23 @@ type reqOpt struct {
 	timeoutMs   int
 }
 
+// seedOrderFor inserts a minimal entry_buy order on a cycle and returns its id (so mutating
+// requests can carry a valid order_id, which Claim now requires).
+func seedOrderFor(t *testing.T, db *sql.DB, exID, cycleID int64) int64 {
+	t.Helper()
+	var em int64
+	if err := db.QueryRow("SELECT exchange_market_id FROM cycles WHERE id=?", cycleID).Scan(&em); err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Exec(`INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, order_type, limit_price, quantity)
+		VALUES (?, ?, ?, 'buy', 'entry_buy', ?, 'QUEUED', 'limit', '100', '1')`, cycleID, exID, em, uniqueCode("qo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
 func seedRequest(t *testing.T, db *sql.DB, exID int64, o reqOpt) int64 {
 	t.Helper()
 	if o.reqType == "" {
@@ -116,8 +133,10 @@ func TestClaimSeparatesDryRunFromLive(t *testing.T) {
 	exID := seedExchange(t, db, 1)
 	dryCyc := seedCycleDryRun(t, db, exID, 1)
 	liveCyc := seedCycleDryRun(t, db, exID, 0)
-	dryReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &dryCyc})
-	liveReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &liveCyc})
+	dryOrd := seedOrderFor(t, db, exID, dryCyc)
+	liveOrd := seedOrderFor(t, db, exID, liveCyc)
+	dryReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &dryCyc, orderID: &dryOrd})
+	liveReq := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &liveCyc, orderID: &liveOrd})
 
 	yes, no := true, false
 	// Dry-run claimer: only the dry request.
@@ -249,7 +268,9 @@ func TestClaimSkipsDisabledExchange(t *testing.T) {
 func TestClaimTypeFilter(t *testing.T) {
 	db, q, ctx := intgQueue(t)
 	exID := seedExchange(t, db, 1)
-	seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder})
+	tcyc := seedCycleDryRun(t, db, exID, 0)
+	tord := seedOrderFor(t, db, exID, tcyc)
+	seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &tcyc, orderID: &tord})
 	seedRequest(t, db, exID, reqOpt{reqType: TypeGetBalance})
 
 	// Only read-only types allowed -> the PLACE_ORDER is not claimed.
@@ -375,7 +396,9 @@ func TestScheduledStepVsRetryConvention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schedID, err := q.EnqueueScheduled(ctx, tx, Request{ExchangeID: exID, Type: TypeCancelOrder, IdempotencyKey: uniqueCode("sched")}, time.Second)
+	cyc := seedCycleDryRun(t, db, exID, 0)
+	ord := seedOrderFor(t, db, exID, cyc)
+	schedID, err := q.EnqueueScheduled(ctx, tx, Request{ExchangeID: exID, Type: TypeCancelOrder, CycleID: &cyc, OrderID: &ord, IdempotencyKey: uniqueCode("sched")}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,8 +428,11 @@ func TestSweepStuckRecoversStaleClaimed(t *testing.T) {
 	exID := seedExchange(t, db, 1)
 	old := time.Now().Add(-time.Hour)
 
-	// A stale mutating CLAIMED (claimed long ago, never went IN_FLIGHT).
-	staleID := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "CLAIMED", claimedAt: &old, claimedBy: "deadworker"})
+	// A stale mutating CLAIMED (claimed long ago, never went IN_FLIGHT). It carries a valid
+	// order+cycle so, after requeue, it is re-claimable (Claim refuses malformed mutations).
+	scyc := seedCycleDryRun(t, db, exID, 0)
+	sord := seedOrderFor(t, db, exID, scyc)
+	staleID := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "CLAIMED", claimedAt: &old, claimedBy: "deadworker", cycleID: &scyc, orderID: &sord})
 	// A FRESH CLAIMED (just claimed) must NOT be swept.
 	freshID := seedRequest(t, db, exID, reqOpt{status: "CLAIMED", claimedAt: ptr(time.Now()), claimedBy: "liveworker"})
 
@@ -414,8 +440,8 @@ func TestSweepStuckRecoversStaleClaimed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeuedClaimed != 1 {
-		t.Errorf("RequeuedClaimed = %d, want 1", res.RequeuedClaimed)
+	if res.RequeuedClaimed < 1 {
+		t.Errorf("RequeuedClaimed = %d, want >= 1 (this run's stale CLAIMED; shared DB may hold others)", res.RequeuedClaimed)
 	}
 
 	st, by, at := reqRow(t, db, staleID)
@@ -535,4 +561,190 @@ func statusRetry(t *testing.T, db *sql.DB, id int64) (string, int) {
 		t.Fatal(err)
 	}
 	return s, rc
+}
+
+// --- PR20 round-5 #4: RequeueProvenUnexecuted is atomic + status-guarded --------------------
+
+// reqStatusOf reads a request's current status + retry_count.
+func reqStatusOf(t *testing.T, db *sql.DB, id int64) (string, int) {
+	t.Helper()
+	var status string
+	var rc int
+	if err := db.QueryRow("SELECT status, retry_count FROM exchange_requests WHERE id=?", id).Scan(&status, &rc); err != nil {
+		t.Fatal(err)
+	}
+	return status, rc
+}
+
+// TestRequeueProvenUnexecutedRequiresInFlight: a terminal request (DEAD/FAILED/SUCCEEDED) can
+// never be resurrected to RETRY_SCHEDULED — the status guard leaves it exactly as it was.
+func TestRequeueProvenUnexecutedRequiresInFlight(t *testing.T) {
+	for _, terminal := range []string{"DEAD", "FAILED", "SUCCEEDED"} {
+		t.Run(terminal, func(t *testing.T) {
+			db, q, ctx := intgQueue(t)
+			exID := seedExchange(t, db, 1)
+			id := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: terminal})
+			got, err := q.RequeueProvenUnexecuted(ctx, id, time.Now().Add(time.Minute), "should be ignored", nil)
+			if err != nil {
+				t.Fatalf("RequeueProvenUnexecuted: %v", err)
+			}
+			if got != terminal {
+				t.Errorf("returned status = %s, want %s (unchanged)", got, terminal)
+			}
+			if s, rc := reqStatusOf(t, db, id); s != terminal || rc != 0 {
+				t.Errorf("row = (%s, retry_count=%d), want (%s, 0) — a terminal request must never be resurrected", s, rc, terminal)
+			}
+		})
+	}
+}
+
+// TestRequeueProvenUnexecutedInFlightRetries: an IN_FLIGHT request is moved to RETRY_SCHEDULED
+// with the retry count incremented exactly once.
+func TestRequeueProvenUnexecutedInFlightRetries(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	id := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "IN_FLIGHT"})
+	got, err := q.RequeueProvenUnexecuted(ctx, id, time.Now().Add(time.Minute), "proven not executed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "RETRY_SCHEDULED" {
+		t.Fatalf("status = %s, want RETRY_SCHEDULED", got)
+	}
+	if s, rc := reqStatusOf(t, db, id); s != "RETRY_SCHEDULED" || rc != 1 {
+		t.Errorf("row = (%s, retry_count=%d), want (RETRY_SCHEDULED, 1)", s, rc)
+	}
+}
+
+// TestRequeueProvenUnexecutedExhaustionDeadLetters: at the retry limit it atomically moves the
+// request to DEAD and pushes the owning order to NEEDS_RECONCILE.
+func TestRequeueProvenUnexecutedExhaustionDeadLetters(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	cyc := seedCycleDryRun(t, db, exID, 0)
+	// Register an order in a state that can enter NEEDS_RECONCILE.
+	var ordID int64
+	res, err := db.Exec(`INSERT INTO orders (cycle_id, exchange_id, exchange_market_id, side, role, local_client_order_id, state, order_type, limit_price, quantity)
+		SELECT ?, ?, em.id, 'buy', 'entry_buy', ?, 'ACKED', 'limit', '100', '1'
+		FROM exchange_markets em WHERE em.exchange_id=? LIMIT 1`, cyc, exID, uniqueCode("ol"), exID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordID, _ = res.LastInsertId()
+	// max_retries defaults to 5 in seedRequest; set retry_count to the limit so next > max.
+	id := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "IN_FLIGHT", cycleID: &cyc, orderID: &ordID})
+	db.Exec("UPDATE exchange_requests SET retry_count=5 WHERE id=?", id)
+
+	got, err := q.RequeueProvenUnexecuted(ctx, id, time.Now().Add(time.Minute), "exhausted", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "DEAD" {
+		t.Fatalf("status = %s, want DEAD (exhausted)", got)
+	}
+	if s, _ := reqStatusOf(t, db, id); s != "DEAD" {
+		t.Errorf("request = %s, want DEAD", s)
+	}
+	var ordState string
+	db.QueryRow("SELECT state FROM orders WHERE id=?", ordID).Scan(&ordState)
+	if ordState != "NEEDS_RECONCILE" {
+		t.Errorf("order state = %s, want NEEDS_RECONCILE (atomic dead-letter)", ordState)
+	}
+}
+
+// TestRequeueProvenUnexecutedConcurrent: two concurrent handlers for the same IN_FLIGHT request
+// produce exactly ONE retry-count increment and ONE transition to RETRY_SCHEDULED.
+func TestRequeueProvenUnexecutedConcurrent(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	id := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, status: "IN_FLIGHT"})
+
+	var wg sync.WaitGroup
+	results := make([]string, 2)
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = q.RequeueProvenUnexecuted(ctx, id, time.Now().Add(time.Minute), "concurrent", nil)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("handler %d: %v", i, err)
+		}
+	}
+	// The definitive proof of "exactly one transition" is that retry_count incremented ONCE:
+	// the FOR UPDATE lock serializes the two handlers, the first moves IN_FLIGHT →
+	// RETRY_SCHEDULED (retry_count 0→1), and the second observes RETRY_SCHEDULED (status guard)
+	// and makes NO further change. (Both may RETURN "RETRY_SCHEDULED" — one transitioned it, the
+	// other observed it — so the row state, not the return string, is the invariant.)
+	if s, rc := reqStatusOf(t, db, id); s != "RETRY_SCHEDULED" || rc != 1 {
+		t.Errorf("row = (%s, retry_count=%d), want (RETRY_SCHEDULED, 1) — exactly one increment despite two concurrent handlers", s, rc)
+	}
+	for _, r := range results {
+		if r != "RETRY_SCHEDULED" {
+			t.Errorf("each handler must end observing RETRY_SCHEDULED, got %v", results)
+		}
+	}
+}
+
+// --- PR20 round-7 #1: mutating requests require cycle_id AND order_id ------------------------
+
+func TestEnqueueRejectsMutationWithoutOrder(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	cyc := seedCycleDryRun(t, db, exID, 0)
+	ord := seedOrderFor(t, db, exID, cyc)
+	cases := []struct {
+		name string
+		r    Request
+	}{
+		{"place no order", Request{ExchangeID: exID, Type: TypePlaceOrder, CycleID: &cyc, IdempotencyKey: uniqueCode("e1")}},
+		{"place no cycle", Request{ExchangeID: exID, Type: TypePlaceOrder, OrderID: &ord, IdempotencyKey: uniqueCode("e2")}},
+		{"cancel no order", Request{ExchangeID: exID, Type: TypeCancelOrder, CycleID: &cyc, IdempotencyKey: uniqueCode("e3")}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tx, _ := db.Begin()
+			_, err := q.Enqueue(ctx, tx, c.r)
+			_ = tx.Rollback()
+			if !errors.Is(err, ErrMalformedMutation) {
+				t.Errorf("Enqueue err = %v, want ErrMalformedMutation", err)
+			}
+			tx2, _ := db.Begin()
+			_, err = q.EnqueueScheduled(ctx, tx2, c.r, time.Second)
+			_ = tx2.Rollback()
+			if !errors.Is(err, ErrMalformedMutation) {
+				t.Errorf("EnqueueScheduled err = %v, want ErrMalformedMutation", err)
+			}
+		})
+	}
+}
+
+// TestClaimRefusesMalformedMutation: a historical/manually-written mutating row without an
+// order_id must NOT be claimed for sending.
+func TestClaimRefusesMalformedMutation(t *testing.T) {
+	db, q, ctx := intgQueue(t)
+	exID := seedExchange(t, db, 1)
+	cyc := seedCycleDryRun(t, db, exID, 0)
+	// Direct insert bypassing Enqueue validation (simulates a historical/manual row).
+	malformed := seedRequest(t, db, exID, reqOpt{reqType: TypePlaceOrder, cycleID: &cyc}) // NULL order_id
+	claimed, err := q.Claim(ctx, exID, "w", 10, AllTypes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range claimed {
+		if c.ID == malformed {
+			t.Fatalf("Claim returned a malformed mutating request %d (NULL order_id)", malformed)
+		}
+	}
+	if s, _ := statusRetry(t, db, malformed); s != "QUEUED" {
+		t.Errorf("malformed row status = %s, want still QUEUED (unclaimed)", s)
+	}
 }

@@ -14,14 +14,23 @@ import (
 // an unsupported exchange simply yields no client. Construction performs no network I/O
 // (adapters connect lazily on first call), so wiring at boot is safe.
 type Builder struct {
-	db       *sql.DB
-	provider *Provider
-	iolog    *exchanges.IOLogger
+	db            *sql.DB
+	provider      *Provider
+	iolog         *exchanges.IOLogger
+	rateLimitSink exchanges.RateLimitSink
 }
 
 // NewBuilder builds a Builder around a Provider (the credential source).
 func NewBuilder(db *sql.DB, provider *Provider, iolog *exchanges.IOLogger) *Builder {
 	return &Builder{db: db, provider: provider, iolog: iolog}
+}
+
+// WithRateLimitSink attaches the sink that receives throttle signals seen on SUCCESSFUL
+// responses (PR20 correction #6), so exhausted-quota headers on an HTTP 200 pause FUTURE
+// requests without disturbing the successful result. Returns the builder for chaining.
+func (b *Builder) WithRateLimitSink(sink exchanges.RateLimitSink) *Builder {
+	b.rateLimitSink = sink
+	return b
 }
 
 // BuildPrivate constructs the private client for code via the factory, ONLY when an
@@ -37,6 +46,7 @@ func (b *Builder) BuildPrivate(ctx context.Context, code string) (exchanges.Priv
 		Symbols:        b.loadSymbols(ctx, code),
 		ClientTimeout:  10 * time.Second,
 		RequestTimeout: 10 * time.Second,
+		RateLimitSink:  b.rateLimitSink,
 	}, b.iolog)
 }
 

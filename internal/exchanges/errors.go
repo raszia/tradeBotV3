@@ -43,6 +43,11 @@ type NormalizedAPIError struct {
 	Category   ErrorCategory
 	Retryable  bool
 	Err        error // wrapped sentinel (execution.Err*), if classified
+	// RateLimit carries structured throttle metadata when Category == CatRateLimit
+	// (PR20 correction #6): the venue-provided wait, where the signal came from, and —
+	// per exchange + operation, from a documented contract only — whether the request
+	// was DEFINITELY rejected before execution. nil for non-rate-limit errors.
+	RateLimit *RateLimitInfo
 }
 
 func (e *NormalizedAPIError) Error() string {

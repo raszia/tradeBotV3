@@ -56,8 +56,13 @@ func (it *intg) seedBuyCycle(t *testing.T, qty string) (int64, int64, int64) {
 	intent := orders.BuyIntentPayload{Side: "buy", OrderType: "limit", SimulatedIOC: true,
 		IntendedPrice: "100", IntendedQuantity: qty, LocalClientOrderID: u("loc"), MakerWaitBeforeCancelMs: 0}
 	payload, _ := json.Marshal(intent)
-	req := last(ex(`INSERT INTO exchange_requests (exchange_id, cycle_id, order_id, request_type, priority, status, payload, timeout_ms, max_retries, idempotency_key)
-		VALUES (?, ?, ?, 'PLACE_ORDER', 50, 'QUEUED', ?, 10000, 5, ?)`, it.exID, cyc, ord, payload, u("idem")))
+	// `symbol` mirrors what buyflow stamps in production; the live guard proves the request
+	// symbol against the registered market (PR20 correction #2), so it must be populated.
+	// `symbol` mirrors what buyflow stamps in production; the live guard proves the request
+	// symbol against the registered market (PR20 correction #2) and recovery compares it to
+	// the venue-reported symbol, so it must be populated exactly as production does.
+	req := last(ex(`INSERT INTO exchange_requests (exchange_id, cycle_id, order_id, symbol, request_type, priority, status, payload, timeout_ms, max_retries, idempotency_key)
+		VALUES (?, ?, ?, ?, 'PLACE_ORDER', 50, 'QUEUED', ?, 10000, 5, ?)`, it.exID, cyc, ord, u("M")+"/IRT", payload, u("idem")))
 	return cyc, ord, req
 }
 

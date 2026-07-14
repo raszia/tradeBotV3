@@ -44,7 +44,7 @@ func TestEnqueueSuccess(t *testing.T) {
 
 	tx, _ := mockDB.Begin()
 	id, err := q.Enqueue(context.Background(), tx, Request{
-		ExchangeID: 1, Type: TypePlaceOrder, IdempotencyKey: "k1", Payload: json.RawMessage(`{"a":1}`),
+		ExchangeID: 1, Type: TypePlaceOrder, CycleID: ptr64(7), OrderID: ptr64(9), IdempotencyKey: "k1", Payload: json.RawMessage(`{"a":1}`),
 	})
 	if err != nil || id != 42 {
 		t.Fatalf("Enqueue = %d, %v", id, err)
@@ -62,7 +62,7 @@ func TestEnqueueDuplicateIdempotencyKeyRejected(t *testing.T) {
 		WillReturnError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry"})
 
 	tx, _ := mockDB.Begin()
-	_, err := q.Enqueue(context.Background(), tx, Request{ExchangeID: 1, Type: TypePlaceOrder, IdempotencyKey: "dup"})
+	_, err := q.Enqueue(context.Background(), tx, Request{ExchangeID: 1, Type: TypePlaceOrder, CycleID: ptr64(7), OrderID: ptr64(9), IdempotencyKey: "dup"})
 	if !errors.Is(err, ErrDuplicateIdempotencyKey) {
 		t.Fatalf("expected ErrDuplicateIdempotencyKey, got %v", err)
 	}
@@ -152,3 +152,5 @@ func TestBackoffExponentialCapped(t *testing.T) {
 		t.Errorf("backoff(100) should cap at %v, got %v", retryMaxDelay, backoff(100))
 	}
 }
+
+func ptr64(v int64) *int64 { return &v }

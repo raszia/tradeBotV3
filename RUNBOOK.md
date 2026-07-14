@@ -19,6 +19,12 @@
 - Real **master key** set in the bootstrap config file (`[security] master_key`) — never an
   env var. With no/invalid master key, credential loading + live execution are safe-disabled.
 - Migrations applied (`cmd/migrate`); every binary fails fast if a migration is pending.
+- **An `exchange_configs` row for every live-enabled exchange.** In `live` mode the
+  order-executor loads and validates per-exchange tuning SYNCHRONOUSLY at startup and
+  **refuses to start** if a wired exchange has no row (or has negative values) — trading real
+  money with uninitialized `rate_limit_per_sec` / `retry_backoff_ms` is not a safe default.
+  Symptom: `order-executor: startup load (exchange tuning): exchange "x" has no
+  exchange_configs row`. Fix: insert/repair the row, then restart.
 - Dashboard users provisioned (PR17): bootstrap the first admin with
   `./bin/dashboard -config <cfg> -create-user admin:admin` — the **password is entered at a
   hidden prompt (or piped via stdin), never on the command line** — then log in via
@@ -46,8 +52,8 @@ never places or cancels orders.**
 ## 3. Configure caps + canary scope  *(via SQL/admin today)*
 
 Set the `live_controls` singleton: keep `kill_switch=1` for now; set tiny
-`max_order_notional` / `max_base_qty`, `max_open_cycles=1`, the daily caps,
-`require_canary_ack=1`, `canary_exchange_id` / `canary_market_id` (the single scope), the
+`max_order_notional` / `max_base_qty`, `max_open_cycles=1` (owner decision: there are NO
+daily order-count/quote caps — the historical columns are ignored), `require_canary_ack=1`, `canary_exchange_id` / `canary_market_id` (the single scope), the
 freshness windows, and `canary_ack_max_age_minutes`. Mark the exchange + the single market
 `live_enabled=1`. Set bootstrap `[execution] mode = "live"`.
 
@@ -137,6 +143,340 @@ full exit. `mark_failed` with open/unknown exposure is refused unless explicitly
 `external_resolution_confirmed=true` + an `external_resolution_reason`.
 
 ---
+
+## 14. Startup failures (the executor refuses to start)
+
+`order-executor` fails fast rather than trading on unknown state. Each of these exits the
+binary with a message; none of them can be "waited out" — fix the cause and restart.
+
+| Symptom | Cause | Operator action |
+|---|---|---|
+| `startup load (exchange tuning): …no exchange_configs row` | a live-enabled exchange has no tuning row | insert the row (`rate_limit_per_sec`, `retry_backoff_ms`), restart |
+| `startup load (exchange tuning): …invalid tuning` | negative `rate_limit_per_sec`/`retry_backoff_ms` | correct the values, restart |
+| `startup load (exchange tuning): initial exchange-tuning load: …` | the DB was unreachable/unreadable at startup | restore DB access, restart |
+| `load exchange cooldowns: …` | `exchange_cooldowns` unreadable | restore the table (migration 033 applied?), restart |
+
+Rationale: an executor that starts with unloaded tuning would send real orders with no pacing;
+one that starts without its durable cooldowns would resume hammering a still-throttled venue.
+
+**Invalid PERIODIC reloads do NOT crash the running executor.** After startup, a bad config
+reload (a removed `exchange_configs` row for a wired live exchange, or a negative value) is
+REJECTED and the last known-good snapshot keeps serving; the executor logs
+`config reload rejected (keeping last known-good snapshot)`. Fix the row at leisure — pacing is
+never silently disabled by a bad reload. (A bad config is only fatal at STARTUP, above.)
+
+## 15. Cooldown durability failure (per-exchange, entry buys auto-disabled)
+
+A rate-limit **park** is armed in memory immediately and made durable by a background worker
+(never inline — a slow write must never delay a successful order response). If the worker
+cannot persist a given exchange's park within the grace period (default 30s), that EXCHANGE's
+live **entry buys** are disabled and the executor logs (naming the exchange):
+
+```
+LIVE ENTRIES DISABLED for exchange: its cooldown could not be persisted within the grace period …
+```
+
+This is PER EXCHANGE: an outage persisting exchange A's cooldown does NOT affect exchange B.
+What still works even for the affected exchange: **proven exit sells and cancels** (risk-
+reducing — a durability outage is a reason to stop CREATING exposure, never a reason to strand
+inventory), plus status reads and dry-run/off modes. Nothing is being sent to the throttled
+venue either way (the in-process park holds).
+
+Operator action:
+1. Check DB health/disk and that `exchange_cooldowns` exists and is writable.
+2. Inspect: `SELECT * FROM exchange_cooldowns;` and the `cooldown persistence failed` ERROR logs
+   (they name the exchange and how long it has been pending; no secrets are logged).
+3. Once writes succeed the executor logs `cooldown durability recovered — live entries re-enabled
+   for exchange` and resumes automatically for that exchange. **No restart is required**, and a
+   restart during the outage is the thing to avoid — it is exactly when an un-persisted park
+   would be lost.
+
+## 15a. Graceful shutdown and the hard-crash limitation
+
+On a GRACEFUL shutdown (SIGTERM/SIGINT) the executor stops claiming, waits for the persistence
+worker, and FLUSHES any pending parks to `exchange_cooldowns` within a bounded window
+(`ShutdownFlushTimeout`, default 5s), logging `graceful shutdown: pending cooldowns flushed`. So
+a normal restart loses no cooldown. If the flush cannot complete (DB down), it logs
+`could not flush all cooldowns before the deadline` with the unflushed count and exits anyway —
+it never hangs.
+
+**Hard crash (kill -9, power loss):** because persistence is asynchronous, a park armed in the
+last moments before a hard crash may not be on disk. This is an accepted limitation — it cannot
+be made perfectly durable without risking turning a confirmed order into an ambiguous one. The
+loss is self-healing: the venue is still throttling, so the next request re-detects the throttle
+and re-parks. Operators need take no action; prefer graceful shutdowns where possible.
+
+## 16. Pre-execution failures, ambiguous vs definitely-unsent, and proven-unexecuted retries
+
+The executor distinguishes requests that DEFINITELY never reached the venue from AMBIGUOUS ones
+that might have. This changes how you investigate a stuck request.
+
+**Definitely-not-sent (pre-network) failures.** A live PLACE/CANCEL can fail BEFORE any HTTP
+request leaves the process — credential load/decrypt, symbol validation, request/payload build,
+auth-token minting, or an already-cancelled send context (e.g. during shutdown). These are
+classified `execution.ErrNotSent` and never become ambiguous:
+- **Temporary** (e.g. the credential DB was briefly unavailable): the request is re-queued via
+  the sanctioned proven-unexecuted path → `RETRY_SCHEDULED`, retried under the normal
+  `max_retries` budget. **Safely retryable — no operator action** unless it keeps failing.
+- **Permanent** (e.g. an invalid/unmapped symbol, an un-normalizable client id): a terminal
+  local failure. A BUY fails cleanly and releases the lock (nothing was placed, no exposure);
+  a SELL/CANCEL goes to `NEEDS_RECONCILE` with the lock held. **Fix the root cause** (symbol
+  mapping / config) and, for the sell/cancel case, resolve via the reconciliation tool (§13).
+
+**Ambiguous outcomes** (timeout, connection reset, 5xx, unknown response, HTTP-200 throttle
+body) mean the mutation MIGHT have executed. These are NEVER retried blindly: the request goes
+`DEAD` and a read-only recovery probe (GET_ORDER) resolves the real state; the order/cycle sit
+in `NEEDS_RECONCILE` until proven. **Requires reconciliation** (§13), not a resend.
+
+**Telling them apart.** Inspect the request's `last_error` and status:
+- `RETRY_SCHEDULED` with a `pre-execution (temporary, not sent)` cause → definitely unsent,
+  auto-retrying. Watch that `retry_count` is climbing toward `max_retries`.
+- `FAILED` with a `pre-execution (permanent, not sent)` cause → definitely unsent, terminal.
+- `DEAD` with an ambiguous cause (timeout/unknown) → maybe-sent; a GET_ORDER probe exists and
+  the order is `NEEDS_RECONCILE`.
+
+**A final guard denied an order whose state changed during pacing.** If the kill switch (or
+session/preflight/enable-flag/credential/order/cycle state) changed while the request waited in
+the pacer, the FINAL guard denies it at send time. A BUY is resolved by
+`orders.OnBuyDenied`: if it can prove no exposure (still QUEUED, no fill, no exchange id, cycle
+pre-send) the request/order/cycle go `FAILED` and the lock is released; otherwise the lock is
+HELD and order+cycle go `NEEDS_RECONCILE` (resolve via §13). Sells/cancels always hold the lock
+on denial.
+
+**Backoff — local failure vs venue rate limit.** A temporary LOCAL not-sent (e.g. a credential
+DB blip) retries with bounded EXPONENTIAL backoff (seeded by the exchange's `retry_backoff_ms`,
+else 1s, jittered) — its `next_retry_at` is seconds-to-minutes out, NOT immediate, so it does
+not burn all retries at once. A venue-PROVEN rate limit (including a Bitpin auth-endpoint 429)
+retries at the exchange `cooldown_until` deadline instead. The `last_error` always names the real
+cause; a credential failure is NEVER logged as "rate-limited".
+
+**Bitpin auth/token failures.** Bitpin acquires/refreshes a JWT before the order call. If the
+auth (`authenticate`/`refresh_token`) endpoint 429s, times out, or returns an invalid token, the
+ORDER endpoint was never called — it is `ErrNotSent`, not an order ambiguity: an auth 429 arms
+Bitpin's cooldown and the request retries after it; a timeout/transient uses local backoff. You
+will NOT see an order GET_ORDER probe for these. Look for `auth` in the `last_error`.
+
+**Pre-handler failures never strand.** A transient DB error reading the order role (before the
+place is dispatched) re-queues (`RETRY_SCHEDULED`) — the cycle is not touched. A malformed
+CANCEL payload (or an inconsistent request whose `cycle_id` does not match the order's real
+cycle) resolves the ACTUAL order+cycle to `NEEDS_RECONCILE` with the lock HELD and the request
+`DEAD` — an unrelated cycle is never modified or unlocked. Resolve the reconcile via §13.
+
+**Exhausted definitely-unsent retries.** When a temporary not-sent (or a venue-proven
+pre-execution rejection) exhausts `max_retries`, `RequeueProvenUnexecuted` atomically moves the
+request to `DEAD` and its order to `NEEDS_RECONCILE`. To investigate:
+```sql
+SELECT id, request_type, status, retry_count, max_retries, last_error, order_id
+FROM exchange_requests WHERE status='DEAD' AND request_type IN ('PLACE_ORDER','CANCEL_ORDER')
+ORDER BY updated_at DESC;
+```
+The `last_error` names the repeated pre-execution cause (e.g. a persistent credential/decrypt
+failure). Exhaustion resolves the request + order + cycle + lock atomically, by operation:
+- **entry buy, still provably unsent (zero exposure)** → request DEAD, order+cycle FAILED, lock
+  RELEASED (nothing to reconcile);
+- **exit sell** → request DEAD, order+cycle NEEDS_RECONCILE, lock HELD (inventory);
+- **cancel** → request DEAD, order+cycle NEEDS_RECONCILE, lock HELD (a venue order may be open).
+Fix the root cause; for the sell/cancel cases resolve the owning order via the reconciliation
+tool (§13). The request itself is terminal and is never auto-resent.
+
+## 17. Malformed mutating requests and stale-recovery operations
+
+**Identifying a malformed mutating request.** A `PLACE_ORDER`/`CANCEL_ORDER` must have both
+`cycle_id` and `order_id`; the queue rejects new ones and refuses to claim old ones that don't.
+Find historical/manual malformed rows:
+```sql
+SELECT id, request_type, status, cycle_id, order_id, last_error
+FROM exchange_requests
+WHERE request_type IN ('PLACE_ORDER','CANCEL_ORDER') AND (order_id IS NULL OR cycle_id IS NULL);
+```
+The executor's sweep finalizes them automatically: request → DEAD, and (if the cycle is known)
+that cycle → `NEEDS_RECONCILE` with its lock HELD — logged as
+`MALFORMED mutating request finalized DEAD`. Resolve the cycle via §13. If neither id is present,
+only the request is marked DEAD (there is nothing to reconcile).
+
+**Recovering a stale mutation without an order id.** A stale `IN_FLIGHT` mutation whose order
+cannot be identified is finalized conservatively — request DEAD, the identifiable cycle
+`NEEDS_RECONCILE`, lock HELD — never left `IN_FLIGHT`. You will see
+`stale mutating request finalized conservatively` in the logs.
+
+**Bitpin auth rate limits and queued orders.** Bitpin gets a JWT before each order. If the auth
+endpoint is rate-limited (429, or a 200 reporting the quota exhausted), the order is NOT sent that
+invocation: the Bitpin cooldown is armed and the request retries after `cooldown_until` — you will
+NOT see an order GET_ORDER probe (the order endpoint was never reached). This is expected; no
+action beyond watching the cooldown clear.
+
+**Inspecting requests stuck in stale recovery.** A stale `IN_FLIGHT` mutation whose
+`orderRecoveryInfo` keeps failing transiently is retried on each sweep, bounded by the recovery
+hard limit (its `inflight_at` age vs the recovery TotalTimeout, min 5m). To see them:
+```sql
+SELECT id, request_type, status, inflight_at, TIMESTAMPDIFF(MINUTE, inflight_at, NOW(6)) AS stale_minutes
+FROM exchange_requests
+WHERE status='IN_FLIGHT' AND request_type IN ('PLACE_ORDER','CANCEL_ORDER')
+ORDER BY inflight_at;
+```
+If `stale_minutes` exceeds the hard limit the next sweep finalizes the row (DEAD + reconcile).
+**Manual reconciliation is required** for any order/cycle left `NEEDS_RECONCILE` — resolve via
+§13; the request itself is terminal and never auto-resent.
+
+## 18. The mutation send boundary, Bitpin pacing, and stale-recovery ownership
+
+**How the send boundary prevents false ambiguity (all three private venues).** Every mutating
+request goes through a two-stage adapter: `PreparePlace`/`PrepareCancel` does ALL fallible work
+(credentials, symbol, payload, and the final HTTP request) while the request is still `CLAIMED`;
+only then does the executor commit `MarkInFlight` and immediately call `Send`, which just binds the
+context and performs the one order/cancel HTTP call. So:
+- a request that is still `CLAIMED` (or was swept back to `QUEUED`) was **definitely not sent** — no
+  reconciliation needed;
+- a request that is `IN_FLIGHT` **may or may not** have reached the venue — it is resolved by the
+  read-only recovery probe, never a blind resend.
+
+**Identifying a false-ambiguity-prevention failure.** The design guarantees no adapter does fallible
+work after `MarkInFlight`. If you ever see a mutating request go `IN_FLIGHT` and then fail with a
+LOCAL error (bad symbol, credential/token error, request-construction error) rather than a network
+error, that is a boundary regression — such errors must occur during preparation while `CLAIMED`.
+Check `last_error` on `IN_FLIGHT`/`DEAD` mutating rows:
+```sql
+SELECT id, request_type, status, last_error
+FROM exchange_requests
+WHERE request_type IN ('PLACE_ORDER','CANCEL_ORDER') AND status IN ('IN_FLIGHT','DEAD')
+ORDER BY inflight_at DESC LIMIT 50;
+```
+A healthy `IN_FLIGHT` failure reads as a timeout/connection error; a local-validation error on an
+`IN_FLIGHT` row should be reported as a bug.
+
+**Inspecting "prepared" vs `IN_FLIGHT`.** Preparation is in-process and leaves no distinct DB state —
+a request being prepared is still `CLAIMED`. The only durable, operator-visible mutation states are
+`CLAIMED` (claimed, possibly preparing, definitely not sent) and `IN_FLIGHT` (past MarkInFlight,
+possibly sent). To see what is in each:
+```sql
+SELECT status, COUNT(*) FROM exchange_requests
+WHERE request_type IN ('PLACE_ORDER','CANCEL_ORDER') GROUP BY status;
+```
+A `CLAIMED` mutation that is old (not being actively worked) is swept back to `QUEUED`; an old
+`IN_FLIGHT` one is recovered (§17).
+
+**How Bitpin pacing differs with cached vs refreshed tokens.** Bitpin needs a JWT before each order.
+Pacing reservations equal ACTUAL HTTP calls:
+- **fresh cached token** → no auth call → the mutation consumes **one** pacing slot (the order);
+- **missing/expired token** → one auth (or refresh) call + the order → **two** pacing slots.
+So Bitpin throughput naturally halves for the first order after a token expiry and returns to full
+rate while the token stays fresh. This is expected; no action. (Nobitex/Wallex authenticate with an
+in-memory header and always consume exactly one slot per mutation.)
+
+**How an ownership mismatch in stale recovery is finalized.** If a stale `IN_FLIGHT` mutation's queue
+row names a cycle or exchange that does NOT match the order it points at (or the row has a NULL
+`cycle_id` but a valid `order_id`), recovery does NOT probe the claimed cycle. It derives the real
+cycle FROM THE ORDER and finalizes conservatively: **request → DEAD, the ACTUAL order + cycle →
+`NEEDS_RECONCILE`, the lock is HELD, and any unrelated cycle/lock is left untouched.** You will see
+`stale mutating request finalized on ownership mismatch` in the logs. To find the authoritative
+cycle for such a request, always read it from the ORDER, not the request:
+```sql
+SELECT o.id AS order_id, o.cycle_id AS authoritative_cycle, o.exchange_id AS authoritative_exchange,
+       er.cycle_id AS request_claimed_cycle, er.exchange_id AS request_claimed_exchange
+FROM exchange_requests er JOIN orders o ON o.id = er.order_id
+WHERE er.id = ?;    -- the stale/malformed request id
+```
+When `request_claimed_cycle` differs from `authoritative_cycle`, the order's cycle is the source of
+truth and the one that will be in `NEEDS_RECONCILE`.
+
+**When manual reconciliation is required.** Any order/cycle left `NEEDS_RECONCILE` by the above needs
+operator resolution via §13. The request row itself is terminal (`DEAD`) and is never auto-resent.
+The unrelated (wrongly-claimed) cycle needs NO action — it was deliberately not touched.
+
+## 19. Authoritative ownership: which executor owns a stray mutation, and Bitpin auth cooldowns
+
+**Which executor owns a malformed or stale mutation.** Ownership is ALWAYS the order's, never the
+queue row's. The rules the sweeps apply:
+- A mutation with a valid `order_id` is owned by the **execution mode of the order's cycle**
+  (`orders.cycle_id → cycles.dry_run`). The LIVE `order-executor` finalizes live-cycle rows; the
+  DRY-RUN one finalizes dry-run-cycle rows. Neither ever touches the other's cycles or locks.
+- A mutation with no `order_id` but a valid `cycle_id` is owned by that claimed cycle's mode.
+- A mutation with neither a trustworthy order nor cycle is marked `DEAD` by any live/dry-run
+  executor, and NO cycle/lock is touched.
+- An `off` executor finalizes nothing.
+
+So if a stray/malformed row is not being cleaned up, check that the executor for its authoritative
+mode is running. Find the authoritative mode:
+```sql
+SELECT er.id, er.status,
+       COALESCE(oc.dry_run, rc.dry_run) AS authoritative_dry_run,   -- 0=live owner, 1=dry-run owner
+       er.order_id, er.cycle_id AS claimed_cycle, er.exchange_id AS claimed_exchange,
+       o.cycle_id AS order_cycle, o.exchange_id AS order_exchange
+FROM exchange_requests er
+LEFT JOIN orders o  ON o.id = er.order_id
+LEFT JOIN cycles oc ON oc.id = o.cycle_id
+LEFT JOIN cycles rc ON rc.id = er.cycle_id
+WHERE er.id = ?;
+```
+`authoritative_dry_run = 0` → the LIVE executor owns it; `= 1` → the DRY-RUN executor. If it is NULL,
+neither ownership is trustworthy and the row is DEAD-only.
+
+**Recovering a mutation with NULL `cycle_id`.** As long as `order_id` is valid, the sweeps derive the
+real cycle from the order. It is finalized by whichever executor matches the ORDER's cycle mode:
+request → `DEAD`, the order and its real cycle → `NEEDS_RECONCILE`, lock HELD. You do NOT need to
+back-fill the queue row's `cycle_id`; the order is authoritative.
+
+**Unknown / unwired claimed exchange.** A stale mutation whose `exchange_id` points to an unknown,
+disabled, or unwired exchange is still discovered through its order (the sweep does not filter by the
+queue exchange). It is finalized conservatively (request DEAD, order + cycle `NEEDS_RECONCILE`, lock
+HELD). It cannot sit `IN_FLIGHT` forever waiting for an executor that never iterates that exchange.
+
+**Verifying Bitpin's real auth cooldown deadline.** When Bitpin's auth/refresh is throttled, the
+queued mutation's `next_retry_at` reflects the VENUE deadline (Retry-After / X-RateLimit-Reset /
+remaining window), not the 1s configured fallback. Verify:
+```sql
+SELECT id, status, retry_count, max_retries,
+       TIMESTAMPDIFF(SECOND, NOW(6), next_retry_at) AS seconds_until_retry, last_error
+FROM exchange_requests
+WHERE exchange_id = (SELECT id FROM exchanges WHERE code='bitpin')
+  AND request_type IN ('PLACE_ORDER','CANCEL_ORDER') AND status='RETRY_SCHEDULED';
+```
+`seconds_until_retry` should be close to the venue's advertised throttle (tens of seconds), not ~1.
+
+**Detecting premature retry-budget exhaustion.** The symptom the round-9 fix removes: a Bitpin
+mutation reaching `DEAD` with `retry_count = max_retries` within a few seconds of an auth throttle,
+while the venue's throttle window was still open. If you see that pattern, the auth deadline is not
+being propagated — treat it as a regression. Normally a throttled mutation consumes ONE attempt then
+waits the real window; the exchange is also parked (`exchange_cooldowns`) for the same deadline.
+
+**No unclaimable recovery probe.** A `GET_ORDER` recovery probe is created ONLY when the order's
+exchange has a usable read-only recovery path in the running executor: a wired client AND
+`exchanges.enabled = 1`. If the exchange has no client after a restart (no credential, disabled for
+live, not constructed) or is disabled, the stale mutation is finalized conservatively instead —
+request `DEAD`, ACTUAL order + cycle `NEEDS_RECONCILE`, lock HELD — and NO probe is queued. If you
+ever find a `GET_ORDER` probe sitting `QUEUED` with no executor claiming it, that is a regression;
+by design none can exist. To check:
+```sql
+SELECT er.id, e.code, e.enabled, er.status, er.created_at
+FROM exchange_requests er JOIN exchanges e ON e.id = er.exchange_id
+WHERE er.request_type='GET_ORDER' AND er.status='QUEUED'
+  AND er.created_at < NOW(6) - INTERVAL 10 MINUTE;
+```
+
+**Probes that become unclaimable AFTER creation.** A probe can be created while its exchange is
+usable and then be stranded when the exchange is later disabled, its credential is removed, or a
+restart does not construct its client. `sweepUnclaimableRecoveryProbes` runs at STARTUP (before the
+first claim) and periodically, finds such probes by JOINing the persisted order (ownership is the
+order's, never the probe row's), scopes by the order's cycle mode, and finalizes each: probe `DEAD`,
+ACTUAL order + cycle `NEEDS_RECONCILE`, lock HELD. So a restart cannot leave an existing probe
+stranded, and a mid-life exchange disable is cleaned within one sweep. Detect ownership-vs-claim for
+a queued probe the same way as §19's ownership query — always trust `orders.exchange_id`/`cycle_id`,
+not the probe row's. The `created_at` query above should return NOTHING once a sweep has run; if it
+returns rows whose `e.enabled=0` or whose exchange has no running client, verify the executor for
+that mode is actually running (an `off` or wrong-mode executor will not finalize them).
+
+**Sweep fairness across modes.** The malformed-mutation sweep filters by execution mode INSIDE its
+SQL query, before the LIMIT, ordered by request id. Rows belonging to the other mode never occupy
+this executor's sweep window, so a backlog of dry-run junk cannot delay live cleanup (or vice
+versa). If malformed rows of YOUR mode are not draining, verify the executor for that mode is
+actually running — the other mode's executor will never take them.
+
+**When manual reconciliation is required.** Any order/cycle left `NEEDS_RECONCILE` needs operator
+resolution via §13. That happens in exactly these recovery cases: an ownership mismatch was
+finalized; a stale mutation's order stayed unreadable past the recovery window (finalized on the
+RETAINED actual cycle — never the claimed one); the order's exchange had no usable recovery client
+or was disabled (no probe possible); or a probe/retry budget was exhausted legitimately (the venue
+stayed throttled past `max_retries × real-deadline`). The DEAD request is terminal in every case.
 
 ## Emergency-stop behavior by cycle state
 

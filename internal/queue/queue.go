@@ -31,6 +31,20 @@ var ErrRequestNotClaimed = errors.New("queue: request not in CLAIMED state")
 // late worker from clobbering a newer status (e.g. overwriting DEAD with SUCCEEDED).
 var ErrRequestNotActive = errors.New("queue: request not in a markable (CLAIMED/IN_FLIGHT) state")
 
+// ErrMalformedMutation is returned by Enqueue/EnqueueScheduled when a MUTATING request
+// (PLACE_ORDER/CANCEL_ORDER) is missing cycle_id or order_id. A mutating request without an
+// order can never be safely dispatched or recovered — it would strand its cycle (PR20
+// correction #1), so it is refused at creation.
+var ErrMalformedMutation = errors.New("queue: mutating request requires cycle_id and order_id")
+
+// validateMutation rejects a mutating request that lacks a cycle_id or order_id.
+func validateMutation(r Request) error {
+	if r.Type.IsMutating() && (r.CycleID == nil || r.OrderID == nil) {
+		return fmt.Errorf("%w: %s cycle_id=%v order_id=%v", ErrMalformedMutation, r.Type, r.CycleID, r.OrderID)
+	}
+	return nil
+}
+
 // Backoff parameters for retry scheduling.
 const (
 	retryBaseDelay = 500 * time.Millisecond
@@ -55,6 +69,9 @@ func New(db *sql.DB, clk clock.Clock) *Queue {
 // atomic with the cycle/order writes that justify it — rule: registered before
 // sent). A duplicate idempotency_key returns ErrDuplicateIdempotencyKey.
 func (q *Queue) Enqueue(ctx context.Context, tx *sql.Tx, r Request) (int64, error) {
+	if err := validateMutation(r); err != nil {
+		return 0, err
+	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO exchange_requests
 		  (exchange_id, symbol, cycle_id, order_id, request_type, priority, status,
@@ -101,6 +118,9 @@ func (q *Queue) Enqueue(ctx context.Context, tx *sql.Tx, r Request) (int64, erro
 // simulated-IOC / reprice steps are not surfaced as failed retries. EnqueueScheduled
 // always leaves retry_count at its default 0.
 func (q *Queue) EnqueueScheduled(ctx context.Context, tx *sql.Tx, r Request, delay time.Duration) (int64, error) {
+	if err := validateMutation(r); err != nil {
+		return 0, err
+	}
 	if delay < 0 {
 		delay = 0
 	}
@@ -183,6 +203,7 @@ func (q *Queue) Claim(ctx context.Context, exchangeID int64, claimedBy string, l
 			WHERE er.exchange_id = ?
 			  AND er.request_type IN (%s)
 			  AND (er.status = 'QUEUED' OR (er.status = 'RETRY_SCHEDULED' AND er.next_retry_at <= NOW(6)))
+			  AND (er.request_type NOT IN ('PLACE_ORDER','CANCEL_ORDER') OR (er.order_id IS NOT NULL AND er.cycle_id IS NOT NULL))
 			  AND EXISTS (SELECT 1 FROM exchanges e WHERE e.id = er.exchange_id AND e.enabled = 1)%s
 			ORDER BY er.priority ASC, er.id ASC
 			LIMIT ?
@@ -271,6 +292,107 @@ func (q *Queue) loadClaimed(ctx context.Context, ids []int64) ([]Claimed, error)
 // is no longer CLAIMED (already swept, requeued, or never claimed) it returns
 // ErrRequestNotClaimed and the executor must NOT send to the exchange — preventing a
 // stale/duplicate mutating send.
+// Release returns a CLAIMED (never-sent) request to QUEUED, clearing the claim. Safe for
+// ANY request type — CLAIMED is strictly pre-send (IN_FLIGHT is the send boundary), so no
+// exchange state can exist for it. Used by the executor to defer claimed work without a
+// network call when its exchange enters a rate-limit cooldown (PR20 #4). A no-op (nil) if
+// the row is no longer CLAIMED.
+func (q *Queue) Release(ctx context.Context, id int64) error {
+	_, err := q.db.ExecContext(ctx,
+		"UPDATE exchange_requests SET status='QUEUED', claimed_by=NULL, claimed_at=NULL, updated_at=NOW(6) WHERE id=? AND status='CLAIMED'", id)
+	return err
+}
+
+// RequeueProvenUnexecuted re-schedules a MUTATING request whose venue PROVED — via its
+// documented response contract (NormalizedAPIError.RateLimit.DefiniteRejection) — that the
+// request was rejected BEFORE execution (e.g. Nobitex's status:"failed" +
+// code:"TooManyRequests" envelope). This is the ONLY sanctioned mutating retry path and it
+// is NOT blind: the caller must hold that proof. The request moves IN_FLIGHT →
+// RETRY_SCHEDULED with next_retry_at = at and retry_count+1; when retries are exhausted it
+// dead-letters conservatively (DEAD + order NEEDS_RECONCILE) instead of looping forever.
+// Returns the resulting status.
+// RequeueProvenUnexecuted is the ONLY sanctioned retry of a mutating request, used when the
+// venue PROVED (documented contract) or the executor knows (a pre-network failure) that the
+// mutation was NOT executed. It is ATOMIC and STATUS-GUARDED (PR20 correction #4): in one
+// transaction it locks the row (`FOR UPDATE`), requires the current status to be exactly
+// `IN_FLIGHT`, enforces the retry limit, and transitions with a status-conditioned UPDATE that
+// must affect exactly one row. A concurrent actor that already moved the request to
+// DEAD/FAILED/SUCCEEDED can therefore never be resurrected to RETRY_SCHEDULED, and two
+// concurrent callers can never both increment the retry count — the second finds the status is
+// no longer IN_FLIGHT and returns the row's current status unchanged. When the retry limit is
+// exhausted it atomically dead-letters (DEAD + order NEEDS_RECONCILE) in the SAME transaction.
+func (q *Queue) RequeueProvenUnexecuted(ctx context.Context, id int64, at time.Time, cause string, onExhaust ExhaustFunc) (string, error) {
+	return q.requeueUnsent(ctx, id, string(StatusInFlight), at, cause, onExhaust)
+}
+
+// RequeueClaimedUnsent re-queues a still-CLAIMED mutating request that failed BEFORE MarkInFlight
+// (a pre-handler failure — definitely never sent). It is status-guarded on CLAIMED so it cannot
+// touch a request another actor already advanced, and it is otherwise identical to
+// RequeueProvenUnexecuted (bounded retry, atomic exhaustion via onExhaust). PR20 correction #1.
+func (q *Queue) RequeueClaimedUnsent(ctx context.Context, id int64, at time.Time, cause string, onExhaust ExhaustFunc) (string, error) {
+	return q.requeueUnsent(ctx, id, string(StatusClaimed), at, cause, onExhaust)
+}
+
+// ExhaustFunc applies the operation-specific terminal disposition (request+order+cycle+lock)
+// atomically inside the requeue transaction when the retry limit is reached (PR20 correction
+// #4). It is provided by the executor (the queue must not import orders/symbollock). When nil,
+// the queue falls back to its own conservative dead-letter (DEAD + order NEEDS_RECONCILE).
+type ExhaustFunc func(ctx context.Context, tx *sql.Tx) error
+
+// requeueUnsent is the shared atomic, row-locked, status-guarded requeue for a mutating request
+// KNOWN not to have executed. requiredStatus is CLAIMED (pre-send) or IN_FLIGHT (post-MarkInFlight).
+func (q *Queue) requeueUnsent(ctx context.Context, id int64, requiredStatus string, at time.Time, cause string, onExhaust ExhaustFunc) (string, error) {
+	var final string
+	err := q.withTx(ctx, func(tx *sql.Tx) error {
+		var status string
+		var retryCount, maxRetries int
+		var orderID sql.NullInt64
+		if err := tx.QueryRowContext(ctx,
+			"SELECT status, retry_count, max_retries, order_id FROM exchange_requests WHERE id=? FOR UPDATE",
+			id).Scan(&status, &retryCount, &maxRetries, &orderID); err != nil {
+			return err
+		}
+		// Only a request still in the expected pre-execution status may be re-queued. Anything
+		// else was already resolved by another actor — leave it exactly as it is.
+		if status != requiredStatus {
+			final = status
+			return nil
+		}
+		if retryCount+1 > maxRetries {
+			// Exhausted: apply the operation-specific disposition atomically in THIS tx.
+			if onExhaust != nil {
+				if err := onExhaust(ctx, tx); err != nil {
+					return err
+				}
+			} else if err := q.deadMutatingStuckTx(ctx, tx, id, orderID,
+				"proven-unexecuted retries exhausted: "+cause); err != nil {
+				return err
+			}
+			final = string(StatusDead)
+			return nil
+		}
+		res, err := tx.ExecContext(ctx,
+			"UPDATE exchange_requests SET status='RETRY_SCHEDULED', retry_count=retry_count+1, next_retry_at=?, last_error=?, updated_at=NOW(6) WHERE id=? AND status=?",
+			at.UTC(), nullStr(cause), id, requiredStatus)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("%w: proven-unexecuted requeue affected %d rows for id=%d", ErrRequestNotActive, n, id)
+		}
+		final = string(StatusRetryScheduled)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return final, nil
+}
+
 func (q *Queue) MarkInFlight(ctx context.Context, id int64) error {
 	res, err := q.db.ExecContext(ctx,
 		"UPDATE exchange_requests SET status='IN_FLIGHT', inflight_at=NOW(6), updated_at=NOW(6) WHERE id=? AND status='CLAIMED'",
@@ -307,6 +429,16 @@ func (q *Queue) MarkSucceeded(ctx context.Context, tx *sql.Tx, id int64, respons
 func (q *Queue) MarkFailed(ctx context.Context, tx *sql.Tx, id int64, cause string) error {
 	return q.markTerminal(ctx, tx, id, "FAILED",
 		"UPDATE exchange_requests SET status='FAILED', last_error=?, updated_at=NOW(6) WHERE id=? AND status IN ('CLAIMED','IN_FLIGHT')",
+		nullStr(cause), id)
+}
+
+// MarkDeadMalformed moves a MALFORMED mutating request to DEAD from ANY non-terminal status
+// (QUEUED/RETRY_SCHEDULED/CLAIMED/IN_FLIGHT) — used only for finalizing malformed/historical
+// rows that were never validly dispatched (PR20 correction #1). Guarded so it never overwrites
+// a terminal status.
+func (q *Queue) MarkDeadMalformed(ctx context.Context, tx *sql.Tx, id int64, cause string) error {
+	return q.markTerminal(ctx, tx, id, "DEAD",
+		"UPDATE exchange_requests SET status='DEAD', last_error=?, updated_at=NOW(6) WHERE id=? AND status IN ('QUEUED','RETRY_SCHEDULED','CLAIMED','IN_FLIGHT')",
 		nullStr(cause), id)
 }
 

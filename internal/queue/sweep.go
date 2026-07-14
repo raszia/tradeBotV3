@@ -112,31 +112,38 @@ func (q *Queue) requeueStaleClaimed(ctx context.Context, graceSeconds int) (int,
 // NEEDS_RECONCILE in one transaction. It NEVER re-sends.
 func (q *Queue) deadMutatingStuck(ctx context.Context, requestID int64, orderID sql.NullInt64) error {
 	return q.withTx(ctx, func(tx *sql.Tx) error {
-		const cause = "stuck IN_FLIGHT: ambiguous mutating send outcome — needs reconcile"
-		if orderID.Valid {
-			var curState string
-			var version int64
-			if err := tx.QueryRowContext(ctx,
-				"SELECT state, version FROM orders WHERE id=?", orderID.Int64).Scan(&curState, &version); err != nil {
-				if err != sql.ErrNoRows {
+		return q.deadMutatingStuckTx(ctx, tx, requestID, orderID,
+			"stuck IN_FLIGHT: ambiguous mutating send outcome — needs reconcile")
+	})
+}
+
+// deadMutatingStuckTx dead-letters a mutating request (DEAD) and pushes its owning order to
+// NEEDS_RECONCILE within the CALLER's transaction, so exhaustion + reconciliation are atomic
+// with the caller's status check (PR20 correction #4).
+func (q *Queue) deadMutatingStuckTx(ctx context.Context, tx *sql.Tx, requestID int64, orderID sql.NullInt64, cause string) error {
+	if orderID.Valid {
+		var curState string
+		var version int64
+		if err := tx.QueryRowContext(ctx,
+			"SELECT state, version FROM orders WHERE id=?", orderID.Int64).Scan(&curState, &version); err != nil {
+			if err != sql.ErrNoRows {
+				return err
+			}
+		} else {
+			from := state.OrderState(curState)
+			// Only transition if it can enter NEEDS_RECONCILE (non-terminal, not already
+			// there). Otherwise leave the order as-is.
+			if err := state.ValidateOrderTransition(from, state.OrderNeedsReconcile); err == nil {
+				if _, err := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
+					OrderID: orderID.Int64, From: from, To: state.OrderNeedsReconcile, Version: version,
+					EventType: "stuck_inflight_reconcile", Reason: cause,
+				}); err != nil {
 					return err
-				}
-			} else {
-				from := state.OrderState(curState)
-				// Only transition if it can enter NEEDS_RECONCILE (non-terminal,
-				// not already there). Otherwise leave the order as-is.
-				if err := state.ValidateOrderTransition(from, state.OrderNeedsReconcile); err == nil {
-					if _, err := state.ApplyOrderTransition(ctx, tx, state.OrderTransition{
-						OrderID: orderID.Int64, From: from, To: state.OrderNeedsReconcile, Version: version,
-						EventType: "stuck_inflight_reconcile", Reason: cause,
-					}); err != nil {
-						return err
-					}
 				}
 			}
 		}
-		return q.MarkDead(ctx, tx, requestID, cause)
-	})
+	}
+	return q.MarkDead(ctx, tx, requestID, cause)
 }
 
 func (q *Queue) withTx(ctx context.Context, fn func(*sql.Tx) error) (retErr error) {
