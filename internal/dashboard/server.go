@@ -30,7 +30,9 @@ import (
 	"strconv"
 	"time"
 
+	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/configstore"
+	"v3TradeBot/internal/opreconcile"
 )
 
 // Config tunes the dashboard.
@@ -70,6 +72,10 @@ type Server struct {
 	cfgStore *configstore.Store
 	cfg      Config
 	log      *slog.Logger
+	// reconciler resolves NEEDS_RECONCILE cases (PR21). It holds only the DB handle, so like the
+	// rest of the dashboard it cannot place/cancel orders — it only applies audited state changes.
+	reconciler *opreconcile.Resolver
+	previews   *previewStore // short-lived preview tokens binding apply to a prior preview
 }
 
 // New builds a Server.
@@ -78,9 +84,10 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{db: db, cfg: cfg, log: log}
+	s := &Server{db: db, cfg: cfg, log: log, previews: newPreviewStore()}
 	if db != nil {
 		s.cfgStore = configstore.New(db)
+		s.reconciler = opreconcile.New(db, clock.NewSystem(), log)
 	}
 	return s
 }
@@ -124,6 +131,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/config/market/{id}/flags", s.requireRole(RoleConfigOperator, s.editMarketFlags))
 	mux.HandleFunc("POST /api/config/exchange/{id}", s.requireRole(RoleConfigOperator, s.editExchangeConfig))
 	mux.HandleFunc("POST /api/config/fee", s.requireRole(RoleConfigOperator, s.editFee))
+
+	// Operator RECONCILIATION (PR21): resolve NEEDS_RECONCILE cases. EXACT-set capability
+	// (reconcile_operator or admin) on EVERY endpoint including read-only ones — details are never
+	// returned to an unauthenticated (401) or unauthorized (403) user. apply requires a matching
+	// prior preview (token). No exchange I/O; every change is audited.
+	mux.HandleFunc("GET /api/reconcile", s.requireReconcileCapable(s.reconcileList))
+	mux.HandleFunc("GET /api/reconcile/audit", s.requireReconcileCapable(s.reconcileAudit))
+	mux.HandleFunc("GET /api/reconcile/{id}", s.requireReconcileCapable(s.reconcileDetail))
+	mux.HandleFunc("POST /api/reconcile/{id}/preview", s.requireReconcileCapable(s.reconcilePreview))
+	mux.HandleFunc("POST /api/reconcile/{id}/apply", s.requireReconcileCapable(s.reconcileApply))
 	return mux
 }
 

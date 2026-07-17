@@ -22,21 +22,42 @@ import (
 // tokens are NEVER stored in plaintext. Only /healthz and /login are unauthenticated;
 // every other route (UI, reads, mutations, WebSocket) requires a valid session.
 
-// Roles, lowest→highest privilege. A route requires a MINIMUM role.
+// Config-ladder roles, lowest→highest CONFIG privilege. A config route requires a MINIMUM role
+// via roleAtLeast/requireRole.
 const (
 	RoleViewer         = "viewer"          // read-only
 	RoleConfigOperator = "config_operator" // read + edit normal config
 	RoleAdmin          = "admin"           // + high-risk config changes
+	// RoleReconcileOperator is an ORTHOGONAL capability, NOT a rung on the config ladder (PR21).
+	// It is deliberately ABSENT from roleRank, so roleAtLeast(reconcile_operator, config_operator)
+	// is false — a reconcile_operator can NEVER pass a config-edit gate. Reconciliation routes use
+	// the exact-set requireReconcileCapable check instead of the ladder.
+	RoleReconcileOperator = "reconcile_operator" // resolve NEEDS_RECONCILE cases only (no config edit)
 )
 
+// roleRank is the CONFIG ladder ONLY. reconcile_operator is intentionally not present.
 var roleRank = map[string]int{RoleViewer: 1, RoleConfigOperator: 2, RoleAdmin: 3}
 
-func validRole(r string) bool { _, ok := roleRank[r]; return ok }
+// validRoles is the full set a dashboard user may hold — decoupled from roleRank so
+// reconcile_operator is a creatable role WITHOUT gaining any config-ladder rank.
+var validRoles = map[string]bool{
+	RoleViewer: true, RoleConfigOperator: true, RoleAdmin: true, RoleReconcileOperator: true,
+}
 
-// roleAtLeast reports whether `have` meets the `need` minimum.
+func validRole(r string) bool { return validRoles[r] }
+
+// roleAtLeast reports whether `have` meets the `need` minimum on the CONFIG ladder. A role not on
+// the ladder (e.g. reconcile_operator) never meets any minimum.
 func roleAtLeast(have, need string) bool {
 	h, ok := roleRank[have]
 	return ok && h >= roleRank[need]
+}
+
+// canReconcile reports whether a role may perform reconciliation. It is an exact-set membership
+// test (reconcile_operator OR admin) — never the config ladder — so config_operator/viewer are
+// excluded and reconcile_operator never leaks config-edit permission (PR21).
+func canReconcile(role string) bool {
+	return role == RoleReconcileOperator || role == RoleAdmin
 }
 
 const (
@@ -223,6 +244,21 @@ func (s *Server) requireRole(minRole string, h http.HandlerFunc) http.HandlerFun
 	return s.requireSession(func(w http.ResponseWriter, r *http.Request) {
 		if !roleAtLeast(sessionFrom(r.Context()).Role, minRole) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "insufficient role"})
+			return
+		}
+		h(w, r)
+	})
+}
+
+// requireReconcileCapable wraps requireSession and enforces the EXACT-SET reconciliation
+// capability (reconcile_operator OR admin) — NOT the config ladder. Every reconciliation endpoint
+// (including read-only ones) uses this, so an unauthenticated caller gets 401 and any role without
+// the reconcile capability (viewer, config_operator) gets 403; reconciliation details are never
+// returned to an unauthenticated or unauthorized user (PR21).
+func (s *Server) requireReconcileCapable(h http.HandlerFunc) http.HandlerFunc {
+	return s.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		if !canReconcile(sessionFrom(r.Context()).Role) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "reconcile capability required"})
 			return
 		}
 		h(w, r)

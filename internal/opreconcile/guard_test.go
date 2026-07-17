@@ -26,8 +26,9 @@ func TestActionsAreDistinct(t *testing.T) {
 	seen := map[Action]bool{}
 	for _, a := range []Action{
 		ActionCancelZeroExposure, ActionAttachExchangeOrderID, ActionMarkBuyFilled,
-		ActionMarkBuyZeroFilled, ActionMarkSellFilled, ActionMarkSellPartiallyFilled,
-		ActionMarkOrderCancelledZeroFill, ActionKeepNeedsReconcile, ActionMarkFailed,
+		ActionMarkBuyPartiallyFilled, ActionMarkBuyZeroFilled, ActionMarkSellFilled,
+		ActionMarkSellPartiallyFilled, ActionMarkOrderCancelledZeroFill,
+		ActionCorrectTerminalOrderFill, ActionKeepNeedsReconcile, ActionMarkFailed,
 	} {
 		if seen[a] {
 			t.Errorf("duplicate action key %q", a)

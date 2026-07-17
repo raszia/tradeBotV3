@@ -24,6 +24,7 @@ var ErrNotReconcileResolution = errors.New("state: not a valid NEEDS_RECONCILE r
 var cycleResolutionTargets = map[CycleState]bool{
 	CycleBuyFilled:           true,
 	CycleBuyPartiallyFilled:  true,
+	CycleSellRepricePending:  true, // PR21 correction: remaining exposure with no active sell → the sell manager creates the next sell from here
 	CycleSellPartiallyFilled: true,
 	CycleSellFilled:          true,
 	CycleCancelled:           true,
@@ -89,6 +90,57 @@ func ApplyOrderResolution(ctx context.Context, tx *sql.Tx, t OrderTransition) (R
 		to:             string(t.To),
 		version:        t.Version,
 		eventType:      defaultEventType(t.EventType, "operator_resolution"),
+		message:        t.Reason,
+		payload:        t.Payload,
+	})
+}
+
+// terminalCorrectFrom are the terminal ORDER states a discovered-fill correction may re-open
+// FROM. FILLED is deliberately excluded (recording MORE against a fully-filled order is an
+// oversell, not a correction). REJECTED/EXPIRED are included because a venue can report a late
+// fill even after a rejection/expiry race.
+var terminalCorrectFrom = map[OrderState]bool{
+	OrderCancelled: true, OrderFailed: true, OrderRejected: true, OrderExpired: true,
+}
+
+// terminalCorrectTo is the ONLY state a terminal-order correction may reach: FILLED, when a
+// discovered fill proves the order actually filled COMPLETELY (the cancel/rejection never took).
+// A merely PARTIAL discovered fill is NOT a valid correction target — reactivating a terminal order
+// to PARTIALLY_FILLED would make a confirmed-cancelled remainder look like an active open order
+// (PR21 correction). A partial discovered fill instead records the fill and LEAVES the order in its
+// terminal state (the remainder stays cancelled); only the cycle advances.
+var terminalCorrectTo = map[OrderState]bool{
+	OrderFilled: true,
+}
+
+// IsTerminalCorrectable reports whether a terminal order state can be re-opened by a discovered-
+// fill correction (PR21 blocker 5).
+func IsTerminalCorrectable(from OrderState) bool { return terminalCorrectFrom[from] }
+
+// CorrectTerminalOrder is the ONLY path that re-opens an already-TERMINAL order to record a fill
+// discovered after the order was terminalized (e.g. a cancel/rejection that raced a venue fill).
+// It is explicit, version-guarded (same CAS as any transition), writes an `operator_terminal_
+// correction` event row, and is restricted to FILLED/PARTIALLY_FILLED targets. It NEVER touches
+// the cycle. Recording a fill against a terminal order WITHOUT this path (silently leaving the
+// order terminal) is forbidden — the preview and the applied order state must always agree
+// (PR21 blocker 5).
+func CorrectTerminalOrder(ctx context.Context, tx *sql.Tx, t OrderTransition) (Result, error) {
+	if !terminalCorrectFrom[t.From] {
+		return Result{}, fmt.Errorf("%w: terminal-order correction must start from a terminal (non-FILLED) order state, got %s", ErrNotReconcileResolution, t.From)
+	}
+	if !terminalCorrectTo[t.To] {
+		return Result{}, fmt.Errorf("%w: %s is not a valid terminal-order correction target", ErrNotReconcileResolution, t.To)
+	}
+	return applyTransition(ctx, tx, transitionSpec{
+		table:          "orders",
+		idCol:          "id",
+		eventTable:     "order_events",
+		eventParentCol: "order_id",
+		id:             t.OrderID,
+		from:           string(t.From),
+		to:             string(t.To),
+		version:        t.Version,
+		eventType:      defaultEventType(t.EventType, "operator_terminal_correction"),
 		message:        t.Reason,
 		payload:        t.Payload,
 	})

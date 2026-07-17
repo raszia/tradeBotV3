@@ -130,17 +130,108 @@ sells/cancels/status remain allowed. Use this if you cannot identify the canary 
   acknowledgement, caps, requests, orders, allow decisions, denials, the first-order checklist,
   and the stop reason. **No secrets.**
 
-## 13. Resolve `NEEDS_RECONCILE`  *(role: reconcile_operator/admin)*
+## 13. Resolve `NEEDS_RECONCILE`  *(role: reconcile_operator or admin)*
 
 ```
-GET  /api/reconcile                 # list
-GET  /api/reconcile/{id}            # full context
-POST /api/reconcile/{id}/preview    # exact proposed changes, mutates nothing
-POST /api/reconcile/{id}/apply      # apply with a reason
+GET  /api/reconcile                 # list of NEEDS_RECONCILE cycles (with execution mode)
+GET  /api/reconcile/{id}            # full context + exposure classification + action catalog
+GET  /api/reconcile/audit           # immutable resolution history
+POST /api/reconcile/{id}/preview    # exact proposed changes + a preview token (mutates nothing)
+POST /api/reconcile/{id}/apply      # apply — requires the preview token
 ```
-Never blind-close: preview then apply. The lock is released only on proven zero exposure /
-full exit. `mark_failed` with open/unknown exposure is refused unless explicitly forced with
-`external_resolution_confirmed=true` + an `external_resolution_reason`.
+
+**Access.** Every endpoint (including the read-only ones) requires a dashboard **session cookie**
+and the exact **reconcile capability** — role `reconcile_operator` OR `admin`. A `viewer` or
+`config_operator` gets 403; no session gets 401. A `reconcile_operator` can resolve cases but
+**cannot edit configuration** (reconciliation is a separate capability, not a config rank). Create
+one with `./bin/dashboard -config <cfg> -create-user <name>:<pass>` then set the role to
+`reconcile_operator` (migration 034 permits the value). The audit records the session username —
+never a body-supplied name.
+
+**Never blind-close: preview, then apply the SAME operation with the returned token.** Preview
+returns `preview_token` and the exact effect: `order_changes[]`, `request_changes[]`,
+`fill_to_insert`, `accounting_changes`, `lock_change`, `exposure_before/after`,
+`exposure_classification`, `execution_mode`. Apply requires the token (missing → 400) and **409s**
+if the cycle/order/request/lock/payload changed since the preview, or the token expired / was used
+/ belongs to another operator — re-preview and retry. A `reason` is mandatory.
+
+**Exposure classification — a recorded `filled_quantity = 0` is NOT proof of zero exposure.**
+- **PROVEN_ZERO** — net 0 and no order could hold unrecorded inventory (never sent / venue-rejected).
+- **OPEN** — recorded net inventory > 0.
+- **UNKNOWN** — net 0 but an order reached (or may have reached) the venue with an unconfirmed
+  outcome (a timed-out place, a cancel that may have raced a fill). Treat as possible exposure.
+- **INCONSISTENT** — recorded sells exceed buys; every resolution is refused until data is fixed.
+
+The symbol lock is released ONLY for PROVEN_ZERO (or a proven full-exit sell). `cancel_zero_exposure`
+and `mark_buy_zero_filled` refuse OPEN outright and refuse UNKNOWN unless you confirm the exchange
+shows no position with `external_resolution_confirmed=true` + a non-empty `external_resolution_reason`.
+`mark_failed` with open/unknown exposure is likewise refused (kept NEEDS_RECONCILE, lock held) unless
+externally confirmed.
+
+**Active queue requests block a close.** A cycle cannot be resolved out of NEEDS_RECONCILE (or its
+lock released) while any related exchange request — a PLACE/CANCEL **or** a GET_ORDER recovery probe
+— is still `QUEUED`/`RETRY_SCHEDULED`/`CLAIMED`/`IN_FLIGHT` (it could still execute). The preview lists
+them; let the executor's recovery finish (or resolve those first). Ownership is derived from the
+order, so a request with wrong queue metadata still counts.
+
+**Fills and order vs cycle state.** `mark_buy_partially_filled` / `mark_buy_filled` are chosen by
+whether the cumulative fill completes the order; `mark_sell_partially_filled` keeps exposure (refused
+if it would close it — use `mark_sell_filled`). A sell can fully fill while the cycle still holds
+inventory, and the cycle can CLOSE while the sell is only partially filled — order and cycle state are
+separate.
+
+**Closing on a sell requires EVERY sell order to be non-executable.** `mark_sell_filled` closes the
+cycle + releases the lock only when the chosen sell order is fully filled — a partially-filled sell
+whose remainder may still be open on the venue is refused (to avoid a later oversell) unless you
+confirm the remainder is cancelled (`external_resolution_confirmed` + reason), in which case that
+order is recorded as terminal CANCELLED with its partial fill preserved. It also refuses if ANY OTHER
+sell order in the cycle can still execute — one that is active (SUBMITTED/ACKED/PARTIALLY_FILLED) OR
+in `NEEDS_RECONCILE` (which may still be open at the venue even with no queue request) — so resolve
+every other sell first. When a partial sell instead COMPLETES the sell order but exposure remains and
+no other active/unresolved sell exists, the cycle goes to `SELL_REPRICE_PENDING` and the sell manager
+creates the next exit sell for the remainder — the remaining inventory is never stranded; if another
+sell is in `NEEDS_RECONCILE`, the operation is refused until you resolve it.
+
+**A fill discovered on a TERMINAL order** (a cancel/rejection that raced a venue fill) uses
+`correct_terminal_order_fill` (never a normal fill action, which is refused on a terminal order). It
+records the fill ONCE and advances the cycle: a FULL discovered fill re-opens the order to FILLED; a
+PARTIAL one leaves the order terminal (its cancelled remainder is preserved — never shown as an
+active PARTIALLY_FILLED). The cycle then moves to BUY_FILLED/BUY_PARTIALLY_FILLED (buy),
+CLOSED (sell that closes exposure), or SELL_REPRICE_PENDING (sell with remaining exposure) — you are
+never asked to enter the same fill twice.
+
+**One exchange order id, one internal order.** `attach_exchange_order_id` is serialized per exchange
+and backed by a UNIQUE `(exchange_id, exchange_order_id)` index — the same venue id cannot be bound
+to two orders, even under concurrent attaches. To find any duplicates before/after:
+```sql
+SELECT exchange_id, exchange_order_id, COUNT(*) FROM orders
+WHERE exchange_order_id IS NOT NULL GROUP BY exchange_id, exchange_order_id HAVING COUNT(*) > 1;
+```
+
+**When manual reconciliation is required / operational SQL.**
+```sql
+-- Cases needing attention + their execution mode:
+SELECT id, canonical_symbol, dry_run AS is_dry_run, updated_at FROM cycles WHERE state='NEEDS_RECONCILE';
+
+-- Recorded exposure for a cycle (recorded net = bought - sold; classification also weighs venue risk):
+SELECT
+  (SELECT COALESCE(SUM(filled_quantity),0) FROM orders WHERE cycle_id=? AND role='entry_buy')
+- (SELECT COALESCE(SUM(filled_quantity),0) FROM orders WHERE cycle_id=? AND role='exit_sell') AS recorded_net;
+
+-- Orders carrying venue risk (an id, or a may-have-executed state => a recorded 0 is NOT proof):
+SELECT id, role, side, state, filled_quantity, exchange_order_id FROM orders WHERE cycle_id=?;
+
+-- Active requests that BLOCK a close:
+SELECT id, request_type, status, order_id FROM exchange_requests
+WHERE (cycle_id=? OR order_id IN (SELECT id FROM orders WHERE cycle_id=?))
+  AND status IN ('QUEUED','RETRY_SCHEDULED','CLAIMED','IN_FLIGHT');
+
+-- The held symbol lock:
+SELECT id, scope, canonical_symbol, state FROM symbol_locks WHERE cycle_id=? AND state='ACTIVE';
+```
+Resolve manually (via the API preview→apply) when the exposure is OPEN/UNKNOWN and needs an operator
+decision, when a fill was discovered on a terminal order, or when data is INCONSISTENT. The DEAD/audit
+row is terminal; the resolver never contacts a venue.
 
 ---
 
