@@ -3,6 +3,8 @@ package exchanges
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +21,14 @@ import (
 	"v3TradeBot/internal/domain"
 	"v3TradeBot/internal/execution"
 )
+
+// credFingerprint is a NON-SECRET, non-reversible fingerprint of a credential (a truncated SHA-256
+// of its fields). It is used ONLY to detect that the active credential changed (a rotation) so a
+// cached auth token can be invalidated; it is never logged and never sent anywhere.
+func credFingerprint(c Credentials) string {
+	h := sha256.Sum256([]byte(c.APIKey + "\x00" + c.APISecret + "\x00" + c.Passphrase))
+	return hex.EncodeToString(h[:8])
+}
 
 // Bitpin adapter — public market data + private trading. Ported/adapted from the
 // sibling iranArb bitpin package. Bitpin is an Iranian exchange that quotes in
@@ -246,6 +256,11 @@ type bitpinPrivate struct {
 	refreshToken       string
 	tokenAt            time.Time
 	authThrottledUntil time.Time
+	// tokenCredFP is a NON-SECRET fingerprint of the credential the cached token was minted with. If
+	// the active credential is rotated, the fingerprint changes and the cached token/refresh token are
+	// dropped so the client re-authenticates with the NEW credential (PR22 round-2 blocker 3). Never
+	// logged.
+	tokenCredFP string
 }
 
 func newBitpinPrivate(cfg ClientConfig, logger *IOLogger) (PrivateClient, error) {
@@ -299,20 +314,36 @@ func (b *bitpinPrivate) bitpinAuthRateLimited(msg string, retryAfter time.Durati
 // definitely-not-sent rate limit, NOT a licence to send the order with a cached token. Lenient
 // (reads) prefers a cached token during a throttle window.
 func (b *bitpinPrivate) bearerToken(ctx context.Context, strict bool) (string, error) {
+	// Resolve the CURRENT active credential FIRST (round-2 blocker 3). The cached token is bound to a
+	// non-secret fingerprint of the credential it was minted with; if the active credential was
+	// rotated, the fingerprint differs and the whole token cache is dropped so we re-authenticate
+	// with the NEW credential. Rotation is therefore effective immediately, never served from the
+	// old credential's cached token.
+	creds, credErr := b.cfg.Creds.Credentials(ctx, bitpinCode)
+	fp := ""
+	if credErr == nil {
+		fp = credFingerprint(creds)
+	}
+
 	b.tokenMu.Lock()
-	// Fast path: still-fresh cached token.
-	if b.accessToken != "" && time.Since(b.tokenAt) < bitpinTokenTTL {
+	// Active credential changed since the cached token was minted → drop the cache (token + refresh
+	// + throttle) so we cannot reuse the previous credential's token or refresh it.
+	if credErr == nil && b.tokenCredFP != "" && b.tokenCredFP != fp {
+		b.accessToken, b.refreshToken, b.tokenCredFP, b.authThrottledUntil = "", "", "", time.Time{}
+	}
+	// Fast path: still-fresh cached token for the SAME credential.
+	if b.accessToken != "" && b.tokenCredFP == fp && time.Since(b.tokenAt) < bitpinTokenTTL {
 		tok := b.accessToken
 		b.tokenMu.Unlock()
 		return tok, nil
 	}
 	// Cached token past our internal TTL. Honor an active 429 backoff on the
 	// auth endpoint: prefer the (slightly-stale, ~1m grace) cached token over an
-	// auth attempt we know would 429 again.
+	// auth attempt we know would 429 again — but only for the SAME credential.
 	inBackoff := !b.authThrottledUntil.IsZero() && time.Now().Before(b.authThrottledUntil)
 	if inBackoff {
 		wait := time.Until(b.authThrottledUntil)
-		hasCache := b.accessToken != ""
+		hasCache := b.accessToken != "" && b.tokenCredFP == fp
 		tok := b.accessToken
 		b.tokenMu.Unlock()
 		if strict {
@@ -322,15 +353,14 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context, strict bool) (string, e
 			return "", b.bitpinAuthRateLimited(fmt.Sprintf("auth throttled, retry after %s", wait.Round(time.Second)), wait, RLSourceStatus)
 		}
 		if hasCache {
-			return tok, nil // reads may proceed with the cached token
+			return tok, nil // reads may proceed with the cached token (same credential)
 		}
 		return "", b.authError(fmt.Sprintf("auth throttled, retry after %s", wait), http.StatusTooManyRequests)
 	}
 	refresh := b.refreshToken
 	b.tokenMu.Unlock()
 
-	creds, err := b.cfg.Creds.Credentials(ctx, bitpinCode)
-	if err != nil {
+	if err := credErr; err != nil {
 		// PR20 correction #3: pre-network credential failure — definitely not sent, transient.
 		return "", execution.NotSent(err)
 	}
@@ -408,6 +438,21 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context, strict bool) (string, e
 		return "", b.authError("token response missing access token", http.StatusUnauthorized)
 	}
 
+	// The active credential may have been ROTATED while this authentication was in flight (round-3
+	// blocker 2A). Re-resolve it and, if its fingerprint no longer matches the credential we
+	// authenticated with, do NOT cache or return this (now stale) token — a stale auth response must
+	// never repopulate the cache after a rotation. Fail definitely-not-sent so the caller retries and
+	// re-authenticates with the new credential.
+	if creds2, cerr := b.cfg.Creds.Credentials(ctx, bitpinCode); cerr == nil && credFingerprint(creds2) != fp {
+		b.tokenMu.Lock()
+		if b.tokenCredFP != credFingerprint(creds2) {
+			// Drop anything tied to the old credential so no stale token/refresh survives.
+			b.accessToken, b.refreshToken, b.tokenCredFP, b.authThrottledUntil = "", "", "", time.Time{}
+		}
+		b.tokenMu.Unlock()
+		return "", execution.NotSent(fmt.Errorf("bitpin: active credential rotated during authentication — not sent, retry with the new credential"))
+	}
+
 	b.tokenMu.Lock()
 	b.accessToken = payload.Access
 	if payload.Refresh != "" {
@@ -415,6 +460,7 @@ func (b *bitpinPrivate) bearerToken(ctx context.Context, strict bool) (string, e
 	}
 	b.tokenAt = time.Now()
 	b.authThrottledUntil = time.Time{}
+	b.tokenCredFP = fp // bind the cached token to the credential it was minted with (round-2 blocker 3)
 	b.tokenMu.Unlock()
 
 	// Auth succeeded, but if it reports the quota is now exhausted, future Bitpin calls must
@@ -527,10 +573,25 @@ type bitpinPrepared struct {
 	b      *bitpinPrivate
 	op     string
 	req    *http.Request
+	credFP string // fingerprint of the credential the request (and its bearer token) were built with
 	decode func(raw []byte) (execution.OrderAck, error)
 }
 
 func (p *bitpinPrepared) Send(ctx context.Context) (execution.OrderAck, error) {
+	// Refuse to transmit if the active credential was ROTATED after this mutation was prepared
+	// (round-3 blocker 2B). The request carries a bearer token minted for the old credential; sending
+	// it would place/cancel through the wrong (now-disabled) credential. The check runs BEFORE the
+	// network call, so this is DEFINITELY-not-sent — the executor re-prepares with the new credential
+	// (never a blind resend of a possibly-sent request).
+	if p.credFP != "" {
+		creds, cerr := p.b.cfg.Creds.Credentials(ctx, bitpinCode)
+		if cerr != nil {
+			return execution.OrderAck{}, execution.NotSent(cerr)
+		}
+		if credFingerprint(creds) != p.credFP {
+			return execution.OrderAck{}, execution.NotSent(fmt.Errorf("bitpin: active credential rotated after preparation — not sent, re-prepare with the new credential"))
+		}
+	}
 	status, hdr, raw, err := doPreparedRequest(ctx, p.b.http, p.req)
 	if err != nil {
 		return execution.OrderAck{}, fmt.Errorf("bitpin %s %s: %w", p.req.Method, p.req.URL.Path, err)
@@ -586,7 +647,7 @@ func (b *bitpinPrivate) PreparePlace(ctx context.Context, req execution.OrderReq
 	if rerr != nil {
 		return nil, rerr
 	}
-	return &bitpinPrepared{b: b, op: "place", req: httpReq,
+	return &bitpinPrepared{b: b, op: "place", req: httpReq, credFP: b.tokenFP(),
 		decode: func(raw []byte) (execution.OrderAck, error) { return b.decodePlaceAck(raw, req) }}, nil
 }
 
@@ -612,7 +673,16 @@ func (b *bitpinPrivate) PrepareCancel(ctx context.Context, exchangeOrderID strin
 	if rerr != nil {
 		return nil, rerr
 	}
-	return &bitpinPrepared{b: b, op: "cancel", req: httpReq}, nil
+	return &bitpinPrepared{b: b, op: "cancel", req: httpReq, credFP: b.tokenFP()}, nil
+}
+
+// tokenFP returns the fingerprint of the credential the current cached bearer token was minted with
+// (set by bearerToken). A prepared mutation captures it so Send can refuse to transmit after a
+// credential rotation (round-3 blocker 2B).
+func (b *bitpinPrivate) tokenFP() string {
+	b.tokenMu.Lock()
+	defer b.tokenMu.Unlock()
+	return b.tokenCredFP
 }
 
 // --- GetBalances ---

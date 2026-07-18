@@ -33,6 +33,9 @@ const (
 	// is false — a reconcile_operator can NEVER pass a config-edit gate. Reconciliation routes use
 	// the exact-set requireReconcileCapable check instead of the ladder.
 	RoleReconcileOperator = "reconcile_operator" // resolve NEEDS_RECONCILE cases only (no config edit)
+	// RoleCredentialOperator is another orthogonal capability (PR22): manage exchange credentials
+	// (create/validate/activate/disable). Like reconcile_operator it is NOT on the config ladder.
+	RoleCredentialOperator = "credential_operator"
 )
 
 // roleRank is the CONFIG ladder ONLY. reconcile_operator is intentionally not present.
@@ -41,7 +44,8 @@ var roleRank = map[string]int{RoleViewer: 1, RoleConfigOperator: 2, RoleAdmin: 3
 // validRoles is the full set a dashboard user may hold — decoupled from roleRank so
 // reconcile_operator is a creatable role WITHOUT gaining any config-ladder rank.
 var validRoles = map[string]bool{
-	RoleViewer: true, RoleConfigOperator: true, RoleAdmin: true, RoleReconcileOperator: true,
+	RoleViewer: true, RoleConfigOperator: true, RoleAdmin: true,
+	RoleReconcileOperator: true, RoleCredentialOperator: true,
 }
 
 func validRole(r string) bool { return validRoles[r] }
@@ -58,6 +62,14 @@ func roleAtLeast(have, need string) bool {
 // excluded and reconcile_operator never leaks config-edit permission (PR21).
 func canReconcile(role string) bool {
 	return role == RoleReconcileOperator || role == RoleAdmin
+}
+
+// canManageCredentials reports whether a role may manage exchange credentials — an exact-set test
+// (credential_operator OR admin), never the config ladder (PR22). All users are trusted internal
+// users, so the model is deliberately simple; the only hard rule is that non-credential roles never
+// receive plaintext secrets (the endpoints never return any regardless of role).
+func canManageCredentials(role string) bool {
+	return role == RoleCredentialOperator || role == RoleAdmin
 }
 
 const (
@@ -259,6 +271,19 @@ func (s *Server) requireReconcileCapable(h http.HandlerFunc) http.HandlerFunc {
 	return s.requireSession(func(w http.ResponseWriter, r *http.Request) {
 		if !canReconcile(sessionFrom(r.Context()).Role) {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "reconcile capability required"})
+			return
+		}
+		h(w, r)
+	})
+}
+
+// requireCredentialCapable wraps requireSession and enforces the EXACT-SET credential capability
+// (credential_operator OR admin). Every credential endpoint uses it: 401 without a session, 403 for
+// any other role — credential data (even metadata) is never served to an unauthorized user (PR22).
+func (s *Server) requireCredentialCapable(h http.HandlerFunc) http.HandlerFunc {
+	return s.requireSession(func(w http.ResponseWriter, r *http.Request) {
+		if !canManageCredentials(sessionFrom(r.Context()).Role) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "credential capability required"})
 			return
 		}
 		h(w, r)

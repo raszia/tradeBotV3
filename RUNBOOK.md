@@ -31,23 +31,87 @@
   `POST /login`. Roles: `viewer` | `config_operator` | `admin` (config edits need
   config_operator+; high-risk flag changes need admin).
 
-## 1. Provision a credential  *(role: credential_operator/admin)*
+## 1. Provision a credential — the safe workflow  *(role: credential_operator or admin)*
 
+The workflow is **create → validate → activate/rotate → (optionally) disable old**. The
+currently working credential stays active until the new one is validated AND activated, so you
+never lose exchange access mid-rotation. Every endpoint needs a dashboard **session cookie** and
+the credential capability (`credential_operator` or `admin`; a `config_operator`/`viewer` gets
+403). Create a credential user with `./bin/dashboard -config <cfg> -create-user <name>:<pass>`
+then set the role to `credential_operator` (migration 036 permits the value). Credential WRITE
+endpoints are **disabled (503)** unless a valid `[security] master_key` is configured (no
+plaintext fallback).
+
+**Create — always inactive.**
 ```
 POST /api/credentials
 { "exchange_code":"<ex>", "label":"default", "api_key":"…", "api_secret":"…",
-  "passphrase":"…optional…", "enabled":true, "status":"active", "reason":"canary provisioning" }
+  "passphrase":"…optional…", "reason":"provisioning" }
 ```
-The secrets are encrypted in memory (AES-256-GCM, `nonce‖ciphertext‖tag`, key = SHA-256(master
-key)) and only ciphertext is stored. The response returns an id + status — never the plaintext
-or the blob. Audited in `credential_audit`.
+The new credential is ALWAYS stored `enabled=false`, `status=unknown`, with a service-assigned
+`key_version` — you cannot create an already-active credential. Secrets are encrypted in memory
+(AES-256-GCM, `nonce‖ciphertext‖tag`, key = SHA-256(master key)); only ciphertext is stored. The
+response returns id + status only — never plaintext or the blob. Audited in `credential_audit`.
 
-## 2. Validate the credential (read-only)
+## 2. Validate the EXACT credential (read-only)
 
-A read-only balance check confirms the credential works and stamps `last_checked_at`. The
-`health-monitor`'s private probe does this automatically (`credentials.Validate`). Confirm via
-`GET /api/credentials` — look for `status=active` and a recent `last_checked_at`. **Validation
-never places or cancels orders.**
+```
+POST /api/credentials/{id}/validate   { "reason":"validate before activating" }
+```
+This decrypts and uses ONLY that credential (never the currently-active one) for a single
+read-only balance read — it **never places or cancels an order**. The result is applied under a
+locked re-read of the credential's current state, so a validation that overlaps an activation/
+rotation can never overwrite it — if the credential is already `active`, a successful validation
+keeps it `active` (it is never downgraded to `valid`). Outcome:
+- success → `status=valid` (validated, not yet active) — ready to activate (or stays `active` if it
+  already was);
+- a definite auth/permission rejection → `status=invalid` — fix the key and re-create;
+- a transient error (timeout, network, rate limit, exchange 5xx) → status **unchanged** — a brief
+  incident never invalidates a good credential; just retry validation.
+
+`valid` means validated but not yet in use; only `active` (enabled) is the live credential the
+system trades with. Validation is **serialized** with activation/rotation per exchange (it briefly
+holds a row lock during its read-only check), so a validation that overlaps an activation can never
+leave the exchange with zero active credentials — even if the validation ends in an auth failure.
+
+**After you activate/rotate, the change is effective immediately.** A long-running executor/
+reconciler/balance-sync/health-monitor with a cached Bitpin token detects the new active credential
+and re-authenticates with it, it never caches a token from an auth response that returned after the
+rotation, and any Bitpin order/cancel that was already *prepared* under the old credential is
+refused before it is sent (reported as "not sent") and re-prepared with the new credential — so a
+mutation can never go out through the rotated-away credential.
+
+If validation fails, the old credential remains active and in use — recover by fixing/rotating the
+new key and re-validating; nothing was activated.
+
+## 2a. Activate / rotate to the validated credential
+
+```
+POST /api/credentials/{id}/activate-or-rotate   { "reason":"rotate to new key" }
+```
+This is atomic and serialized per exchange: it confirms the credential is validated, makes it the
+single active one, and **disables the previously active credential in the same transaction** — so
+there is exactly one active credential and no gap in access. A credential that has not been
+validated is refused. If anything fails, the old credential stays active (nothing is left
+half-rotated). The database enforces at most one active credential per exchange, so two concurrent
+rotations can never leave two active.
+
+## 2b. Disable an old credential (guarded)
+
+```
+POST /api/credentials/{id}/disable   { "reason":"retire old key" }
+```
+Disabling keeps the row + audit history. It is **refused for the last OPERATIONAL (enabled +
+`active`) credential** of an exchange while that exchange has open live risk — an active live
+session, a non-terminal live cycle, a non-terminal or `NEEDS_RECONCILE` live order, or an active
+live exchange request — so you can never remove the ability to sell inventory, cancel an order, or
+recover an ambiguous result. A `valid` (validated-but-inactive) credential does NOT count as a
+replacement — only an `active` one does; so to replace the live credential under risk, **rotate**
+(which swaps atomically) rather than disabling it. The active-request check follows the request's
+real order (not its queue metadata), so a stale/wrong `exchange_id`/`cycle_id` on a queue row cannot
+hide an active request on a live order. Disabling is allowed once another `active` credential exists
+or the risk clears; terminal history, dry-run data, and inactive locks never block it. Check
+`GET /api/credentials` (metadata only — never secrets) and `GET /api/credentials/audit`.
 
 ## 3. Configure caps + canary scope  *(via SQL/admin today)*
 

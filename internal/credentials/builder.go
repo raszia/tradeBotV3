@@ -50,6 +50,35 @@ func (b *Builder) BuildPrivate(ctx context.Context, code string) (exchanges.Priv
 	}, b.iolog)
 }
 
+// fixedCreds is a CredentialProvider that always returns ONE specific decrypted credential,
+// regardless of the exchange code asked for. Used by BuildForCredential so validation targets the
+// exact credential row an operator selected (PR22 requirement 2), never the auto-selected active one.
+type fixedCreds struct{ c exchanges.Credentials }
+
+func (f fixedCreds) Credentials(context.Context, string) (exchanges.Credentials, error) {
+	return f.c, nil
+}
+
+// BuildForCredential constructs a private client bound to the ONE credential identified by
+// credentialID (by decrypting only that row), for READ-ONLY validation. The returned client is a
+// full PrivateClient, but validation only ever calls its read path (GetBalances via BalanceReader)
+// — it never calls PlaceOrder/CancelOrder. A missing row / unsupported algorithm / decrypt failure
+// returns an error (no plaintext).
+func (b *Builder) BuildForCredential(ctx context.Context, credentialID int64) (exchanges.PrivateClient, error) {
+	code, creds, err := b.provider.CredentialsByID(ctx, credentialID)
+	if err != nil {
+		return nil, err
+	}
+	return exchanges.NewPrivateClient(exchanges.ClientConfig{
+		Code:           code,
+		Creds:          fixedCreds{creds},
+		Symbols:        b.loadSymbols(ctx, code),
+		ClientTimeout:  10 * time.Second,
+		RequestTimeout: 10 * time.Second,
+		RateLimitSink:  b.rateLimitSink,
+	}, b.iolog)
+}
+
 // loadSymbols returns the canonical->venue symbol map for an exchange (empty on error;
 // balance/health/reconcile reads do not need it, only order placement does).
 func (b *Builder) loadSymbols(ctx context.Context, code string) map[string]string {

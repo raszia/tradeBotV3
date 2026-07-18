@@ -32,6 +32,8 @@ import (
 
 	"v3TradeBot/internal/clock"
 	"v3TradeBot/internal/configstore"
+	"v3TradeBot/internal/credentials"
+	"v3TradeBot/internal/exchanges"
 	"v3TradeBot/internal/opreconcile"
 )
 
@@ -43,6 +45,10 @@ type Config struct {
 	WSInterval      time.Duration // live-update push cadence (default 2s)
 	SessionTTL      time.Duration // login session lifetime (default 12h)
 	SecureCookies   bool          // set the Secure flag on the session cookie (enable behind HTTPS)
+	// MasterKey is the bootstrap AES master key (PR22). When present + valid it enables credential
+	// provisioning (create/validate/activate/disable). Empty/invalid → credential WRITE endpoints
+	// are disabled (no plaintext fallback). Never logged.
+	MasterKey string
 }
 
 func (c *Config) withDefaults() {
@@ -76,6 +82,11 @@ type Server struct {
 	// rest of the dashboard it cannot place/cancel orders — it only applies audited state changes.
 	reconciler *opreconcile.Resolver
 	previews   *previewStore // short-lived preview tokens binding apply to a prior preview
+	// Credential provisioning (PR22). Non-nil only when a valid master key is configured; the
+	// credBuilder builds a READ-ONLY client for a specific credential during validation. When nil,
+	// credential WRITE endpoints are disabled (no plaintext fallback).
+	provisioner *credentials.Provisioner
+	credBuilder *credentials.Builder
 }
 
 // New builds a Server.
@@ -88,6 +99,23 @@ func New(db *sql.DB, log *slog.Logger, cfg Config) *Server {
 	if db != nil {
 		s.cfgStore = configstore.New(db)
 		s.reconciler = opreconcile.New(db, clock.NewSystem(), log)
+		// Credential provisioning is enabled ONLY with a valid master key (PR22). Without it,
+		// credential writes are disabled and secrets can never be decrypted — no plaintext fallback.
+		if cfg.MasterKey != "" {
+			if prov, err := credentials.NewProvisioner(db, cfg.MasterKey, clock.NewSystem(), log); err == nil {
+				if provider, perr := credentials.NewProvider(db, cfg.MasterKey, clock.NewSystem(), log); perr == nil {
+					iolog := exchanges.NewIOLogger(exchanges.IOLogConfig{Enabled: true, Source: "dashboard"}, db)
+					s.provisioner = prov
+					s.credBuilder = credentials.NewBuilder(db, provider, iolog)
+				} else {
+					log.Warn("dashboard: credential provisioning disabled (provider init failed)", "err", perr)
+				}
+			} else {
+				log.Warn("dashboard: credential provisioning disabled (invalid master key)", "err", err)
+			}
+		} else {
+			log.Info("dashboard: credential provisioning disabled (no master key configured)")
+		}
 	}
 	return s
 }
@@ -141,6 +169,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/reconcile/{id}", s.requireReconcileCapable(s.reconcileDetail))
 	mux.HandleFunc("POST /api/reconcile/{id}/preview", s.requireReconcileCapable(s.reconcilePreview))
 	mux.HandleFunc("POST /api/reconcile/{id}/apply", s.requireReconcileCapable(s.reconcileApply))
+
+	// Exchange CREDENTIAL provisioning (PR22): create → validate → activate/rotate → disable. Every
+	// endpoint requires the exact-set credential capability (credential_operator or admin); metadata
+	// is never served to an unauthorized user, and no endpoint returns plaintext or an encrypted
+	// blob. Writes are disabled (503) without a valid master key.
+	mux.HandleFunc("GET /api/credentials", s.requireCredentialCapable(s.credentialList))
+	mux.HandleFunc("GET /api/credentials/audit", s.requireCredentialCapable(s.credentialAudit))
+	mux.HandleFunc("POST /api/credentials", s.requireCredentialCapable(s.credentialCreate))
+	mux.HandleFunc("POST /api/credentials/{id}/validate", s.requireCredentialCapable(s.credentialValidate))
+	mux.HandleFunc("POST /api/credentials/{id}/activate-or-rotate", s.requireCredentialCapable(s.credentialActivateOrRotate))
+	mux.HandleFunc("POST /api/credentials/{id}/disable", s.requireCredentialCapable(s.credentialDisable))
 	return mux
 }
 

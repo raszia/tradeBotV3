@@ -23,6 +23,10 @@ type Provisioner struct {
 	cipher *secrets.Cipher
 	clk    clock.Clock
 	log    *slog.Logger
+	// faultBeforeCommit is a TEST-ONLY hook. When non-nil it runs just before an ActivateOrRotate
+	// transaction commits; a non-nil return forces a full rollback, proving the credential state
+	// change and its audit row roll back together (PR22 requirement 8). Never set in production.
+	faultBeforeCommit func() error
 }
 
 // NewProvisioner builds a Provisioner. An empty master key returns secrets.ErrNoMasterKey
@@ -61,14 +65,13 @@ func IsCredentialValidation(err error) bool {
 var validCredStatus = map[string]bool{"unknown": true, "active": true, "invalid": true, "disabled": true, "error": true}
 
 // CreateInput is the plaintext (in-memory-only) input to Create. The secret fields are
-// encrypted immediately and never stored/logged/returned in the clear.
+// encrypted immediately and never stored/logged/returned in the clear. NOTE: enabled, status and
+// key_version are NOT accepted from the caller — the service always assigns them (PR22 requirement
+// 1), so a new credential can never be created already-active.
 type CreateInput struct {
 	ExchangeCode string `json:"exchange_code"`
 	Label        string `json:"label"`
-	KeyVersion   int    `json:"key_version"`
 	Algorithm    string `json:"algorithm"`
-	Enabled      bool   `json:"enabled"`
-	Status       string `json:"status"`
 	APIKey       string `json:"api_key"`
 	APISecret    string `json:"api_secret"`
 	Passphrase   string `json:"passphrase"`
@@ -76,8 +79,10 @@ type CreateInput struct {
 	Operator     string `json:"-"` // from the authenticated session, never the body
 }
 
-// Create encrypts the supplied secrets and inserts ONE credential row, then audits it. It
-// returns only the new credential id — never the plaintext or the encrypted blob.
+// Create encrypts the supplied secrets and inserts ONE credential row that is ALWAYS INACTIVE and
+// UNVALIDATED — enabled=0, status='unknown', key_version = service-assigned (max for the exchange
+// + 1). A new credential can never be used until it is validated and then activated (PR22
+// requirement 1). Returns only the new credential id — never the plaintext or the encrypted blob.
 func (p *Provisioner) Create(ctx context.Context, in CreateInput) (int64, error) {
 	exID, err := p.exchangeID(ctx, in.ExchangeCode)
 	if err != nil {
@@ -96,11 +101,18 @@ func (p *Provisioner) Create(ctx context.Context, in CreateInput) (int64, error)
 	}
 	defer tx.Rollback()
 
+	// Service-assigned key_version — never from the body.
+	var maxKV sql.NullInt64
+	_ = tx.QueryRowContext(ctx, "SELECT MAX(key_version) FROM exchange_credentials WHERE exchange_id=?", exID).Scan(&maxKV)
+	kv := 1
+	if maxKV.Valid {
+		kv = int(maxKV.Int64) + 1
+	}
 	res, err := tx.ExecContext(ctx, `
 INSERT INTO exchange_credentials
   (exchange_id, label, encrypted_api_key, encrypted_api_secret, encrypted_passphrase, encryption_algorithm, key_version, enabled, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		exID, in.Label, encKey, encSec, encPass, in.Algorithm, in.KeyVersion, b2iCred(in.Enabled), in.Status)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'unknown')`,
+		exID, in.Label, encKey, encSec, encPass, in.Algorithm, kv)
 	if err != nil {
 		if isDup(err) {
 			return 0, cvf("a credential labelled %q already exists for %s", in.Label, in.ExchangeCode)
@@ -108,7 +120,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		return 0, err
 	}
 	id, _ := res.LastInsertId()
-	if err := p.audit(ctx, tx, exID, &id, in.Operator, "create", "", in.Status, 0, in.KeyVersion, in.Reason); err != nil {
+	if err := p.audit(ctx, tx, exID, &id, in.Operator, "create", "", "unknown", 0, kv, in.Reason); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -119,92 +131,129 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
 // RotateInput rotates an exchange's credentials: a NEW credential supersedes the current
 // active one. The old plaintext is not needed (only the new secrets are supplied).
-type RotateInput struct {
-	ExchangeCode string `json:"exchange_code"`
-	Label        string `json:"label"` // optional base label for the new row (derived if empty)
-	Algorithm    string `json:"algorithm"`
-	APIKey       string `json:"api_key"`
-	APISecret    string `json:"api_secret"`
-	Passphrase   string `json:"passphrase"`
-	Reason       string `json:"reason"`
-	Operator     string `json:"-"`
-}
-
-// Rotate creates a new active credential at key_version = (current max active)+1 and
-// DISABLES every previously-active credential for the exchange, all in one transaction, so
-// exactly one active credential ever exists (no ambiguity). Both sides are audited. The
-// new secrets are encrypted in memory; nothing plaintext is stored/returned.
-func (p *Provisioner) Rotate(ctx context.Context, in RotateInput) (int64, error) {
-	exID, err := p.exchangeID(ctx, in.ExchangeCode)
-	if err != nil {
-		return 0, err
+// ValidateCredential performs the ONLY allowed credential check — a read-only balance read via the
+// narrow BalanceReader (never places/cancels) against the EXACT credential the operator selected
+// (PR22 requirement 2; the caller builds the reader with Builder.BuildForCredential(id)). The
+// status update AND the audit row are written in ONE transaction (requirement 5). Classification
+// (requirement 2):
+//   - success                        → status 'valid' (validated, ready to activate).
+//   - DEFINITE auth/permission error → status 'invalid'.
+//   - transient (timeout/network/rate limit/5xx) → status UNCHANGED (a brief incident must never
+//     permanently invalidate a good credential); the attempt is noted + audited.
+func (p *Provisioner) ValidateCredential(ctx context.Context, credentialID int64, r BalanceReader, operator string) error {
+	if strings.TrimSpace(operator) == "" {
+		return cvf("an authenticated operator is required")
 	}
-	if strings.TrimSpace(in.APIKey) == "" || strings.TrimSpace(in.APISecret) == "" {
-		return 0, cvf("api_key and api_secret are required for rotation")
-	}
-	algo := in.Algorithm
-	if algo == "" {
-		algo = secrets.AlgorithmAESGCM
-	}
-	if !secrets.SupportedAlgorithm(algo) {
-		return 0, cvf("unsupported encryption algorithm %q", in.Algorithm)
-	}
-	if strings.TrimSpace(in.Reason) == "" {
-		return 0, cvf("a reason is required to rotate credentials")
-	}
-
+	// Validation is fully SERIALIZED against activation/rotation (PR22 round-3 blocker 1): the
+	// credential row and then its exchange row are locked FOR UPDATE — the SAME lock order as
+	// ActivateOrRotate — and held for the DURATION of the (read-only) network check. So an
+	// activate/rotate cannot commit in the middle of a validation, and a failed validation can never
+	// overwrite a credential that was concurrently activated. This is a low-frequency operator
+	// action, so holding the lock across the network call is acceptable.
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer tx.Rollback()
 
-	// Current active credential (highest key_version), if any.
-	var curID sql.NullInt64
-	var curLabel sql.NullString
-	var curKV sql.NullInt64
-	_ = tx.QueryRowContext(ctx,
-		"SELECT id, label, key_version FROM exchange_credentials WHERE exchange_id=? AND enabled=1 AND status='active' ORDER BY key_version DESC, id DESC LIMIT 1",
-		exID).Scan(&curID, &curLabel, &curKV)
-
-	newKV := 1
-	if curKV.Valid {
-		newKV = int(curKV.Int64) + 1
+	var exID, kv int64
+	var curStatus string
+	err = tx.QueryRowContext(ctx, "SELECT exchange_id, status, key_version FROM exchange_credentials WHERE id=? FOR UPDATE", credentialID).Scan(&exID, &curStatus, &kv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cvf("credential %d not found", credentialID)
 	}
-	label := strings.TrimSpace(in.Label)
-	if label == "" {
-		base := "default"
-		if curLabel.Valid {
-			base = stripVersionSuffix(curLabel.String)
+	if err != nil {
+		return err
+	}
+	var lockedEx int64
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM exchanges WHERE id=? FOR UPDATE", exID).Scan(&lockedEx); err != nil {
+		return err
+	}
+	// Read-only validation WHILE holding the locks — activation/rotation is blocked until we commit.
+	_, balErr := r.GetBalances(ctx)
+
+	// Decide the new status from the CURRENT (locked) status, never the pre-network snapshot.
+	newStatus := curStatus
+	note := "read-only balance check: ok"
+	switch {
+	case curStatus == "disabled":
+		// It was disabled (e.g. rotated away) during validation — never resurrect its status.
+		note = "read-only check completed but the credential was disabled during validation — status unchanged"
+	case balErr == nil:
+		// Success. Keep ACTIVE (never downgrade the live credential to 'valid'); otherwise mark valid.
+		if curStatus == "active" {
+			newStatus = "active"
+			note = "read-only check: ok (already active)"
+		} else {
+			newStatus = "valid"
 		}
-		label = fmt.Sprintf("%s#v%d", base, newKV)
+	case IsDefiniteAuthError(balErr):
+		newStatus = "invalid"
+		note = "read-only check: authentication/permission rejected" // safe, no secret
+	default:
+		// Transient (timeout/network/rate-limit/5xx) — preserve the current DB state EXACTLY.
+		newStatus = curStatus
+		note = "read-only check could not complete (transient error) — status unchanged"
 	}
 
-	encKey, encSec, encPass, err := p.encryptFields(in.APIKey, in.APISecret, in.Passphrase)
-	if err != nil {
-		return 0, err
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE exchange_credentials SET status=?, last_auth_error=?, last_checked_at=? WHERE id=?",
+		newStatus, note, p.clk.Now().UTC(), credentialID); err != nil {
+		return err
 	}
-	res, err := tx.ExecContext(ctx, `
-INSERT INTO exchange_credentials
-  (exchange_id, label, encrypted_api_key, encrypted_api_secret, encrypted_passphrase, encryption_algorithm, key_version, enabled, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active')`,
-		exID, label, encKey, encSec, encPass, algo, newKV)
-	if err != nil {
-		if isDup(err) {
-			return 0, cvf("a credential labelled %q already exists for %s", label, in.ExchangeCode)
-		}
-		return 0, err
+	if err := p.audit(ctx, tx, exID, &credentialID, operator, "validate", curStatus, newStatus, int(kv), int(kv), note); err != nil {
+		return err
 	}
-	newID, _ := res.LastInsertId()
-	if err := p.audit(ctx, tx, exID, &newID, in.Operator, "rotate_new", "", "active", int(curKV.Int64), newKV, in.Reason); err != nil {
-		return 0, err
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return balErr // surface the (masked) error to the caller
+}
+
+// ActivateOrRotate makes the ALREADY-VALIDATED credential `credentialID` the single active
+// credential for its exchange, disabling any previously-active one — ALL in one transaction,
+// serialized per exchange with a FOR UPDATE lock on the exchange row (PR22 requirement 3). It
+// refuses a credential that has not been validated (status must be 'valid' or already 'active').
+// Because the old credential is disabled and the new one activated together, the exchange is never
+// left without a working credential, and (with the DB active-guard) two concurrent rotations can
+// never leave two active credentials. If any step fails, the previous credential stays active.
+func (p *Provisioner) ActivateOrRotate(ctx context.Context, credentialID int64, reason, operator string) error {
+	if strings.TrimSpace(reason) == "" {
+		return cvf("a reason is required to activate/rotate a credential")
+	}
+	if strings.TrimSpace(operator) == "" {
+		return cvf("an authenticated operator is required")
+	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Lock the credential row, then serialize on its exchange row (per-exchange rotation lock).
+	var exID, kv int64
+	var status string
+	err = tx.QueryRowContext(ctx, "SELECT exchange_id, status, key_version FROM exchange_credentials WHERE id=? FOR UPDATE", credentialID).Scan(&exID, &status, &kv)
+	if errors.Is(err, sql.ErrNoRows) {
+		return cvf("credential %d not found", credentialID)
+	}
+	if err != nil {
+		return err
+	}
+	var lockedEx int64
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM exchanges WHERE id=? FOR UPDATE", exID).Scan(&lockedEx); err != nil {
+		return err
+	}
+	// Confirm the credential has been VALIDATED (never activate an unvalidated one — requirement 1).
+	if status != "valid" && status != "active" {
+		return cvf("credential %d has not been validated (status %q) — validate it before activating", credentialID, status)
 	}
 
-	// Disable EVERY previously-active credential (not just the highest) so no two active
-	// credentials are ever ambiguous.
-	rows, err := tx.QueryContext(ctx, "SELECT id, key_version FROM exchange_credentials WHERE exchange_id=? AND enabled=1 AND status='active' AND id<>?", exID, newID)
+	// Disable every OTHER active credential FIRST so activating the new one cannot trip the
+	// one-active-per-exchange DB guard, and so the exchange never has two active credentials.
+	rows, err := tx.QueryContext(ctx, "SELECT id, key_version FROM exchange_credentials WHERE exchange_id=? AND enabled=1 AND status='active' AND id<>? FOR UPDATE", exID, credentialID)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	type oldRow struct {
 		id int64
@@ -215,29 +264,45 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active')`,
 		var o oldRow
 		if err := rows.Scan(&o.id, &o.kv); err != nil {
 			rows.Close()
-			return 0, err
+			return err
 		}
 		olds = append(olds, o)
 	}
 	rows.Close()
 	for _, o := range olds {
 		if _, err := tx.ExecContext(ctx, "UPDATE exchange_credentials SET enabled=0, status='disabled' WHERE id=?", o.id); err != nil {
-			return 0, err
+			return err
 		}
 		oid := o.id
-		if err := p.audit(ctx, tx, exID, &oid, in.Operator, "rotate_disable_old", "active", "disabled", o.kv, o.kv, in.Reason); err != nil {
-			return 0, err
+		if err := p.audit(ctx, tx, exID, &oid, operator, "rotate_disable_old", "active", "disabled", o.kv, o.kv, reason); err != nil {
+			return err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, err
+	// Activate the selected credential.
+	if _, err := tx.ExecContext(ctx, "UPDATE exchange_credentials SET enabled=1, status='active' WHERE id=?", credentialID); err != nil {
+		if isDup(err) {
+			return cvf("another credential is already active for this exchange — retry")
+		}
+		return err
 	}
-	return newID, nil
+	if err := p.audit(ctx, tx, exID, &credentialID, operator, "activate", status, "active", int(kv), int(kv), reason); err != nil {
+		return err
+	}
+	if p.faultBeforeCommit != nil {
+		if ferr := p.faultBeforeCommit(); ferr != nil {
+			return ferr // deferred tx.Rollback() undoes the activate + the disables + all audit rows
+		}
+	}
+	return tx.Commit()
 }
 
-// Disable turns a credential off (enabled=0, status='disabled') so PR20a's provider stops
-// using it, KEEPING the row (and its audit history) — secrets are not deleted by default.
+// Disable turns a credential off (enabled=0, status='disabled'), keeping the row + audit history.
+// It REFUSES to disable the LAST usable credential for an exchange while that exchange has open
+// operational risk (a non-terminal live cycle, a non-terminal/NEEDS_RECONCILE live order, an active
+// live exchange request, or an active live session) — an operator must not remove the ability to
+// sell inventory, cancel an order, or recover an ambiguous result (PR22 requirement 4). Terminal
+// history, dry-run data, and inactive locks never block. The state change + audit are one tx.
 func (p *Provisioner) Disable(ctx context.Context, credentialID int64, reason, operator string) error {
 	if strings.TrimSpace(reason) == "" {
 		return cvf("a reason is required to disable a credential")
@@ -250,13 +315,35 @@ func (p *Provisioner) Disable(ctx context.Context, credentialID int64, reason, o
 
 	var exID, kv int64
 	var oldStatus string
-	err = tx.QueryRowContext(ctx, "SELECT exchange_id, status, key_version FROM exchange_credentials WHERE id=?", credentialID).Scan(&exID, &oldStatus, &kv)
+	var enabled int
+	err = tx.QueryRowContext(ctx, "SELECT exchange_id, status, key_version, enabled FROM exchange_credentials WHERE id=? FOR UPDATE", credentialID).Scan(&exID, &oldStatus, &kv, &enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return cvf("credential %d not found", credentialID)
 	}
 	if err != nil {
 		return err
 	}
+	// Open-risk guard: only when disabling this credential would leave the exchange with NO
+	// OPERATIONAL credential. Only enabled + status='active' is operational — the live provider loads
+	// exactly that; a 'valid' (validated-but-not-active) credential is NOT a live replacement (PR22
+	// round-2 blocker 2a). Since the DB active-guard permits only one active credential per exchange,
+	// this effectively refuses disabling the live credential under open risk — use rotation instead.
+	if enabled == 1 && oldStatus == "active" {
+		var otherOperational int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM exchange_credentials WHERE exchange_id=? AND id<>? AND enabled=1 AND status='active'",
+			exID, credentialID).Scan(&otherOperational); err != nil {
+			return err
+		}
+		if otherOperational == 0 {
+			if detail, err := p.exchangeOpenRisk(ctx, tx, exID); err != nil {
+				return err
+			} else if detail != "" {
+				return cvf("refusing to disable the last operational (active) credential for this exchange while it has open risk (%s) — rotate to a validated credential instead, or resolve the risk first", detail)
+			}
+		}
+	}
+
 	if _, err := tx.ExecContext(ctx, "UPDATE exchange_credentials SET enabled=0, status='disabled' WHERE id=?", credentialID); err != nil {
 		return err
 	}
@@ -266,44 +353,49 @@ func (p *Provisioner) Disable(ctx context.Context, credentialID int64, reason, o
 	return tx.Commit()
 }
 
-// Validate performs the ONLY allowed credential check — a read-only balance read via the
-// narrow BalanceReader (never places/cancels) — then records the result + audits it. The
-// caller supplies the read-only client (built by the Builder), so Validate itself does no
-// exchange I/O directly.
-func (p *Provisioner) Validate(ctx context.Context, credentialID int64, r BalanceReader, operator string) error {
-	var exID, kv int64
-	var oldStatus string
-	err := p.db.QueryRowContext(ctx, "SELECT exchange_id, status, key_version FROM exchange_credentials WHERE id=?", credentialID).Scan(&exID, &oldStatus, &kv)
-	if errors.Is(err, sql.ErrNoRows) {
-		return cvf("credential %d not found", credentialID)
-	}
+// exchangeOpenRisk returns a short, non-empty description when the exchange has LIVE operational
+// risk that a working credential is needed to resolve, else "". Dry-run data and terminal history
+// never count (requirement 4: "do not make this unnecessarily broad").
+func (p *Provisioner) exchangeOpenRisk(ctx context.Context, tx *sql.Tx, exID int64) (string, error) {
+	var liveSession, liveCycle, liveOrder, activeReq bool
+	// Active-request ownership is ORDER-AUTHORITATIVE (PR22 round-2 blocker 2b): when a request has
+	// an order_id, its real exchange + mode come from the persisted ORDER's cycle, NOT the request
+	// row's own (possibly wrong/stale/missing) exchange_id/cycle_id. Only a request with NO order_id
+	// falls back to its own fields. This way a queue row with bad metadata cannot hide an active
+	// request whose real order is a live order on the exchange being disabled.
+	err := tx.QueryRowContext(ctx, `
+SELECT
+  EXISTS(SELECT 1 FROM live_run_sessions WHERE exchange_id=? AND status='ACTIVE'),
+  EXISTS(SELECT 1 FROM cycles WHERE buy_exchange_id=? AND dry_run=0 AND state NOT IN ('CLOSED','CANCELLED','FAILED')),
+  EXISTS(SELECT 1 FROM orders o JOIN cycles c ON c.id=o.cycle_id
+         WHERE o.exchange_id=? AND c.dry_run=0 AND o.state NOT IN ('FILLED','CANCELLED','REJECTED','EXPIRED','FAILED')),
+  EXISTS(SELECT 1 FROM exchange_requests er
+         LEFT JOIN orders o  ON o.id  = er.order_id
+         LEFT JOIN cycles oc ON oc.id = o.cycle_id
+         LEFT JOIN cycles rc ON rc.id = er.cycle_id
+         WHERE er.status IN ('QUEUED','RETRY_SCHEDULED','CLAIMED','IN_FLIGHT')
+           AND (
+             (er.order_id IS NOT NULL AND o.exchange_id = ? AND oc.dry_run = 0)
+             OR (er.order_id IS NULL AND er.exchange_id = ? AND (rc.dry_run = 0 OR rc.id IS NULL))
+           ))`,
+		exID, exID, exID, exID, exID).Scan(&liveSession, &liveCycle, &liveOrder, &activeReq)
 	if err != nil {
-		return err
+		return "", err
 	}
-	newStatus := "active"
-	note := any(nil)
-	_, balErr := r.GetBalances(ctx)
-	if balErr != nil {
-		newStatus = "invalid"
-		note = "balance validation failed"
+	var risks []string
+	if liveSession {
+		risks = append(risks, "an active live session")
 	}
-	if _, err := p.db.ExecContext(ctx,
-		"UPDATE exchange_credentials SET status=?, last_auth_error=?, last_checked_at=? WHERE id=?",
-		newStatus, note, p.clk.Now().UTC(), credentialID); err != nil {
-		return err
+	if liveCycle {
+		risks = append(risks, "a non-terminal live cycle")
 	}
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	if liveOrder {
+		risks = append(risks, "an open or NEEDS_RECONCILE live order")
 	}
-	defer tx.Rollback()
-	if err := p.audit(ctx, tx, exID, &credentialID, operator, "validate", oldStatus, newStatus, int(kv), int(kv), "read-only balance check"); err != nil {
-		return err
+	if activeReq {
+		risks = append(risks, "an active live exchange request")
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return balErr // surface the auth error (masked) to the caller
+	return strings.Join(risks, ", "), nil
 }
 
 // ---- helpers ----
@@ -316,21 +408,14 @@ func (p *Provisioner) validateCreate(in *CreateInput) error {
 	if strings.TrimSpace(in.APIKey) == "" || strings.TrimSpace(in.APISecret) == "" {
 		return cvf("api_key and api_secret are required")
 	}
-	if in.KeyVersion <= 0 {
-		in.KeyVersion = 1
-	}
 	if in.Algorithm == "" {
 		in.Algorithm = secrets.AlgorithmAESGCM
 	}
 	if !secrets.SupportedAlgorithm(in.Algorithm) {
 		return cvf("unsupported encryption algorithm %q", in.Algorithm)
 	}
-	if in.Status == "" {
-		in.Status = "active"
-	}
-	if !validCredStatus[in.Status] {
-		return cvf("invalid status %q", in.Status)
-	}
+	// enabled/status/key_version are NEVER taken from the caller — Create assigns enabled=0,
+	// status='unknown', service key_version (PR22 requirement 1).
 	if strings.TrimSpace(in.Reason) == "" {
 		return cvf("a reason is required to create a credential")
 	}

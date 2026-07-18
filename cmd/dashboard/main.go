@@ -38,6 +38,9 @@ func main() {
 		cfg := dashboard.Config{
 			SecureCookies: base.Cfg.Dashboard.SecureCookies,
 			SessionTTL:    time.Duration(base.Cfg.Dashboard.SessionTTLMinutes) * time.Minute,
+			// PR22: the master key enables credential provisioning (create/validate/activate/
+			// disable). Absent/invalid → credential writes are disabled (no plaintext fallback).
+			MasterKey: base.Cfg.Security.MasterKey,
 		}
 		srv := dashboard.New(store.DB(), base.Log, cfg)
 

@@ -232,14 +232,16 @@ func TestActiveCredentialSelectedOverNonActive(t *testing.T) {
 
 func TestKeyVersionRespectedHighestActiveSelected(t *testing.T) {
 	f := setupC(t)
-	f.seedCred("v1", 1, "active", 1, "old-key", "x", "")
+	// PR22 enforces ONE active credential per exchange (DB active-guard). The superseded credential
+	// is disabled; the provider selects the single active one.
+	f.seedCred("v1", 0, "disabled", 1, "old-key", "x", "")
 	f.seedCred("v2", 1, "active", 3, "new-key", "y", "")
 	creds, err := f.provider().Credentials(f.ctx, "credprobe")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if creds.APIKey != "new-key" {
-		t.Errorf("selected %q, want new-key (highest key_version)", creds.APIKey)
+		t.Errorf("selected %q, want new-key (the single active credential)", creds.APIKey)
 	}
 }
 

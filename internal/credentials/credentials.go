@@ -110,6 +110,55 @@ LIMIT 1`, code).Scan(&id, &encKey, &encSec, &encPass, &algorithm, &keyVersion)
 	return exchanges.Credentials{APIKey: apiKey, APISecret: apiSecret, Passphrase: passphrase}, nil
 }
 
+// CredentialsByID decrypts the ONE credential row identified by credentialID (regardless of its
+// enabled/status), returning the exchange code and the decrypted secrets. It exists so validation
+// can check the EXACT credential an operator selected — NOT the auto-selected active one (PR22
+// requirement 2). Errors carry no plaintext; an unsupported algorithm / decrypt failure marks the
+// row unusable and returns an error.
+func (p *Provider) CredentialsByID(ctx context.Context, credentialID int64) (string, exchanges.Credentials, error) {
+	var (
+		code, algorithm string
+		encKey, encSec  []byte
+		encPass         []byte
+	)
+	err := p.db.QueryRowContext(ctx, `
+SELECT e.code, ec.encrypted_api_key, ec.encrypted_api_secret, ec.encrypted_passphrase, ec.encryption_algorithm
+FROM exchange_credentials ec JOIN exchanges e ON e.id = ec.exchange_id
+WHERE ec.id = ?`, credentialID).Scan(&code, &encKey, &encSec, &encPass, &algorithm)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", exchanges.Credentials{}, fmt.Errorf("credentials: credential %d not found", credentialID)
+	}
+	if err != nil {
+		return "", exchanges.Credentials{}, fmt.Errorf("credentials: load id %d: %w", credentialID, err)
+	}
+	if !secrets.SupportedAlgorithm(algorithm) {
+		p.markUnusable(ctx, credentialID, "unsupported encryption algorithm")
+		return "", exchanges.Credentials{}, secrets.ErrUnsupportedAlgorithm
+	}
+	apiKey, err := p.decryptField(encKey)
+	if err != nil {
+		p.markUnusable(ctx, credentialID, "decryption failed")
+		return "", exchanges.Credentials{}, err
+	}
+	apiSecret, err := p.decryptField(encSec)
+	if err != nil {
+		p.markUnusable(ctx, credentialID, "decryption failed")
+		return "", exchanges.Credentials{}, err
+	}
+	passphrase, err := p.decryptField(encPass)
+	if err != nil {
+		p.markUnusable(ctx, credentialID, "decryption failed")
+		return "", exchanges.Credentials{}, err
+	}
+	return code, exchanges.Credentials{APIKey: apiKey, APISecret: apiSecret, Passphrase: passphrase}, nil
+}
+
+// IsDefiniteAuthError reports whether err is a DEFINITE authentication/authorization failure — the
+// only class allowed to invalidate a credential (PR22 requirement 2). Transient errors (timeout,
+// network, rate limit, 5xx) return false so a brief incident never permanently invalidates a good
+// credential.
+func IsDefiniteAuthError(err error) bool { return isDefiniteAuthError(err) }
+
 // decryptField returns "" for a NULL/empty blob (e.g. venues with no passphrase) and
 // the decrypted plaintext otherwise. Errors carry no sensitive data.
 func (p *Provider) decryptField(blob []byte) (string, error) {
